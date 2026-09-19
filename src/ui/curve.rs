@@ -1,22 +1,25 @@
-//! 胜率曲线（TASKS 4.3）：底部面板逐手黑方胜率折线、当前手指示与悬停数值。
+//! 胜率曲线（TASKS 4.3 / 4.4）：底部面板逐手黑方胜率折线、当前手指示、
+//! 悬停数值与失误联动。
 //!
 //! 数据只读自 [`AnalysisState::history`]（逐手历史缓冲，随浏览逐步积累）：
 //!
 //! - 只画已知点：仅相邻两手（手数差 1）都有数据才连线，缺口留空，
 //!   不臆造未知走势；已知点用小圆点标记，颜色复用 [`overlay::winrate_color`]
 //!   （与棋盘候选点同一胜率映射）；
+//! - 失误联动：损失达到疑问手及以上的手数，曲线点改用
+//!   [`overlay::severity_color`] 并稍加大，一眼看出曲线在哪一段跳水；
 //! - 胜率一律**黑方视角**（`reportAnalysisWinratesAs = BLACK`），不翻转，
 //!   标题与提示文案均注明；
 //! - 当前手（[`Board::cursor`]）用琥珀色竖线 + 大圆点指示，
 //!   该手尚无数据时仍显示竖线位置；
 //! - 悬停时磁吸高亮最近已知手数（竖线 + 白环），并用 egui 原生指针提示
-//!   显示手数 / 胜率 / 目差 / visits；离开曲线区全部消失。
+//!   显示手数 / 胜率 / 目差 / visits / 该手损失；离开曲线区全部消失。
 
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2};
 
 use crate::board::Board;
 
-use super::analysis::{AnalysisState, HistoryPoint};
+use super::analysis::{AnalysisState, HistoryPoint, MoveLoss};
 use super::overlay;
 
 /// 曲线区四周留白：轴标注与标题占用。
@@ -43,6 +46,16 @@ pub fn show(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
     // 已知点（按手数升序，含 0 = 初始空盘）；总手数以外的陈旧条目不取。
     let known: Vec<HistoryPoint> =
         (0..=total).filter_map(|turn| analysis.history_point(turn)).collect();
+    // 每手损失（与 known 按下标平行；第 0 手或两端数据不全为 `None`），
+    // 曲线着色与悬停提示共用，避免同一手重复派生。
+    let losses: Vec<Option<MoveLoss>> = known
+        .iter()
+        .map(|p| {
+            board
+                .record_at(p.turn.checked_sub(1)?)
+                .and_then(|r| analysis.move_loss(p.turn, r.player))
+        })
+        .collect();
 
     // 无论有无数据都先占满面板内容区：egui 0.36 的 Panel 收缩到内容尺寸，
     // 空状态只画一行小字会把面板塌缩成一条缝并记住该尺寸。
@@ -95,14 +108,28 @@ pub fn show(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
             );
         }
     }
-    // 已知点标记。
-    for p in &known {
+    // 已知点标记：失误手（疑问手及以上）用严重程度色并稍加大，
+    // 让「曲线跳水段」一眼可辨；其余用胜率色。
+    for (p, loss) in known.iter().zip(&losses) {
         let center = Pos2::new(x(p.turn as f32), y(p.winrate as f32));
-        painter.circle_filled(center, DOT_RADIUS, overlay::winrate_color(p.winrate));
+        match loss.filter(|l| l.severity.is_marked()) {
+            Some(l) => {
+                let radius = DOT_RADIUS + 1.5;
+                painter.circle_filled(center, radius, overlay::severity_color(l.severity));
+                painter.circle_stroke(
+                    center,
+                    radius,
+                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(20, 20, 20, 150)),
+                );
+            }
+            None => {
+                painter.circle_filled(center, DOT_RADIUS, overlay::winrate_color(p.winrate));
+            }
+        }
     }
 
     draw_cursor(&painter, plot, &x, &y, board.cursor(), &known);
-    draw_hover(&painter, plot, &x, &y, total, response, &known);
+    draw_hover(&painter, plot, &x, &y, total, response, &known, &losses);
 }
 
 /// 坐标系：底板、边框、Y 轴 0/50/100% 标注、50% 虚线参考线、X 轴首末手数。
@@ -172,7 +199,8 @@ fn draw_cursor(
 
 /// 悬停反馈：磁吸到最近已知手数，画淡竖线 + 白环高亮，并弹原生指针提示。
 /// 按值收 `Response`：`on_hover_ui_at_pointer` 需要 ownership，
-/// 且此后调用方不再使用它。
+/// 且此后调用方不再使用它。`losses` 与 `known` 按下标平行（每手损失）。
+#[allow(clippy::too_many_arguments)]
 fn draw_hover(
     painter: &Painter,
     plot: Rect,
@@ -181,6 +209,7 @@ fn draw_hover(
     total: usize,
     response: Response,
     known: &[HistoryPoint],
+    losses: &[Option<MoveLoss>],
 ) {
     let Some(pos) = response.hover_pos().filter(|p| plot.contains(*p)) else {
         return;
@@ -189,7 +218,11 @@ fn draw_hover(
     let total_f = total as f32;
     let hovered =
         ((pos.x - plot.left()) / plot.width() * total_f).round().clamp(0.0, total_f) as usize;
-    let Some(p) = known.iter().copied().min_by_key(|p| p.turn.abs_diff(hovered)) else {
+    let Some((index, p)) = known
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, p)| p.turn.abs_diff(hovered))
+    else {
         return;
     };
     let hx = x(p.turn as f32);
@@ -202,10 +235,18 @@ fn draw_hover(
         CURSOR_RADIUS + 2.0,
         Stroke::new(1.5, Color32::WHITE),
     );
+    // 该手损失（第 0 手或数据不全为 `None`，不显示）。
+    let loss_text = losses[index].map(|l| {
+        format!("第 {} 手损失 {:+.1} 目 · {:+.0}%（{}）",
+            l.turn, l.score_loss, l.winrate_loss * 100.0, l.severity.name())
+    });
     response.on_hover_ui_at_pointer(|ui| {
         ui.weak(format!("最近已知：第 {} 手", p.turn));
         ui.label(format!("黑方胜率 {:.1}%", p.winrate * 100.0));
         ui.label(format!("目差 {:+.1}（黑方视角）", p.score_lead));
         ui.label(format!("visits {}", p.visits));
+        if let Some(text) = loss_text {
+            ui.label(text);
+        }
     });
 }

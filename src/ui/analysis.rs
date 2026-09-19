@@ -15,6 +15,8 @@
 //! 逐手胜率历史（[`AnalysisState::history`]，TASKS 4.3 曲线用）只是
 //! 终态快照的按手数转存：随浏览逐步积累，切换局面不清空，
 //! 同一手数后到且 visits 更多的终态覆盖先到的。
+//! 每手损失（[`AnalysisState::move_loss`]，TASKS 4.4）不另存状态：
+//! 读取时由相邻两个已知历史点现场派生，引擎零额外查询。
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -36,6 +38,25 @@ const FAST_VISITS: u32 = 100;
 /// 超出部分不再写入，避免无界增长。
 const HISTORY_CAP: usize = 999;
 
+// ---- 每手损失分级阈值（目差口径，正 = 行棋方亏损）----
+//
+// 参考主流 AI 复盘工具按目差损失分档的惯例（1 / 3 / 6 目为常用分界）：
+//
+// - 0.3 目以下视为搜索噪声：visits 有限时引擎对同一点位的 scoreLead
+//   复评存在零点几目的抖动，不应据此判亏；
+// - 1 目：贴目制下连续出现即足以翻盘，「明显亏损」的下限；
+// - 3 目：约一个普通官子的价值，通常是局部选点错误的量级；
+// - 6 目：约半手棋（中盘一手价值 10–15 目），多为漏看或死活误判。
+
+/// 好棋与尚可的分界（目）：低于此值视为搜索噪声。
+const SEVERITY_GOOD_MAX: f64 = 0.3;
+/// 疑问手下限（目）。
+const SEVERITY_QUESTIONABLE_MIN: f64 = 1.0;
+/// 失误下限（目）。
+const SEVERITY_MISTAKE_MIN: f64 = 3.0;
+/// 恶手下限（目）。
+const SEVERITY_BLUNDER_MIN: f64 = 6.0;
+
 /// 逐手历史的一个数据点：第 `turn` 手之后局面的终态分析结果。
 /// 胜率 / 目差为**黑方视角**（与 [`Snapshot`] 同一口径，不翻转）。
 #[derive(Clone, Copy, Debug)]
@@ -48,6 +69,84 @@ pub struct HistoryPoint {
     pub score_lead: f64,
     /// 产出该结果的搜索量（覆盖判定依据：visits 更多的后到覆盖先到的）。
     pub visits: u64,
+}
+
+/// 第 `turn` 手（1 起）的行棋方视角损失：由第 `turn − 1` 与第 `turn` 手后
+/// 两个**已知**历史点现场派生（[`AnalysisState::move_loss`]），任一端缺失
+/// 即为「未知」，不插值、不臆造 0。
+#[derive(Clone, Copy, Debug)]
+pub struct MoveLoss {
+    /// 手数（1 起）。
+    pub turn: usize,
+    /// 行棋方。
+    pub player: Stone,
+    /// 目差损失（目，正 = 行棋方亏损），严重程度分级的依据。
+    pub score_loss: f64,
+    /// 胜率损失 [0, 1]（正 = 行棋方亏损），辅助信息。
+    pub winrate_loss: f64,
+    /// 严重程度分级。
+    pub severity: Severity,
+}
+
+/// 每手损失的严重程度（按目差损失分档，阈值依据见各常量文档）。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Severity {
+    /// 好棋：不亏（含搜索噪声以内）。
+    Good,
+    /// 尚可：小亏，常规次优。
+    Fine,
+    /// 疑问手：明显亏损。
+    Questionable,
+    /// 失误：局部量级亏损。
+    Mistake,
+    /// 恶手：全局量级亏损。
+    Blunder,
+}
+
+impl Severity {
+    /// 由目差损失定档。
+    fn from_score_loss(loss: f64) -> Self {
+        if loss < SEVERITY_GOOD_MAX {
+            Self::Good
+        } else if loss < SEVERITY_QUESTIONABLE_MIN {
+            Self::Fine
+        } else if loss < SEVERITY_MISTAKE_MIN {
+            Self::Questionable
+        } else if loss < SEVERITY_BLUNDER_MIN {
+            Self::Mistake
+        } else {
+            Self::Blunder
+        }
+    }
+
+    /// 中文名（侧栏汇总与曲线悬停显示）。
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Good => "好棋",
+            Self::Fine => "尚可",
+            Self::Questionable => "疑问手",
+            Self::Mistake => "失误",
+            Self::Blunder => "恶手",
+        }
+    }
+
+    /// 是否在棋盘上标注：只标疑问手及以上，好棋 / 尚可不标。
+    pub fn is_marked(self) -> bool {
+        self >= Self::Questionable
+    }
+}
+
+/// 失误汇总统计（[`AnalysisState::loss_summary`]，侧栏显示用）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LossSummary {
+    /// 总手数。
+    pub total: usize,
+    /// 两端数据齐全、可算损失的手数；其余手数状态为「未知」。
+    pub analyzed: usize,
+    /// 疑问手 / 失误 / 恶手计数（好棋与尚可不统计，避免噪声凑数）。
+    pub questionable: u32,
+    pub mistake: u32,
+    pub blunder: u32,
 }
 
 /// 引擎生命周期状态机（用户可见部分）。
@@ -217,6 +316,51 @@ impl AnalysisState {
     /// 查询某手的逐手历史数据（0 = 初始空盘）；该手尚无终态数据时为 `None`。
     pub fn history_point(&self, turn: usize) -> Option<HistoryPoint> {
         self.history.get(turn).and_then(|slot| slot.map(|e| e.point))
+    }
+
+    /// 第 `turn` 手（1 起）的行棋方视角损失；`None` = 两端数据不全（未知）。
+    ///
+    /// 视角换算（`winrate` / `score_lead` 均为黑方视角，见 `HistoryPoint`）：
+    /// 黑方行棋时损失 = 走子前黑方值 − 走子后黑方值；白方行棋时符号相反
+    /// （黑方值升 = 白方亏）。结果一律为「行棋方失去了多少」，正 = 亏。
+    /// 行棋方由调用方从 `Board::record_at(turn - 1)` 取。
+    pub fn move_loss(&self, turn: usize, player: Stone) -> Option<MoveLoss> {
+        if turn == 0 {
+            return None; // 空盘没有「走子前」，无从谈损失
+        }
+        let before = self.history_point(turn - 1)?;
+        let after = self.history_point(turn)?;
+        let side = match player {
+            Stone::Black => 1.0,
+            Stone::White => -1.0,
+        };
+        let score_loss = (before.score_lead - after.score_lead) * side;
+        let winrate_loss = (before.winrate - after.winrate) * side;
+        Some(MoveLoss {
+            turn,
+            player,
+            score_loss,
+            winrate_loss,
+            severity: Severity::from_score_loss(score_loss),
+        })
+    }
+
+    /// 失误汇总统计：遍历全部手数现场派生（每手仅两次下标读取与算术，
+    /// 可每帧调用）。「已分析」只计两端数据齐全的手数，缺口不计入分级。
+    pub fn loss_summary(&self, board: &Board) -> LossSummary {
+        let mut summary = LossSummary { total: board.move_count(), ..LossSummary::default() };
+        for i in 0..summary.total {
+            let Some(record) = board.record_at(i) else { continue };
+            let Some(loss) = self.move_loss(i + 1, record.player) else { continue };
+            summary.analyzed += 1;
+            match loss.severity {
+                Severity::Questionable => summary.questionable += 1,
+                Severity::Mistake => summary.mistake += 1,
+                Severity::Blunder => summary.blunder += 1,
+                Severity::Good | Severity::Fine => {}
+            }
+        }
+        summary
     }
 
     /// 每帧调用（`App::logic`）：轮询引擎事件并按局面推进分析。

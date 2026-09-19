@@ -83,7 +83,12 @@ impl GuanqiApp {
             board: Board::new(Size::new(19).expect("19 为固定合法尺寸")),
             notice: None,
             analysis,
-            overlay: overlay::Overlay { show_candidates: true, show_heat: true, focus: None },
+            overlay: overlay::Overlay {
+                show_candidates: true,
+                show_heat: true,
+                show_mistakes: true,
+                focus: None,
+            },
             curve_open: true,
             engine_cfg,
             settings,
@@ -222,6 +227,7 @@ impl eframe::App for GuanqiApp {
                 panel_action = analysis_panel::show(
                     ui,
                     &self.analysis,
+                    &self.board,
                     &self.engine_cfg,
                     self.notice,
                     self.startup_notice.as_deref(),
@@ -279,7 +285,7 @@ impl eframe::App for GuanqiApp {
                 ui,
                 &mut self.board,
                 &mut self.notice,
-                self.analysis.snapshot.as_ref(),
+                &self.analysis,
                 &self.overlay,
             );
         });

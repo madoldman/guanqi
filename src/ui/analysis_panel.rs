@@ -1,19 +1,19 @@
-//! 分析侧栏：引擎状态、胜率 / 目差、候选点列表、叠加层开关与提示行
-//! （TASKS 4.2）。
+//! 分析侧栏：引擎状态、胜率 / 目差、候选点列表、失误统计、叠加层开关
+//! 与提示行（TASKS 4.2 / 4.4）。
 //!
 //! 数据只读自 [`AnalysisState`]：胜率 / 目差为**黑方视角**（引擎配置
 //! `reportAnalysisWinratesAs = BLACK`，实测对 rootInfo 与 moveInfos 同时生效），
-//! 不按行棋方翻转。棋盘候选点叠加 / 热度图（`overlay` 模块）直接取
-//! `AnalysisState::snapshot`，本面板只提供层开关、胜率色阶图例与
-//! 候选点点击定位。
+//! 不按行棋方翻转。棋盘候选点叠加 / 热度图 / 失误标注（`overlay` 模块）
+//! 直接取 `AnalysisState` 的快照与历史缓冲，本面板只提供层开关、失误汇总、
+//! 胜率色阶图例与候选点点击定位。
 
 use egui::{Color32, Pos2, Rect, RichText, Sense, Ui, Vec2};
 
-use crate::board::{Coord, IllegalReason, Stone};
+use crate::board::{Board, Coord, IllegalReason, Stone};
 use crate::engine::{EngineConfig, RootInfo};
 use crate::sgf::GameMeta;
 
-use super::analysis::{AnalysisState, EngineStatus};
+use super::analysis::{AnalysisState, EngineStatus, Severity};
 use super::overlay::{self, Overlay};
 
 /// 侧栏展示的候选点条数（空盘时引擎可回上百条，只取前几条；
@@ -103,6 +103,7 @@ fn eval_lines(root: &RootInfo) -> (String, String) {
 /// 绘制分析侧栏。`settings_open` 由本面板与顶部按钮共享；
 /// `overlay` 为棋盘叠加层的层开关与定位状态（本面板读写）；
 /// `curve_open` 为胜率曲线底部面板的显示开关。
+/// `board` 提供总手数与各行棋方（失误汇总按手数现场派生）。
 /// `game` / `comment` / `load_notice` 为「打开棋谱」相关信息：已载入棋谱
 /// 的元信息、当前手注释与最近一次打开操作的提示（无则对应段落不显示）。
 /// 注释可能很长，整体包一层垂直滚动，避免侧栏内容被裁剪。
@@ -110,6 +111,7 @@ fn eval_lines(root: &RootInfo) -> (String, String) {
 pub fn show(
     ui: &mut Ui,
     analysis: &AnalysisState,
+    board: &Board,
     cfg: &EngineConfig,
     notice: Option<IllegalReason>,
     startup_notice: Option<&str>,
@@ -124,6 +126,7 @@ pub fn show(
         panel_body(
             ui,
             analysis,
+            board,
             cfg,
             notice,
             startup_notice,
@@ -143,6 +146,7 @@ pub fn show(
 fn panel_body(
     ui: &mut Ui,
     analysis: &AnalysisState,
+    board: &Board,
     cfg: &EngineConfig,
     notice: Option<IllegalReason>,
     startup_notice: Option<&str>,
@@ -304,10 +308,43 @@ fn panel_body(
     ui.add_space(6.0);
     ui.separator();
 
+    // ---- 失误统计（TASKS 4.4）----
+    ui.heading("失误");
+    let summary = analysis.loss_summary(board);
+    if summary.total == 0 {
+        ui.weak("—");
+    } else {
+        // 「已分析 / 总手数」必须显式给出：数据随浏览逐步积累，
+        // 不写清楚会被误认为整盘都算过了。
+        ui.weak(format!(
+            "已分析 {} / {} 手（随浏览逐步积累）",
+            summary.analyzed, summary.total
+        ));
+        ui.horizontal_wrapped(|ui| {
+            // 计数与棋盘标记共用同一套严重程度配色。
+            for (label, count, severity) in [
+                ("疑问手", summary.questionable, Severity::Questionable),
+                ("失误", summary.mistake, Severity::Mistake),
+                ("恶手", summary.blunder, Severity::Blunder),
+            ] {
+                ui.label(
+                    RichText::new(format!("{label} {count}"))
+                        .color(overlay::severity_color(severity))
+                        .strong(),
+                );
+            }
+        });
+        ui.weak("棋盘标注：目差损失 ≥1 目疑问手 / ≥3 目失误 / ≥6 目恶手");
+    }
+
+    ui.add_space(6.0);
+    ui.separator();
+
     // ---- 叠加层 ----
     ui.heading("叠加层");
     ui.checkbox(&mut overlay.show_candidates, "候选点圆圈");
     ui.checkbox(&mut overlay.show_heat, "局势热度图");
+    ui.checkbox(&mut overlay.show_mistakes, "失误标注");
     ui.checkbox(curve_open, "胜率曲线面板");
     // 胜率色阶图例：与棋盘候选点共用 overlay::winrate_color 同一映射。
     ui.horizontal(|ui| {

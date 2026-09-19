@@ -1,5 +1,6 @@
 //! 棋盘视图：`egui::Painter` 自绘棋盘与鼠标 / 键盘交互（TASKS 2.2 / 2.3），
-//! 并按开关挂载分析叠加层（候选点 / 热度图 / 定位高亮，TASKS 4.1 / 4.2）。
+//! 并按开关挂载分析叠加层（候选点 / 热度图 / 定位高亮，TASKS 4.1 / 4.2）
+//! 与失误标注（TASKS 4.4）。
 //!
 //! 设计要点：
 //!
@@ -14,7 +15,7 @@ use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Stroke, Ui, Vec2
 
 use crate::board::{Action, Board, Coord, IllegalReason, Size, Stone};
 
-use super::analysis::Snapshot;
+use super::analysis::AnalysisState;
 use super::overlay::{self, Overlay};
 
 // ---- 配色 ----
@@ -40,13 +41,13 @@ const STATUS_HEIGHT: f32 = 26.0;
 /// 绘制棋盘视图并处理交互。
 ///
 /// `notice` 由调用方持有：非法落子时写入原因，任何一次成功操作后清除，
-/// 使提示能跨帧稳定显示。`snapshot` 为当前局面的分析快照（无则跳过全部
-/// 叠加层）；`overlay` 持有层开关与侧栏定位状态。
+/// 使提示能跨帧稳定显示。`analysis` 提供当前局面快照（候选点 / 热度图）
+/// 与逐手历史（失误标注）；`overlay` 持有层开关与侧栏定位状态。
 pub fn show(
     ui: &mut Ui,
     board: &mut Board,
     notice: &mut Option<IllegalReason>,
-    snapshot: Option<&Snapshot>,
+    analysis: &AnalysisState,
     overlay: &Overlay,
 ) {
     handle_keyboard(ui, board, notice);
@@ -58,6 +59,7 @@ pub fn show(
 
     let size = board.size();
     if let Some(layout) = Layout::fit(response.rect, size) {
+        let snapshot = analysis.snapshot.as_ref();
         let painter = ui.painter_at(layout.rect.expand(2.0));
         draw_board(&painter, &layout);
         draw_grid(&painter, &layout, size);
@@ -71,6 +73,10 @@ pub fn show(
         }
         draw_stones(&painter, &layout, board);
         draw_last_move_mark(&painter, &layout, board);
+        // 失误标注画在棋子之上：小色点不遮棋子辨识。
+        if overlay.show_mistakes {
+            overlay::draw_mistakes(&painter, &layout, board, analysis);
+        }
         // 候选点与定位高亮画在棋子之上。
         if overlay.show_candidates
             && let Some(snapshot) = snapshot

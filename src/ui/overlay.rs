@@ -1,12 +1,12 @@
-//! 棋盘分析叠加层（TASKS 4.1 / 4.2）：候选点圆圈、ownership 热度图、
-//! 侧栏点击定位高亮与主变幽灵子。
+//! 棋盘分析叠加层（TASKS 4.1 / 4.2 / 4.4）：候选点圆圈、ownership 热度图、
+//! 失误标注、侧栏点击定位高亮与主变幽灵子。
 //!
-//! 数据只读自 [`Snapshot`]（分析结果唯一存放点），几何换算复用
-//! [`Layout`]；无数据 / 数据不合法（`ownership` 缺失或长度不符）时
-//! 静默跳过，绝不 panic。层开关关闭时调用方直接跳过绘制调用，
-//! 不产生任何每帧开销。
+//! 数据只读自 [`Snapshot`] 与 [`AnalysisState`]（分析结果唯一存放点，
+//! 失误标注按手数从历史缓冲现场派生），几何换算复用 [`Layout`]；
+//! 无数据 / 数据不合法（`ownership` 缺失或长度不符）时静默跳过，绝不
+//! panic。层开关关闭时调用方直接跳过绘制调用，不产生任何每帧开销。
 //!
-//! 映射规则（与侧栏图例共用 [`winrate_color`]）：
+//! 映射规则（与侧栏图例共用 [`winrate_color`] / [`severity_color`]）：
 //!
 //! - 候选点大小：`sqrt(visits / 可见候选最大 visits)` 线性映射到
 //!   `[0.16, 0.42] × 间距` 的半径；首个候选为主选点，额外画白环；
@@ -17,13 +17,16 @@
 //! - 热度图：`ownership` 为各点目差（正 = 黑势），按当前快照最大 |值|
 //!   （下限 [`HEAT_SCALE_MIN`]）线性归一化后乘最大不透明度（开局各点
 //!   目差实测 |v| < 1，绝对刻度会整层不可见）；黑势叠深色块、白势叠
-//!   浅色块，绘制在棋子之下，棋子保持清晰。
+//!   浅色块，绘制在棋子之下，棋子保持清晰；
+//! - 失误标注（KaTrain 风格）：疑问手及以上的落子处叠小色点
+//!   （黄疑问手 / 橙失误 / 红恶手），画在棋子之上但不遮棋子辨识；
+//!   当前手恰为失误手时额外加外环。回看中同样针对所有已知手数绘制。
 
 use egui::{Align2, Color32, FontId, Painter, Rect, Stroke, Vec2};
 
-use crate::board::{Board, Coord, Stone};
+use crate::board::{Action, Board, Coord, Stone};
 
-use super::analysis::Snapshot;
+use super::analysis::{AnalysisState, Severity, Snapshot};
 use super::board_view::Layout;
 
 /// 棋盘上绘制的候选点条数（与侧栏 `MOVE_LIMIT` 解耦，各自维护）。
@@ -42,6 +45,8 @@ pub struct Overlay {
     pub show_candidates: bool,
     /// 局势热度图层开关。
     pub show_heat: bool,
+    /// 失误标注层开关（疑问手及以上才画，关闭时零绘制开销）。
+    pub show_mistakes: bool,
     /// 侧栏点击定位；局面变化（快照作废）时由 App 清除。
     pub focus: Option<Focus>,
 }
@@ -83,6 +88,18 @@ pub(crate) fn winrate_color(winrate: f64) -> Color32 {
 
 fn lerp(a: u8, b: u8, t: f32) -> u8 {
     (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8
+}
+
+/// 严重程度 → 标注色（棋盘标记、侧栏统计与曲线联动共用）：
+/// 黄疑问手 / 橙失误 / 红恶手，黄橙取自既有提示色系，保证观感一致。
+pub(crate) fn severity_color(severity: Severity) -> Color32 {
+    match severity {
+        // 不标注的档位无对应色（调用方先用 `is_marked` 过滤），给中性灰兜底。
+        Severity::Good | Severity::Fine => Color32::from_rgb(140, 140, 148),
+        Severity::Questionable => Color32::from_rgb(248, 196, 42),
+        Severity::Mistake => Color32::from_rgb(255, 152, 82),
+        Severity::Blunder => Color32::from_rgb(235, 77, 61),
+    }
 }
 
 /// ownership 热度图：整格色块铺在网格之上、棋子之下。
@@ -161,6 +178,44 @@ pub(crate) fn draw_candidates(painter: &Painter, layout: &Layout, snapshot: &Sna
             Color32::from_rgba_unmultiplied(0, 0, 0, 160),
         );
         painter.text(center, Align2::CENTER_CENTER, &label, font, Color32::from_rgba_unmultiplied(255, 255, 255, 245));
+    }
+}
+
+/// 失误标注（KaTrain 风格）：疑问手及以上的落子处叠小色点，颜色按
+/// [`severity_color`] 分档；当前手恰为失误手时额外加一圈外环更醒目。
+/// 回看中针对**所有已知手数**绘制，不只当前手；数据不全（未知）的手数
+/// 由 [`AnalysisState::move_loss`] 返回 `None`，自然跳过。
+pub(crate) fn draw_mistakes(
+    painter: &Painter,
+    layout: &Layout,
+    board: &Board,
+    analysis: &AnalysisState,
+) {
+    for i in 0..board.move_count() {
+        let Some(record) = board.record_at(i) else { continue };
+        let Action::Place(at) = record.action else { continue }; // 弃着无处可标
+        let Some(loss) = analysis.move_loss(i + 1, record.player) else { continue };
+        if !loss.severity.is_marked() {
+            continue; // 好棋 / 尚可不标，避免满盘花花绿绿
+        }
+        let color = severity_color(loss.severity);
+        let center = layout.point(at);
+        let radius = (layout.spacing * 0.16).max(2.5);
+        painter.circle_filled(center, radius, color);
+        // 深色细描边：白子上定形，黑子上靠亮色填充保持辨识。
+        painter.circle_stroke(
+            center,
+            radius,
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(20, 20, 20, 150)),
+        );
+        if loss.turn == board.cursor() {
+            // 当前手恰为失误手：棋子外缘加同色环，与末手内环标记呼应。
+            painter.circle_stroke(
+                center,
+                layout.spacing * 0.56,
+                Stroke::new((layout.spacing * 0.07).max(2.0), color),
+            );
+        }
     }
 }
 
