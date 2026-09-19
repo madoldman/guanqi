@@ -17,22 +17,17 @@
 //!
 //! 协议事实与线程模型见子模块文档；全部来自 v1.18.2 实测。
 
-// 引擎桥接层的完整公开 API 要到 UI 接线任务才有调用方；
-// allow 收窄到整个引擎模块，接入后如需精简再逐项处理。
-#![allow(dead_code)]
-
+// 模块统一位于 lib 目标后，公开类型即导出 API，无需整体放宽 dead_code。
 mod config;
 mod process;
 mod protocol;
 
-// 面向 UI 接线任务的门面 re-export，接入前无内部使用者，属预期。
-#[allow(unused_imports)]
+// 面向 UI 接线任务的门面 re-export。
 pub use config::{
     config_dir, default_analysis_cfg_path, default_weights_dir, effective_analysis_cfg,
     ensure_analysis_cfg, find_katago_in_path, load_settings, save_settings, scan_weights,
     settings_path, EngineBackend, EngineConfig, LoadedSettings,
 };
-#[allow(unused_imports)]
 pub use protocol::{AnalysisQuery, AnalysisReport, MoveInfo, QueryId, RootInfo};
 
 use crate::board::Size;

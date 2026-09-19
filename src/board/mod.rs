@@ -32,11 +32,24 @@
 //!    不再截断未来；
 //! 4. `MoveRecord` 与 `Grid` 结构无需变更，迁移面集中在 `Board` 内部。
 //!
+//! # 预设局面（让子局 / 摆子局，[`Board::from_setup`]）
+//!
+//! SGF 棋谱允许在非空初始局面上开始（`AB` / `AW` / `AE` 摆子，
+//! `PL` 指定首着方）。预设局面的语义约定：
+//!
+//! - 摆子**不计入手数**（`move_count` 从 0 起）、**不计提子统计**、
+//!   **不参与劫争判定**（劫争仍只比较相邻两手真实着法间的盘面）；
+//! - 历史 `positions[0]` 就是预设局面，`records()` 只含预设之后的真实着法；
+//! - 摆子中的**无气块允许存在**（记谱软件常导出死子未提的谱，
+//!   显示与分析均无碍），不报错、不 panic；仅坐标越界或黑白冲突时报
+//!   [`SetupError`]；
+//! - [`Board::new`] 等价于「空盘 + 黑先」的预设局面，二者共用同一构造路径。
+//!
 //! # 未实现的规则边界
 //!
-//! 超级劫与循环禁着、双活、让子 / 预设局面初始化（初始恒为空盘黑先）、
-//! 终局计子；禁着点仅覆盖自杀。GTP / SGF 的弃着记法（`pass` / `tt`）
-//! 不在本模块解析，由引擎与 SGF 层转换成 [`Action::Pass`]。
+//! 超级劫与循环禁着、双活、终局计子；禁着点仅覆盖自杀。
+//! GTP / SGF 的弃着记法（`pass` / `tt`）不在本模块解析，
+//! 由引擎与 SGF 层转换成 [`Action::Pass`]。
 
 // coord / rules 两个冻结文件内仍留有为阶段 3 / 5 预备的公开 API
 // （GTP / SGF 坐标转换、提子信息查询等），在接入前无调用方，allow 收窄到此。
@@ -84,6 +97,26 @@ impl MoveRecord {
     }
 }
 
+/// 预设局面构造失败的原因（坐标问题；无气块不在此列，见模块文档）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SetupError {
+    /// 摆子 / 清除坐标不在棋盘上。
+    OffBoard(Coord),
+    /// 同一坐标被同时指派为黑子与白子。
+    Conflicting(Coord),
+}
+
+impl std::fmt::Display for SetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OffBoard(c) => write!(f, "摆子坐标 {c} 超出棋盘范围"),
+            Self::Conflicting(c) => write!(f, "坐标 {c} 被同时摆为黑子与白子"),
+        }
+    }
+}
+
+impl std::error::Error for SetupError {}
+
 /// 棋盘状态：盘面 + 当前行棋方 + 提子计数 + 线性历史与游标。
 ///
 /// 游标（`cursor`）支持在不销毁后续手数的情况下回看（复盘）；
@@ -107,20 +140,59 @@ pub struct Board {
 }
 
 impl Board {
-    /// 创建空盘，黑先。
+    /// 创建空盘，黑先。等价于「空盘 + 黑先」的预设局面，与
+    /// [`Board::from_setup`] 共用同一构造路径。
     pub fn new(size: Size) -> Self {
-        let grid: Grid = vec![None; size.point_count()];
-        Self {
+        Self::from_setup(size, &[], &[], &[], Stone::Black)
+            .expect("空盘预设没有任何坐标，构造必然成功")
+    }
+
+    /// 由预设局面构造棋盘（让子局 / 摆子局，语义见模块文档）：
+    ///
+    /// - 摆子不计手数、不计提子统计、不参与劫争判定；
+    /// - `positions[0]` 即预设局面，`records()` 只含其后的真实着法；
+    /// - 摆子中的无气块允许存在（不报错、不提取）；
+    /// - 先摆黑 (`black`)、再摆白 (`white`)，最后清除 (`removed`)，
+    ///   即清除与摆子同点时清除生效；
+    /// - 仅坐标越界或同一坐标黑白冲突时返回 [`SetupError`]。
+    pub fn from_setup(
+        size: Size,
+        black: &[Coord],
+        white: &[Coord],
+        removed: &[Coord],
+        to_play: Stone,
+    ) -> Result<Self, SetupError> {
+        for &at in black.iter().chain(white).chain(removed) {
+            if !at.on_board(size) {
+                return Err(SetupError::OffBoard(at));
+            }
+        }
+        for &at in black {
+            if white.contains(&at) {
+                return Err(SetupError::Conflicting(at));
+            }
+        }
+        let mut grid: Grid = vec![None; size.point_count()];
+        for &at in black {
+            grid[at.index(size)] = Some(Stone::Black);
+        }
+        for &at in white {
+            grid[at.index(size)] = Some(Stone::White);
+        }
+        for &at in removed {
+            grid[at.index(size)] = None;
+        }
+        Ok(Self {
             size,
             grid,
-            to_play: Stone::Black,
+            to_play,
             moves: Vec::new(),
             positions: Vec::new(),
             cursor: 0,
             captured_by_black: 0,
             captured_by_white: 0,
         }
-        .with_initial_position()
+        .with_initial_position())
     }
 
     /// 内部辅助：写入初始盘面快照，保证 `positions` 不变量。

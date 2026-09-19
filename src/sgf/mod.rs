@@ -25,17 +25,14 @@
 //! 属性顺序不重排、值解码后再转义写出，因此
 //! `parse_str(&tree.write())? == tree`（未知属性与转义都不变）。
 
-// 阶段 5 UI 接线（文件打开、棋谱树）接入前无调用方，先整体放宽 dead_code。
-#![allow(dead_code)]
-
+// 模块统一位于 lib 目标后，公开类型即导出 API，无需整体放宽 dead_code。
 mod error;
 mod lexer;
+mod load;
 mod tree;
 
-// UI 接线前 re-export 无内部使用者，属预期。
-#[allow(unused_imports)]
 pub use error::{Position, SgfError, SgfErrorKind};
-#[allow(unused_imports)]
+pub use load::{GameMeta, LoadError, LoadedGame, load_from_bytes};
 pub use tree::{GameInfo, GameTree, Node, Property};
 
 use std::borrow::Cow;

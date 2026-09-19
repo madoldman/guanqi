@@ -1,12 +1,7 @@
 //! 观棋 (Guanqi) —— KataGo 围棋 AI 引擎图形前端。
 //!
-//! 程序入口：配置原生窗口选项并启动 eframe 运行时。
-
-mod app;
-mod board;
-mod engine;
-mod sgf;
-mod ui;
+//! 程序入口（薄壳）：配置原生窗口选项并启动 eframe 运行时。
+//! 全部功能在库目标中（见 `lib.rs`）。
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -21,6 +16,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "guanqi",
         options,
-        Box::new(|cc| Ok(Box::new(app::GuanqiApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(guanqi::app::GuanqiApp::new(cc)))),
     )
 }

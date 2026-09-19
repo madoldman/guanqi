@@ -154,8 +154,7 @@ struct Inflight {
 }
 
 /// 引擎接线与分析状态。
-pub struct AnalysisState {
-    /// 引擎状态机（侧栏直接显示）。
+pub struct AnalysisState {    /// 引擎状态机（侧栏直接显示）。
     pub engine: EngineStatus,
     /// 当前局面的最新分析快照；局面变化即作废。
     pub snapshot: Option<Snapshot>,
@@ -239,6 +238,21 @@ impl AnalysisState {
         while let Some(event) = self.handle.as_mut().and_then(Engine::try_recv) {
             self.on_event(event, board, cfg);
         }
+    }
+
+    /// 载入新棋谱时清空全部分析状态：作废在飞查询与快照、清空逐手
+    /// 胜率历史（新对局不能混入旧曲线）。引擎进程保持运行，下一帧
+    /// `sync` 会因局面签名变化自动对新局面发起查询。
+    pub fn reset(&mut self) {
+        if let Some(inflight) = self.inflight.take()
+            && let Some(handle) = self.handle.as_mut()
+        {
+            handle.terminate(inflight.id);
+        }
+        self.analyzed_sig = None;
+        self.snapshot = None;
+        self.transient_error = None;
+        self.history.clear();
     }
 
     /// 退出时优雅关闭引擎进程（`App::on_exit` 调用）。
@@ -379,5 +393,11 @@ impl AnalysisState {
             stage,
             started: Instant::now(),
         });
+    }
+}
+
+impl Default for AnalysisState {
+    fn default() -> Self {
+        Self::new()
     }
 }

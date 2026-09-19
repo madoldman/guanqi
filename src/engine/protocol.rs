@@ -161,6 +161,8 @@ impl AnalysisQuery {
 pub(crate) enum ControlRequest {
     Terminate(QueryId),
     TerminateAll,
+    /// `query_version` 诊断命令：协议完整实现的一部分，当前接线未使用。
+    #[allow(dead_code)]
     QueryVersion,
 }
 
@@ -289,6 +291,9 @@ pub struct AnalysisReport {
 }
 
 impl AnalysisReport {
+    /// 终态判定辅助：与 [`super::EngineEvent::Report`] 的 `is_final` 同一
+    /// 口径，供诊断 / 测试使用，当前主流程未调用。
+    #[allow(dead_code)]
     pub(crate) fn is_final(&self) -> bool {
         !self.is_during_search
     }

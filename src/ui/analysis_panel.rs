@@ -11,6 +11,7 @@ use egui::{Color32, Pos2, Rect, RichText, Sense, Ui, Vec2};
 
 use crate::board::{Coord, IllegalReason, Stone};
 use crate::engine::{EngineConfig, RootInfo};
+use crate::sgf::GameMeta;
 
 use super::analysis::{AnalysisState, EngineStatus};
 use super::overlay::{self, Overlay};
@@ -34,6 +35,35 @@ pub enum PanelAction {
         /// 主变幽灵子（已剔除断着与盘面已有棋子的点由绘制端处理）。
         ghosts: Vec<(Coord, Stone)>,
     },
+}
+
+/// 「打开棋谱」流程的用户可见提示（App 写入，随侧栏提示行显示）。
+#[derive(Clone, Debug)]
+pub enum LoadNotice {
+    /// 载入成功（完整）。
+    Ok(String),
+    /// 需要留意：部分载入（非法着法提前停止）、已有对话框在等待等。
+    Warn(String),
+    /// 打开失败（原棋盘保留不动）。
+    Failed(String),
+}
+
+impl LoadNotice {
+    /// 提示文本。
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Ok(text) | Self::Warn(text) | Self::Failed(text) => text,
+        }
+    }
+
+    /// 提示配色（与侧栏既有提示一致：绿 = 成功，橙 = 留意，红 = 失败）。
+    fn color(&self) -> Color32 {
+        match self {
+            Self::Ok(_) => Color32::from_rgb(140, 220, 140),
+            Self::Warn(_) => Color32::from_rgb(255, 190, 90),
+            Self::Failed(_) => Color32::from_rgb(255, 120, 110),
+        }
+    }
 }
 
 /// 状态文本与配色。
@@ -73,6 +103,9 @@ fn eval_lines(root: &RootInfo) -> (String, String) {
 /// 绘制分析侧栏。`settings_open` 由本面板与顶部按钮共享；
 /// `overlay` 为棋盘叠加层的层开关与定位状态（本面板读写）；
 /// `curve_open` 为胜率曲线底部面板的显示开关。
+/// `game` / `comment` / `load_notice` 为「打开棋谱」相关信息：已载入棋谱
+/// 的元信息、当前手注释与最近一次打开操作的提示（无则对应段落不显示）。
+/// 注释可能很长，整体包一层垂直滚动，避免侧栏内容被裁剪。
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut Ui,
@@ -83,6 +116,42 @@ pub fn show(
     settings_open: &mut bool,
     overlay: &mut Overlay,
     curve_open: &mut bool,
+    game: Option<&GameMeta>,
+    comment: Option<&str>,
+    load_notice: Option<&LoadNotice>,
+) -> PanelAction {
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        panel_body(
+            ui,
+            analysis,
+            cfg,
+            notice,
+            startup_notice,
+            settings_open,
+            overlay,
+            curve_open,
+            game,
+            comment,
+            load_notice,
+        )
+    })
+    .inner
+}
+
+/// 侧栏正文（[`show`] 的滚动内容）。
+#[allow(clippy::too_many_arguments)]
+fn panel_body(
+    ui: &mut Ui,
+    analysis: &AnalysisState,
+    cfg: &EngineConfig,
+    notice: Option<IllegalReason>,
+    startup_notice: Option<&str>,
+    settings_open: &mut bool,
+    overlay: &mut Overlay,
+    curve_open: &mut bool,
+    game: Option<&GameMeta>,
+    comment: Option<&str>,
+    load_notice: Option<&LoadNotice>,
 ) -> PanelAction {
     let mut action = PanelAction::None;
     ui.heading("分析");
@@ -120,6 +189,49 @@ pub fn show(
             *settings_open = !*settings_open;
         }
     });
+
+    // ---- 棋谱信息（打开棋谱后显示；属性存在才显示对应行）----
+    if let Some(game) = game {
+        ui.add_space(6.0);
+        ui.separator();
+        ui.heading("棋谱");
+        let file = game
+            .source
+            .file_name()
+            .map_or_else(|| "（无文件名）".to_owned(), |n| n.to_string_lossy().into_owned());
+        let file_label = ui.label(RichText::new(file).strong());
+        file_label.on_hover_text(game.source.display().to_string());
+        let info = &game.info;
+        if let Some(line) = player_line(&info.player_black, &info.rank_black) {
+            ui.label(format!("黑：{line}"));
+        }
+        if let Some(line) = player_line(&info.player_white, &info.rank_white) {
+            ui.label(format!("白：{line}"));
+        }
+        if let Some(result) = &info.result {
+            ui.label(format!("结果：{result}"));
+        }
+        if let Some(komi) = info.komi {
+            ui.label(format!("贴目：{komi}"));
+        }
+        if info.handicap > 0 {
+            ui.label(format!("让子：{}", info.handicap));
+        }
+        if let Some(date) = &info.date {
+            ui.label(format!("日期：{date}"));
+        }
+        if let Some(event) = &info.event {
+            ui.label(format!("赛事：{event}"));
+        }
+        if let Some(rules) = &info.rules {
+            ui.label(format!("规则：{rules}"));
+        }
+        // 当前手的 `C` 注释（无则不显示）。
+        if let Some(text) = comment {
+            ui.add_space(4.0);
+            ui.label(text);
+        }
+    }
 
     ui.add_space(6.0);
     ui.separator();
@@ -237,8 +349,26 @@ pub fn show(
         ui.colored_label(Color32::from_rgb(255, 190, 90), text);
         hint = true;
     }
+    if let Some(msg) = load_notice {
+        ui.colored_label(msg.color(), msg.text());
+        hint = true;
+    }
     if !hint {
         ui.weak("无提示。");
     }
     action
+}
+
+/// 棋手与段位拼成一行显示文本（如 `聂卫平 九段`）；两者都缺返回 `None`。
+fn player_line(name: &Option<String>, rank: &Option<String>) -> Option<String> {
+    match (name, rank) {
+        (None, None) => None,
+        (name, rank) => Some(
+            name.as_deref()
+                .into_iter()
+                .chain(rank.as_deref())
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+    }
 }
