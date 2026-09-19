@@ -3,6 +3,7 @@ name = "guanqi"
 version = "0.1.0"
 edition = "2024"
 description = "观棋 —— KataGo 围棋 AI 引擎图形前端"
+license = "MIT"
 # 仅通过发行版包管理器分发（pacman 等），不发布到 crates.io。
 publish = false
 
