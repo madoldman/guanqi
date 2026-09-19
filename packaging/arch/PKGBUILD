@@ -1,0 +1,113 @@
+# Maintainer: 刘传玉
+# 观棋 —— KataGo 围棋 AI 引擎图形前端（本地打包，暂不提交 AUR）
+#
+# 打包方式（在仓库 packaging/arch/ 目录说明，实际构建在仓库外进行，例如
+# /home/madoldman/build/guanqi-pkg/）：
+#   1) 生成源码包（在仓库根目录执行；含工作树中的 LICENSE，排除 .git/target/packaging）：
+#      tar --exclude-vcs --exclude=target --exclude=packaging \
+#          --transform 's,^\./,guanqi-0.1.0/,' \
+#          -czf /home/madoldman/build/guanqi-pkg/guanqi-0.1.0.tar.gz .
+#      （主流程把 LICENSE 提交入库后，可改为标准做法：
+#        git archive --format=tar.gz --prefix=guanqi-0.1.0/ -o guanqi-0.1.0.tar.gz HEAD）
+#   2) 生成离线依赖包：cargo vendor <目录> 后 tar -czf vendor.tar.gz <目录名>
+#   3) 把本 PKGBUILD 与 guanqi.desktop、guanqi.svg、guanqi-*.png 一并复制到构建目录
+#   4) makepkg 构建，sudo pacman -U guanqi-0.1.0-1-x86_64.pkg.tar.zst 安装
+
+pkgname=guanqi
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='观棋 —— KataGo 围棋 AI 引擎图形前端'
+arch=('x86_64')
+license=('MIT')
+# release 构建无调试符号，关闭 makepkg 的 debug 子包拆分（避免无意义的 guanqi-debug）
+options=('!debug')
+
+# 依赖依据：对运行中的 release 二进制 /proc/<pid>/maps 实测归纳（2026-09-19，
+# Wayland 会话 + X11 display 并存环境），非仅 ldd（eframe/winit/wgpu 大量运行时 dlopen）：
+#   - ldd 直接链接仅 glibc / libgcc_s / libm；其余全部 dlopen
+#   - eframe 0.36.2 同时启用 glow 与 wgpu 时 Renderer::default() 选 Wgpu（Vulkan），
+#     同时 wgpu 亦枚举 GL 后端，故 Vulkan 与 EGL 两套栈都需在位
+depends=(
+  'gcc-libs'           # libgcc_s / libstdc++（ldd 直接链接）
+  'wayland'            # libwayland-client（winit Wayland 后端 dlopen）
+  'libdisplay-info'    # Wayland dmabuf 反馈解析（smithay-client-toolkit dlopen）
+  'libxkbcommon'       # 键盘输入，Wayland/X11 后端共用（dlopen）
+  'libx11'             # X11 会话支持（winit dlopen；Wayland 会话下亦被探测加载）
+  'libxcb'             # 同上（x11rb-dl 直接 dlopen libxcb.so.1）
+  'xcb-util-keysyms'   # X11 键盘路径（实测被 dlopen：libxcb-keysyms.so.1）
+  'libglvnd'           # libEGL（wgpu GL 后端 dlopen）
+  'mesa'               # EGL/GL 实现（libEGL_mesa / libgallium）与软件渲染回退
+  'vulkan-icd-loader'  # libvulkan.so.1（wgpu/Vulkan 默认渲染路径，ash dlopen）
+)
+makedepends=('cargo')
+# 外部依赖约定（项目定死）：KataGo 引擎与权重、中文字体均不打进包，由用户自备/自选
+optdepends=(
+  'katago: 围棋 AI 分析引擎（主程序启动时自动在 PATH 中查找，权重与配置文件需用户自备）'
+  'noto-fonts-cjk: 中文界面字体（程序按固定路径加载 /usr/share/fonts/noto-cjk/ 下字体）'
+  'adobe-source-han-sans-cn-fonts: 思源黑体（中文界面字体的另一选择）'
+  'vulkan-swrast: 无硬件 Vulkan 驱动时的软件渲染回退'
+)
+
+# 全部本地源：源码 tarball + 离线依赖 tarball + 桌面入口 + 图标（SVG 与常用尺寸 PNG）
+source=(
+  "guanqi-$pkgver.tar.gz"
+  'vendor.tar.gz'
+  'guanqi.desktop'
+  'guanqi.svg'
+  'guanqi-256.png'
+  'guanqi-128.png'
+  'guanqi-64.png'
+  'guanqi-48.png'
+  'guanqi-32.png'
+)
+sha256sums=('1f96c495bf1b4885bea0be6e7b3f5452e1dae4200b68165989f9a102cff50a5a'
+            '126bfe2b530670e39af8307d5552790bf4c408a82b3e203cb60bbe8691153ac1'
+            '4b2b693a7106e462be64769487b8f9e59c32ff91ce2c5d5b70e58924e1bc78d5'
+            '73a956d0f62b37854bd681123a8674601bf564574213ee97b109f874a20b9c33'
+            'effb8563310b021a37c80265641c1a7e7cf2b3f758df3db7edc5fbe15e02e9c8'
+            '31a07f97f9adf9be14b10edfd72b1ad2ea5fd328d4ab84a92559ad39f170ea43'
+            '50e6ef5ffe5108fe6e65070ccc3860fb2cd8e167c07f44a4dca8b24fc9c60c72'
+            '756ae8e63cf745e3a3548d928e72f3fc185f94040e9d99fd247e731358a334f1'
+            'a987308f0857725b35ba15d5b37ab016e1e2b0b654ca797eb31d1d818f0a7359')
+
+prepare() {
+  cd "guanqi-$pkgver"
+  # 离线构建关键：把 crates.io 源替换为 vendor 目录（cargo vendor 输出的标准配置）。
+  # directory 用绝对路径，避免相对路径解析歧义。
+  mkdir -p .cargo
+  cat > .cargo/config.toml <<EOF
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "$srcdir/vendor"
+EOF
+}
+
+build() {
+  cd "guanqi-$pkgver"
+  # CARGO_HOME 指向空目录：构建完全自包含，不读用户 cargo 缓存，保证 vendor 可复现
+  export CARGO_HOME="$srcdir/cargo-home"
+  export CARGO_TARGET_DIR="$srcdir/target"
+  # 重映射源码路径：避免把构建机 $srcdir 绝对路径编进二进制（消除 makepkg 的 srcdir 引用警告）
+  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$srcdir=/usr/src/guanqi"
+  # --frozen = --offline + --locked：完全离线，且强制 Cargo.lock 与清单一致
+  cargo build --frozen --release
+}
+
+package() {
+  cd "guanqi-$pkgver"
+  # 主程序（用户端只拿预编译二进制，不接触 cargo/crates.io）
+  install -Dm755 "$srcdir/target/release/guanqi" "$pkgdir/usr/bin/guanqi"
+  # 桌面入口
+  install -Dm644 "$srcdir/guanqi.desktop" "$pkgdir/usr/share/applications/guanqi.desktop"
+  # 图标：SVG + 常用尺寸 PNG
+  install -Dm644 "$srcdir/guanqi.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/guanqi.svg"
+  local _s
+  for _s in 256 128 64 48 32; do
+    install -Dm644 "$srcdir/guanqi-$_s.png" \
+      "$pkgdir/usr/share/icons/hicolor/${_s}x${_s}/apps/guanqi.png"
+  done
+  # 许可证（MIT，作者已定）
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

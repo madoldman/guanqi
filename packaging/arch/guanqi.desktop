@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=观棋
+Name[en]=Guanqi
+Comment=KataGo 围棋 AI 引擎图形前端
+Comment[en]=Graphical frontend for the KataGo Go engine
+Exec=guanqi
+Icon=guanqi
+Terminal=false
+Categories=Game;BoardGame;
+Keywords=go;weiqi;baduk;围棋;棋类;KataGo;
