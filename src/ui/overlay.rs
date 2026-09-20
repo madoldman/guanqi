@@ -26,7 +26,7 @@ use egui::{Align2, Color32, FontId, Painter, Rect, Stroke, Vec2};
 
 use crate::board::{Action, Board, Coord, Stone};
 
-use super::analysis::{AnalysisState, Severity, Snapshot};
+use super::analysis::{loss_from_points, AnalysisState, Severity, Snapshot};
 use super::board_view::Layout;
 
 /// 棋盘上绘制的候选点条数（与侧栏 `MOVE_LIMIT` 解耦，各自维护）。
@@ -183,19 +183,20 @@ pub(crate) fn draw_candidates(painter: &Painter, layout: &Layout, snapshot: &Sna
 
 /// 失误标注（KaTrain 风格）：疑问手及以上的落子处叠小色点，颜色按
 /// [`severity_color`] 分档；当前手恰为失误手时额外加一圈外环更醒目。
-/// 回看中针对**所有已知手数**绘制，不只当前手；数据不全（未知）的手数
-/// 由 [`AnalysisState::move_loss`] 返回 `None`，自然跳过。
+/// 回看中针对**所有已知手数**绘制，不只当前手；只沿**当前线**取数
+/// （[`AnalysisState::line_points`]），其它分支的手不与当前线混排；
+/// 数据不全（未知）的手数由 [`loss_from_points`] 返回 `None`，自然跳过。
 pub(crate) fn draw_mistakes(
     painter: &Painter,
     layout: &Layout,
     board: &Board,
     analysis: &AnalysisState,
 ) {
-    // 只沿**当前线**遍历：变着分支上的手数不与当前线混排。
-    for i in 0..board.line_len() {
-        let Some(record) = board.record_at(i) else { continue };
+    let slots = analysis.line_points(board);
+    for (i, record) in board.line_records().iter().enumerate() {
         let Action::Place(at) = record.action else { continue }; // 弃着无处可标
-        let Some(loss) = analysis.move_loss(i + 1, record.player) else { continue };
+        let (Some(before), Some(after)) = (slots[i], slots[i + 1]) else { continue };
+        let Some(loss) = loss_from_points(i + 1, record.player, before, after) else { continue };
         if !loss.severity.is_marked() {
             continue; // 好棋 / 尚可不标，避免满盘花花绿绿
         }

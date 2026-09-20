@@ -32,6 +32,8 @@ pub struct GuanqiApp {
     board: Board,
     /// 最近一次非法落子的原因；由棋盘视图写入、跨帧显示，成功操作后清除。
     notice: Option<IllegalReason>,
+    /// 最近一次「回看中落子新建变着分支」的轻提示；成功导航 / 切分支后清除。
+    branch_notice: Option<String>,
     /// 引擎接线与分析状态（状态机 + 当前局面快照）。
     analysis: AnalysisState,
     /// 棋盘叠加层状态：层开关与侧栏点击定位（本次运行内保持）。
@@ -82,6 +84,7 @@ impl GuanqiApp {
             fonts_ok,
             board: Board::new(Size::new(19).expect("19 为固定合法尺寸")),
             notice: None,
+            branch_notice: None,
             analysis,
             overlay: overlay::Overlay {
                 show_candidates: true,
@@ -197,7 +200,6 @@ impl eframe::App for GuanqiApp {
         if ui.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.ctrl) {
             self.open_file_dialog();
         }
-
         // 顶部菜单栏：文件 → 打开棋谱…
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -291,6 +293,7 @@ impl eframe::App for GuanqiApp {
                 ui,
                 &mut self.board,
                 &mut self.notice,
+                &mut self.branch_notice,
                 &self.analysis,
                 &self.overlay,
             );

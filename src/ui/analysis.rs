@@ -13,11 +13,13 @@
 //! [`AnalysisState::snapshot`] 是分析结果的唯一存放点：侧栏读它显示，
 //! 棋盘候选点叠加层 / 热度图也直接取用，避免二次搬运。
 //! 逐手胜率历史（[`AnalysisState::history`]，TASKS 4.3 曲线用）只是
-//! 终态快照的按手数转存：随浏览逐步积累，切换局面不清空，
-//! 同一手数后到且 visits 更多的终态覆盖先到的。
-//! 每手损失（[`AnalysisState::move_loss`]，TASKS 4.4）不另存状态：
-//! 读取时由相邻两个已知历史点现场派生，引擎零额外查询。
+//! 终态快照的转存：键为**局面签名**（根到该局面着法前缀的 FNV-1a），
+//! 谱树中不同分支的同一手数是不同局面，各存各的，切换分支不互相覆盖；
+//! 同局面后到且 visits 更多的终态覆盖先到的。
+//! 每手损失（[`loss_from_points`]，TASKS 4.4）不另存状态：读取时由当前线
+//! 相邻两个已知历史点现场派生，引擎零额外查询。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -34,8 +36,8 @@ pub type Waker = Arc<dyn Fn() + Send + Sync>;
 /// 快速阶段的 visits 上限：局面刚变化时先小预算出结果，再自动加深。
 const FAST_VISITS: u32 = 100;
 
-/// 逐手历史的容量上限（手数）。19 路盘的实用对局远小于此，
-/// 超出部分不再写入，避免无界增长。
+/// 逐手历史容量上限（条目数，各分支分开计数）。19 路盘的实用对局
+/// 远小于此，超出部分不再写入，避免无界增长。
 const HISTORY_CAP: usize = 999;
 
 // ---- 每手损失分级阈值（目差口径，正 = 行棋方亏损）----
@@ -72,7 +74,7 @@ pub struct HistoryPoint {
 }
 
 /// 第 `turn` 手（1 起）的行棋方视角损失：由第 `turn − 1` 与第 `turn` 手后
-/// 两个**已知**历史点现场派生（[`AnalysisState::move_loss`]），任一端缺失
+/// 两个**已知**历史点现场派生（[`loss_from_points`]），任一端缺失
 /// 即为「未知」，不插值、不臆造 0。
 #[derive(Clone, Copy, Debug)]
 pub struct MoveLoss {
@@ -139,7 +141,7 @@ impl Severity {
 /// 失误汇总统计（[`AnalysisState::loss_summary`]，侧栏显示用）。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LossSummary {
-    /// 总手数。
+    /// 当前线总手数。
     pub total: usize,
     /// 两端数据齐全、可算损失的手数；其余手数状态为「未知」。
     pub analyzed: usize,
@@ -188,44 +190,70 @@ pub struct Snapshot {
     pub ownership: Option<Vec<f32>>,
 }
 
-/// 逐手历史条目：数据点 + 写入时的局面签名（覆盖判定用）。
-#[derive(Clone, Copy, Debug)]
-struct HistoryEntry {
-    point: HistoryPoint,
-    /// 该手数写入时的局面签名（[`Self::position_sig`]）：
-    /// 悔棋后另行走子使同手数对应新局面，旧条目须无条件让位。
-    sig: u64,
-}
-
 /// 局面签名：对手数记录前缀逐字节做 FNV-1a（行棋方 / 着法 / 提子）。
-/// 仅用于本模块的覆盖判定，不要求抗碰撞。
+/// 仅用于本模块的覆盖判定与历史取数，不要求抗碰撞。
 fn position_sig(records: &[MoveRecord]) -> u64 {
-    fn byte(h: &mut u64, b: u8) {
-        *h ^= u64::from(b);
-        *h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
     let mut h = 0xcbf2_9ce4_8422_2325;
     for r in records {
-        byte(&mut h, u8::from(matches!(r.player, Stone::Black)));
-        match r.action {
-            Action::Place(c) => {
-                byte(&mut h, 1);
-                byte(&mut h, c.x());
-                byte(&mut h, c.y());
-            }
-            Action::Pass => byte(&mut h, 0),
-        }
-        let n = r.captured.len();
-        byte(&mut h, n as u8);
-        byte(&mut h, (n >> 8) as u8);
-        for c in &r.captured {
-            byte(&mut h, c.x());
-            byte(&mut h, c.y());
-        }
+        hash_record(&mut h, r);
     }
     h
 }
 
+/// 把一手棋混入局面签名（[`position_sig`] 与 [`AnalysisState::line_points`]
+/// 的滚动计算共用，保证两条路径对同一前缀算出同一签名）。
+fn hash_record(h: &mut u64, record: &MoveRecord) {
+    fn byte(h: &mut u64, b: u8) {
+        *h ^= u64::from(b);
+        *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    byte(h, u8::from(matches!(record.player, Stone::Black)));
+    match record.action {
+        Action::Place(c) => {
+            byte(h, 1);
+            byte(h, c.x());
+            byte(h, c.y());
+        }
+        Action::Pass => byte(h, 0),
+    }
+    let n = record.captured.len();
+    byte(h, n as u8);
+    byte(h, (n >> 8) as u8);
+    for c in &record.captured {
+        byte(h, c.x());
+        byte(h, c.y());
+    }
+}
+
+/// 第 `turn` 手（1 起）的行棋方视角损失：由走子前后两个局面点的数据派生；
+/// `turn == 0` 或任一端缺失时为 `None`（未知），不插值、不臆造 0。
+///
+/// 视角换算（`winrate` / `score_lead` 均为黑方视角，见 `HistoryPoint`）：
+/// 黑方行棋时损失 = 走子前黑方值 − 走子后黑方值；白方行棋时符号相反
+/// （黑方值升 = 白方亏）。结果一律为「行棋方失去了多少」，正 = 亏。
+pub fn loss_from_points(
+    turn: usize,
+    player: Stone,
+    before: HistoryPoint,
+    after: HistoryPoint,
+) -> Option<MoveLoss> {
+    if turn == 0 {
+        return None; // 空盘没有「走子前」，无从谈损失
+    }
+    let side = match player {
+        Stone::Black => 1.0,
+        Stone::White => -1.0,
+    };
+    let score_loss = (before.score_lead - after.score_lead) * side;
+    let winrate_loss = (before.winrate - after.winrate) * side;
+    Some(MoveLoss {
+        turn,
+        player,
+        score_loss,
+        winrate_loss,
+        severity: Severity::from_score_loss(score_loss),
+    })
+}
 /// 查询阶段：先快后深。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Stage {
@@ -253,7 +281,8 @@ struct Inflight {
 }
 
 /// 引擎接线与分析状态。
-pub struct AnalysisState {    /// 引擎状态机（侧栏直接显示）。
+pub struct AnalysisState {
+    /// 引擎状态机（侧栏直接显示）。
     pub engine: EngineStatus,
     /// 当前局面的最新分析快照；局面变化即作废。
     pub snapshot: Option<Snapshot>,
@@ -261,10 +290,12 @@ pub struct AnalysisState {    /// 引擎状态机（侧栏直接显示）。
     pub transient_error: Option<String>,
     /// 最近一条引擎日志（诊断用）。
     pub last_log: Option<String>,
-    /// 逐手胜率历史：下标 = 手数（0 = 初始空盘），`None` = 该手尚无终态数据。
-    /// 随浏览逐步积累，切换局面（落子 / 导航 / 悔棋）不清空；
-    /// 曲线（`ui::curve`）按手数取用，缺口留空。
-    history: Vec<Option<HistoryEntry>>,
+    /// 逐手胜率历史：键 = 局面签名（根到该局面着法前缀的 FNV-1a，
+    /// 见 [`position_sig`]）。谱树中不同分支的同一手数是不同局面，
+    /// 各存各的：切换分支不互相覆盖，切回来数据仍在。
+    /// 曲线 / 失误统计（`ui::curve` / `ui::overlay`）经 [`Self::line_points`]
+    /// 只取当前线上的点，缺口留空。
+    history: HashMap<u64, HistoryPoint>,
     handle: Option<Engine>,
     inflight: Option<Inflight>,
     /// 上次发起查询时的局面签名（手数记录前缀）；`None` 表示尚未分析过。
@@ -278,7 +309,7 @@ impl AnalysisState {
             snapshot: None,
             transient_error: None,
             last_log: None,
-            history: Vec::new(),
+            history: HashMap::new(),
             handle: None,
             inflight: None,
             analyzed_sig: None,
@@ -313,46 +344,35 @@ impl AnalysisState {
         self.inflight.is_some()
     }
 
-    /// 查询某手的逐手历史数据（0 = 初始空盘）；该手尚无终态数据时为 `None`。
-    pub fn history_point(&self, turn: usize) -> Option<HistoryPoint> {
-        self.history.get(turn).and_then(|slot| slot.map(|e| e.point))
-    }
-
-    /// 第 `turn` 手（1 起）的行棋方视角损失；`None` = 两端数据不全（未知）。
+    /// 当前线（根到当前节点沿选中子分支）的逐手历史数据：下标 = 手数
+    /// （0 = 初始空盘，长度 = `line_len() + 1`），`None` = 该手尚无终态数据。
     ///
-    /// 视角换算（`winrate` / `score_lead` 均为黑方视角，见 `HistoryPoint`）：
-    /// 黑方行棋时损失 = 走子前黑方值 − 走子后黑方值；白方行棋时符号相反
-    /// （黑方值升 = 白方亏）。结果一律为「行棋方失去了多少」，正 = 亏。
-    /// 行棋方由调用方从 `Board::record_at(turn - 1)` 取。
-    pub fn move_loss(&self, turn: usize, player: Stone) -> Option<MoveLoss> {
-        if turn == 0 {
-            return None; // 空盘没有「走子前」，无从谈损失
+    /// 每项按「根到该手着法前缀」的签名从历史缓冲取——同手数的不同分支
+    /// 是不同局面，各取各的数据，互不干扰。O(线长) 滚动计算签名，
+    /// 一帧至多调用一次（曲线、失误标注、侧栏汇总各调一次，可接受）。
+    pub fn line_points(&self, board: &Board) -> Vec<Option<HistoryPoint>> {
+        let records = board.line_records();
+        let mut points = Vec::with_capacity(records.len() + 1);
+        let mut sig = 0xcbf2_9ce4_8422_2325;
+        points.push(self.history.get(&sig).copied());
+        for record in records {
+            hash_record(&mut sig, record);
+            points.push(self.history.get(&sig).copied());
         }
-        let before = self.history_point(turn - 1)?;
-        let after = self.history_point(turn)?;
-        let side = match player {
-            Stone::Black => 1.0,
-            Stone::White => -1.0,
-        };
-        let score_loss = (before.score_lead - after.score_lead) * side;
-        let winrate_loss = (before.winrate - after.winrate) * side;
-        Some(MoveLoss {
-            turn,
-            player,
-            score_loss,
-            winrate_loss,
-            severity: Severity::from_score_loss(score_loss),
-        })
+        points
     }
 
-    /// 失误汇总统计：遍历全部手数现场派生（每手仅两次下标读取与算术，
+    /// 失误汇总统计：遍历当前线现场派生（每手仅两次哈希读取与算术，
     /// 可每帧调用）。「已分析」只计两端数据齐全的手数，缺口不计入分级。
     pub fn loss_summary(&self, board: &Board) -> LossSummary {
-        // 只统计**当前线**：变着分支的手数不在当前线的复盘中。
-        let mut summary = LossSummary { total: board.line_len(), ..LossSummary::default() };
-        for i in 0..summary.total {
-            let Some(record) = board.record_at(i) else { continue };
-            let Some(loss) = self.move_loss(i + 1, record.player) else { continue };
+        let points = self.line_points(board);
+        let mut summary =
+            LossSummary { total: board.line_len(), ..LossSummary::default() };
+        for (i, record) in board.line_records().iter().enumerate() {
+            let (Some(before), Some(after)) = (points[i], points[i + 1]) else { continue };
+            let Some(loss) = loss_from_points(i + 1, record.player, before, after) else {
+                continue;
+            };
             summary.analyzed += 1;
             match loss.severity {
                 Severity::Questionable => summary.questionable += 1,
@@ -467,8 +487,7 @@ impl AnalysisState {
             moves,
             ownership: report.ownership,
         });
-        // 终态转存进逐手历史：局面未变时 visits 更高者胜（深阶段覆盖快阶段），
-        // 局面已变（悔棋后另行走子）则无条件覆盖。
+        // 终态转存进逐手历史：局面未变时 visits 更高者胜（深阶段覆盖快阶段）。
         if is_final
             && let Some(root) = &root
         {
@@ -488,16 +507,14 @@ impl AnalysisState {
         }
     }
 
-    /// 终态结果转存进逐手历史：下标 = 手数（0 = 初始空盘）。
-    /// 同一手数：局面不同（`sig` 不符，悔棋后另行走子）无条件覆盖；
-    /// 局面相同则 visits 不低于旧条目才覆盖（深阶段后到、覆盖快阶段）。
-    /// 无根节点数据或超容量时跳过。
+    /// 终态结果转存进逐手历史：键 = 局面签名（该报告对应的着法前缀）。
+    /// 同一局面（同签名）visits 不低于旧条目才覆盖（深阶段后到、覆盖快阶段）；
+    /// 不同局面各占一个键，同手数的分支互不覆盖。无根节点数据或
+    /// 容量已满时跳过。
     fn record_history(&mut self, turn: usize, root: &RootInfo, sig: u64) {
-        if turn > HISTORY_CAP {
+        if turn > HISTORY_CAP || self.history.len() >= HISTORY_CAP && !self.history.contains_key(&sig)
+        {
             return;
-        }
-        if self.history.len() <= turn {
-            self.history.resize(turn + 1, None);
         }
         let point = HistoryPoint {
             turn,
@@ -505,12 +522,12 @@ impl AnalysisState {
             score_lead: root.score_lead,
             visits: root.visits,
         };
-        let overwrite = match self.history[turn].as_ref() {
-            Some(entry) => entry.sig != sig || root.visits >= entry.point.visits,
+        let overwrite = match self.history.get(&sig) {
+            Some(old) => root.visits >= old.visits,
             None => true,
         };
         if overwrite {
-            self.history[turn] = Some(HistoryEntry { point, sig });
+            self.history.insert(sig, point);
         }
     }
 

@@ -1,7 +1,9 @@
 //! 胜率曲线（TASKS 4.3 / 4.4）：底部面板逐手黑方胜率折线、当前手指示、
 //! 悬停数值与失误联动。
 //!
-//! 数据只读自 [`AnalysisState::history`]（逐手历史缓冲，随浏览逐步积累）：
+//! 数据经 [`AnalysisState::line_points`] 只取**当前线**（根到当前节点沿
+//! 选中子分支）上的历史点——历史缓冲按局面签名存储，同手数的不同分支
+//! 各存各的，切换分支不会冲掉另一条线的数据，切回来曲线即恢复：
 //!
 //! - 只画已知点：仅相邻两手（手数差 1）都有数据才连线，缺口留空，
 //!   不臆造未知走势；已知点用小圆点标记，颜色复用 [`overlay::winrate_color`]
@@ -19,7 +21,7 @@ use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Response, Sense, Stroke
 
 use crate::board::Board;
 
-use super::analysis::{AnalysisState, HistoryPoint, MoveLoss};
+use super::analysis::{loss_from_points, AnalysisState, HistoryPoint, MoveLoss};
 use super::overlay;
 
 /// 曲线区四周留白：轴标注与标题占用。
@@ -44,17 +46,22 @@ const LABEL: Color32 = Color32::from_rgb(160, 160, 168);
 pub fn show(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
     // 横轴取**当前线**长度（棋谱树里变着分支各成一条线，与棋盘显示口径一致）。
     let total = board.line_len();
-    // 已知点（按手数升序，含 0 = 初始空盘）；总手数以外的陈旧条目不取。
-    let known: Vec<HistoryPoint> =
-        (0..=total).filter_map(|turn| analysis.history_point(turn)).collect();
+    // 当前线上的历史点（下标 = 手数，0 = 初始空盘）：历史缓冲按局面签名
+    // 存储，这里只取当前线各局面各自的数据，同手数的分支互不掺混。
+    let slots = analysis.line_points(board);
+    // 已知点（按手数升序）。
+    let known: Vec<HistoryPoint> = slots.iter().filter_map(|p| *p).collect();
     // 每手损失（与 known 按下标平行；第 0 手或两端数据不全为 `None`），
     // 曲线着色与悬停提示共用，避免同一手重复派生。
     let losses: Vec<Option<MoveLoss>> = known
         .iter()
         .map(|p| {
-            board
-                .record_at(p.turn.checked_sub(1)?)
-                .and_then(|r| analysis.move_loss(p.turn, r.player))
+            match (p.turn.checked_sub(1).and_then(|i| slots[i]), slots[p.turn]) {
+                (Some(before), Some(after)) => board
+                    .record_at(p.turn - 1)
+                    .and_then(|r| loss_from_points(p.turn, r.player, before, after)),
+                _ => None,
+            }
         })
         .collect();
 

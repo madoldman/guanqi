@@ -1,17 +1,18 @@
 //! 棋盘视图：`egui::Painter` 自绘棋盘与鼠标 / 键盘交互（TASKS 2.2 / 2.3），
-//! 并按开关挂载分析叠加层（候选点 / 热度图 / 定位高亮，TASKS 4.1 / 4.2）
-//! 与失误标注（TASKS 4.4）。
+//! 并按开关挂载分析叠加层（候选点 / 热度图 / 定位高亮，TASKS 4.1 / 4.2）、
+//! 失误标注（TASKS 4.4）与分支选择器（变着分支切换）。
 //!
 //! 设计要点：
 //!
 //! - 屏幕坐标与交叉点的换算集中在 [`Layout`]，其余代码只跟 [`Coord`] 打交道；
 //! - 坐标注释的列字母与行号取自 [`Coord::to_gtp`] 的输出，
 //!   与 GTP 口径（列字母跳过 `I`、行号自下向上）由同一份实现保证一致；
-//! - [`show`] 收 `&mut Board`：落子 / 导航 / 悔棋都会修改棋盘状态，
+//! - [`show`] 收 `&mut Board`：落子 / 导航 / 悔棋 / 切换分支都会修改棋盘状态，
 //!   各绘制函数只借用 `&Board` 顺带读取；
-//! - 非法落子原因写入 `notice`（由调用方持有），跨帧显示直到下一次成功操作。
+//! - 非法落子原因写入 `notice`、建分支提示写入 `branch_notice`
+//!   （均由调用方持有），跨帧显示直到下一次成功操作。
 
-use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Stroke, Ui, Vec2};
+use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 
 use crate::board::{Action, Board, Coord, IllegalReason, Size, Stone};
 
@@ -30,6 +31,8 @@ const LINE: Color32 = Color32::from_rgb(70, 49, 25);
 const LABEL: Color32 = Color32::from_rgb(52, 36, 17);
 /// 非法落子提示。
 const NOTICE: Color32 = Color32::from_rgb(255, 152, 82);
+/// 分支选择器文字与「已创建变着」提示（同一琥珀色系）。
+const BRANCH: Color32 = Color32::from_rgb(255, 170, 40);
 
 /// 交叉点到棋盘边缘的留白，以间距为单位（容纳坐标标注）。
 const MARGIN_IN_SPACING: f32 = 1.2;
@@ -37,20 +40,38 @@ const MARGIN_IN_SPACING: f32 = 1.2;
 const MAX_SPACING: f32 = 40.0;
 /// 底部状态行预留高度。
 const STATUS_HEIGHT: f32 = 26.0;
+/// 分支选择器行预留高度（0 = 不显示时不占位）。
+const BRANCH_HEIGHT: f32 = 26.0;
 
 /// 绘制棋盘视图并处理交互。
 ///
-/// `notice` 由调用方持有：非法落子时写入原因，任何一次成功操作后清除，
+/// `notice` / `branch_notice` 由调用方持有：非法落子时写入前者、
+/// 回看中新建变着分支时写入后者，任何一次成功操作后清除，
 /// 使提示能跨帧稳定显示。`analysis` 提供当前局面快照（候选点 / 热度图）
-/// 与逐手历史（失误标注）；`overlay` 持有层开关与侧栏定位状态。
+/// 与当前线历史（失误标注）；`overlay` 持有层开关与侧栏定位状态。
 pub fn show(
     ui: &mut Ui,
     board: &mut Board,
     notice: &mut Option<IllegalReason>,
+    branch_notice: &mut Option<String>,
     analysis: &AnalysisState,
     overlay: &Overlay,
 ) {
-    handle_keyboard(ui, board, notice);
+    handle_keyboard(ui, board, notice, branch_notice);
+
+    // 分支点时在棋盘上方给一行选择器（按钮动作在落子处理前执行，
+    // 因为选择器只读棋盘、落子要可变借用，二者借用不冲突）；
+    // 非分支点该行不创建，不留占位。
+    let mut branch_sel = BranchSel::default();
+    if board.is_branch_point() {
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), BRANCH_HEIGHT),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                branch_sel = draw_branch_selector(ui, board);
+            },
+        );
+    }
 
     // 状态行固定在底部，其余空间全部给棋盘。
     let avail = ui.available_rect_before_wrap();
@@ -90,22 +111,101 @@ pub fn show(
             draw_hover(&painter, &layout, board, pos);
         }
         if response.clicked() {
-            handle_click(board, notice, &layout, response.interact_pointer_pos());
+            handle_click(board, notice, branch_notice, &layout, response.interact_pointer_pos());
         }
     }
 
-    draw_status(ui, board, *notice);
+    // 选择器动作在落子之后统一执行：二者都改棋盘，避免借用在先。
+    match branch_sel {
+        BranchSel::Select(i) => {
+            if board.select_child(i) {
+                *branch_notice = None;
+            }
+        }
+        BranchSel::Step(step) => {
+            let moved = match step {
+                BranchStep::Next => board.next_branch(),
+                BranchStep::Prev => board.prev_branch(),
+            };
+            if moved {
+                *branch_notice = None;
+            }
+        }
+        BranchSel::None => {}
+    }
+
+    draw_status(ui, board, *notice, branch_notice.as_deref());
+}
+
+/// 分支选择器的一帧交互结果（绘制期间收集，绘制后统一执行）。
+#[derive(Default)]
+enum BranchSel {
+    /// 无操作。
+    #[default]
+    None,
+    /// 点击了第 `i` 个子分支。
+    Select(usize),
+    /// 点击了上 / 下一条分支按钮。
+    Step(BranchStep),
+}
+
+/// 相邻分支切换方向。
+enum BranchStep {
+    Next,
+    Prev,
+}
+
+/// 绘制分支选择器行：「变着 X/Y」+ ◀ + 各子分支首手（GTP 坐标）+ ▶。
+/// 返回本帧被点击的动作（由调用方执行，见 [`BranchSel`]）。
+fn draw_branch_selector(ui: &mut Ui, board: &Board) -> BranchSel {
+    let mut action = BranchSel::None;
+    let size = board.size();
+    let count = board.child_count();
+    let selected = board.selected_child();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("变着 {}/{}", selected + 1, count)).color(BRANCH).strong());
+        if ui.button("◀").clicked() {
+            action = BranchSel::Step(BranchStep::Prev);
+        }
+        for i in 0..count {
+            // 子分支首手：GTP 坐标显示（Display 是调试格式，不用）；弃着显示文字。
+            let label = match board.child_move(i) {
+                Some(record) => match record.action {
+                    Action::Place(c) => c.to_gtp(size),
+                    Action::Pass => "弃着".to_owned(),
+                },
+                None => "?".to_owned(),
+            };
+            if ui.selectable_label(i == selected, label).clicked() {
+                action = BranchSel::Select(i);
+            }
+        }
+        if ui.button("▶").clicked() {
+            action = BranchSel::Step(BranchStep::Next);
+        }
+        ui.weak("Ctrl+← / Ctrl+→ 切换");
+    });
+    action
 }
 
 // ---- 交互 ----
 
-/// ← 后退一手，→ 前进一手，Ctrl+Z 悔棋；任何一次成功的导航都清除非法提示。
-fn handle_keyboard(ui: &Ui, board: &mut Board, notice: &mut Option<IllegalReason>) {
-    let (back, forward, undo) = ui.input(|i| {
+/// ← 后退一手，→ 前进一手，Ctrl+Z 悔棋；
+/// Ctrl+← / Ctrl+→ 在相邻子分支间切换（不占用 ←/→ 的前进后退）；
+/// 任何一次成功的导航都清除非法落子与建分支两类提示。
+fn handle_keyboard(
+    ui: &Ui,
+    board: &mut Board,
+    notice: &mut Option<IllegalReason>,
+    branch_notice: &mut Option<String>,
+) {
+    let (back, forward, undo, prev, next) = ui.input(|i| {
         (
-            i.key_pressed(egui::Key::ArrowLeft),
-            i.key_pressed(egui::Key::ArrowRight),
+            i.key_pressed(egui::Key::ArrowLeft) && !i.modifiers.ctrl,
+            i.key_pressed(egui::Key::ArrowRight) && !i.modifiers.ctrl,
             i.key_pressed(egui::Key::Z) && i.modifiers.ctrl,
+            i.key_pressed(egui::Key::ArrowLeft) && i.modifiers.ctrl,
+            i.key_pressed(egui::Key::ArrowRight) && i.modifiers.ctrl,
         )
     });
     let moved = if back {
@@ -114,25 +214,44 @@ fn handle_keyboard(ui: &Ui, board: &mut Board, notice: &mut Option<IllegalReason
         board.step_forward()
     } else if undo {
         board.undo().is_some()
+    } else if prev {
+        board.prev_branch()
+    } else if next {
+        board.next_branch()
     } else {
         false
     };
     if moved {
         *notice = None;
+        *branch_notice = None;
     }
 }
 
 /// 点击交叉点落子；非法时记录原因供状态行显示。
+///
+/// 回看中（非叶节点）落子不再被拒绝，而是**新建变着分支**：
+/// 建了新分支（全树节点增加）时给轻提示；落到已有分支（直接切换过去）
+/// 或叶子上续棋则不打扰。
 fn handle_click(
     board: &mut Board,
     notice: &mut Option<IllegalReason>,
+    branch_notice: &mut Option<String>,
     layout: &Layout,
     pos: Option<Pos2>,
 ) {
     let Some(pos) = pos else { return };
     let Some(at) = layout.hit_test(pos) else { return };
+    let nodes_before = board.move_count();
     match board.play(at) {
-        Ok(()) => *notice = None,
+        Ok(()) => {
+            *notice = None;
+            // 全树着法数增加 = 这次落子新建了分支（而非切进已有分支）。
+            if board.move_count() > nodes_before {
+                *branch_notice = Some(format!("已在第 {} 手创建变着", board.cursor() - 1));
+            } else {
+                *branch_notice = None;
+            }
+        }
         Err(reason) => *notice = Some(reason),
     }
 }
@@ -383,8 +502,9 @@ fn draw_hover(painter: &Painter, layout: &Layout, board: &Board, pos: Pos2) {
     }
 }
 
-/// 最小状态行：手数 / 行棋方 / 提子 / 非法提示 / 快捷键说明（完整侧栏在阶段 4）。
-fn draw_status(ui: &mut Ui, board: &Board, notice: Option<IllegalReason>) {
+/// 最小状态行：手数 / 行棋方 / 提子 / 非法提示 / 建分支提示 / 快捷键说明
+/// （完整侧栏在阶段 4）。
+fn draw_status(ui: &mut Ui, board: &Board, notice: Option<IllegalReason>, branch_notice: Option<&str>) {
     ui.add_space(6.0);
     ui.horizontal_wrapped(|ui| {
         ui.label(format!("第 {} / {} 手", board.cursor(), board.line_len()));
@@ -399,11 +519,15 @@ fn draw_status(ui: &mut Ui, board: &Board, notice: Option<IllegalReason>) {
             board.captured_by(Stone::Black),
             board.captured_by(Stone::White),
         ));
+        if let Some(text) = branch_notice {
+            ui.separator();
+            ui.colored_label(BRANCH, text);
+        }
         if let Some(reason) = notice {
             ui.separator();
             ui.colored_label(NOTICE, format!("非法落子：{reason}"));
         }
         ui.separator();
-        ui.weak("点击落子 · ← 后退 · → 前进 · Ctrl+Z 悔棋");
+        ui.weak("点击落子 · ← 后退 · → 前进 · Ctrl+←/→ 切分支 · Ctrl+Z 悔棋");
     });
 }
