@@ -1,8 +1,10 @@
-//! SGF 模块：棋谱解析与序列化（纯 std，零第三方依赖）。
+//! SGF 模块：棋谱解析、序列化与棋谱存取（纯 std，零第三方依赖）。
 //!
 //! 子模块分工：[`lexer`] 词法与转义；[`error`] 结构化错误与位置；
 //! [`tree`] 游戏树结构、序列化与属性访问器（含对局信息汇总
-//! [`GameInfo`]）。本文件提供字节解码入口与语法解析器。
+//! [`GameInfo`]）；[`load`] SGF → [`Board`]（打开棋谱）；[`save`]
+//! [`Board`] → SGF 文本 / 落盘（另存为，含变着与注释）。本文件提供
+//! 字节解码入口与语法解析器。
 //!
 //! # 编码处理（扩展点）
 //!
@@ -29,10 +31,12 @@
 mod error;
 mod lexer;
 mod load;
+mod save;
 mod tree;
 
 pub use error::{Position, SgfError, SgfErrorKind};
 pub use load::{GameMeta, LoadError, LoadedGame, load_from_bytes};
+pub use save::{SaveError, board_to_sgf, save_to_file};
 pub use tree::{GameInfo, GameTree, Node, Property};
 
 use std::borrow::Cow;

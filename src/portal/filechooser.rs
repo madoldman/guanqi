@@ -1,8 +1,8 @@
-//! `org.freedesktop.portal.FileChooser.OpenFile` 的语义封装。
+//! `org.freedesktop.portal.FileChooser` 的语义封装（OpenFile / SaveFile）。
 //!
 //! 协议时序（规范要求**先订阅再调用**，否则可能漏掉应答信号）：
 //! 1. 用 `handle_token` 预测 request 对象路径，`AddMatch` 订阅其 Response 信号；
-//! 2. 调 `OpenFile`（应答立即返回 handle，与用户操作无关）；
+//! 2. 调 `OpenFile` / `SaveFile`（应答立即返回 handle，与用户操作无关）；
 //! 3. 等 `org.freedesktop.portal.Request.Response`（`u response, a{sv} results`）。
 //!
 //! `parent_window` 传空串 = 不做窗口模态绑定（简化）。将来可从 egui viewport
@@ -72,18 +72,44 @@ pub fn open_file_blocking(
     let predicted = request_path(conn.unique_name(), &token);
     let rule = response_match_rule(&predicted);
     conn.add_match(&rule)?;
-    let result = run_request(conn, title, &token, &predicted);
+    let result = run_request(conn, title, &token, &predicted, |conn, title, token| {
+        open_file_call(conn, title, token)
+    });
     conn.remove_match(&rule);
     result
 }
 
+/// 打开「保存文件」对话框并**阻塞**到用户选择 / 取消 / 超时（须在工作线程调用）。
+/// `default_name` 经 `current_name` 选项作为对话框里的默认文件名。
+/// `Ok(Some(path))` = 用户确认的保存位置；`Ok(None)` = 用户取消。
+pub fn save_file_blocking(
+    conn: &mut Connection,
+    title: &str,
+    default_name: &str,
+) -> Result<Option<PathBuf>, PortalError> {
+    let token = handle_token();
+    let predicted = request_path(conn.unique_name(), &token);
+    let rule = response_match_rule(&predicted);
+    conn.add_match(&rule)?;
+    let result = run_request(conn, title, &token, &predicted, |conn, title, token| {
+        save_file_call(conn, title, token, default_name)
+    });
+    conn.remove_match(&rule);
+    result
+}
+
+/// 对话框调用的统一形态：连接 + 标题 + token → request handle
+/// （保存版闭包会捕获默认文件名，故用泛型而非 fn 指针）。
+/// 订阅之后到等信号之前的公共时序：发起调用、补订 handle、等 Response、
+/// 超时先 Close 再上报。打开与保存共用，只差 `call` 这一步。
 fn run_request(
     conn: &mut Connection,
     title: &str,
     token: &str,
     predicted: &str,
+    call: impl FnOnce(&mut Connection, &str, &str) -> Result<String, PortalError>,
 ) -> Result<Option<PathBuf>, PortalError> {
-    let handle = open_file_call(conn, title, token)?;
+    let handle = call(conn, title, token)?;
     // 预测路径与实际 handle 不一致时补订一条（某些实现可能不透传 handle_token）。
     let mut extra_rule = None;
     if handle != predicted {
@@ -124,30 +150,45 @@ pub fn open_file_call(
         items: vec![
             entry("handle_token", Value::Str(token.to_owned())),
             entry("multiple", Value::Bool(false)),
-            entry(
-                "filters",
-                Value::Array {
-                    elem: "(sa(us))".into(),
-                    items: vec![Value::Struct(vec![
-                        Value::Str("棋谱 (SGF)".into()),
-                        Value::Array {
-                            elem: "(us)".into(),
-                            items: vec![
-                                // (us)：u = 0 表示 Glob 模式。
-                                Value::Struct(vec![Value::U32(0), Value::Str("*.sgf".into())]),
-                                Value::Struct(vec![Value::U32(0), Value::Str("*.SGF".into())]),
-                            ],
-                        },
-                    ])],
-                },
-            ),
+            sgf_filter_entry(),
         ],
     };
+    dialog_call(conn, "OpenFile", title, options)
+}
+
+/// 调 `SaveFile`（签名与 OpenFile 相同：`s sa{sv} -> o`）。
+/// 选项：`handle_token` + `current_name`（默认文件名）+ `filters`。
+/// 不传 `current_folder`（路径以 `file://` URI 传入，且非必需——对话框
+/// 默认落在用户常用目录，`current_name` 已足够定位保存意图）。
+pub fn save_file_call(
+    conn: &mut Connection,
+    title: &str,
+    token: &str,
+    default_name: &str,
+) -> Result<String, PortalError> {
+    let options = Value::Array {
+        elem: "{sv}".into(),
+        items: vec![
+            entry("handle_token", Value::Str(token.to_owned())),
+            entry("current_name", Value::Str(default_name.to_owned())),
+            sgf_filter_entry(),
+        ],
+    };
+    dialog_call(conn, "SaveFile", title, options)
+}
+
+/// 发起 FileChooser 的成员调用并取回 request handle。
+fn dialog_call(
+    conn: &mut Connection,
+    member: &str,
+    title: &str,
+    options: Value,
+) -> Result<String, PortalError> {
     let reply = conn.call(
         SERVICE,
         OBJECT_PATH,
         FILECHOOSER,
-        "OpenFile",
+        member,
         &[
             Value::Str(String::new()),
             Value::Str(title.to_owned()),
@@ -157,8 +198,29 @@ pub fn open_file_call(
     )?;
     match reply.into_iter().next() {
         Some(Value::Path(handle)) => Ok(handle),
-        _ => Err(PortalError::Protocol("OpenFile 应答不是对象路径".into())),
+        _ => Err(PortalError::Protocol(format!("{member} 应答不是对象路径"))),
     }
+}
+
+/// 「棋谱 (SGF)」过滤器的 `a{sv}` 条目（打开与保存共用同一过滤集）。
+fn sgf_filter_entry() -> Value {
+    entry(
+        "filters",
+        Value::Array {
+            elem: "(sa(us))".into(),
+            items: vec![Value::Struct(vec![
+                Value::Str("棋谱 (SGF)".into()),
+                Value::Array {
+                    elem: "(us)".into(),
+                    items: vec![
+                        // (us)：u = 0 表示 Glob 模式。
+                        Value::Struct(vec![Value::U32(0), Value::Str("*.sgf".into())]),
+                        Value::Struct(vec![Value::U32(0), Value::Str("*.SGF".into())]),
+                    ],
+                },
+            ])],
+        },
+    )
 }
 
 /// 关闭 portal 请求（尽力而为，不等应答）：等待超时兜底与探针联调用。

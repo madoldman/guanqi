@@ -9,7 +9,8 @@
 //! # 对上层（UI 接线）的约定（与 engine 模块一致）
 //!
 //! - [`FileDialog::available`] 先行探测（不弹窗），无 portal 环境可降级提示；
-//! - [`FileDialog::open_file`] 立即返回，对话框在专职线程阻塞等待；
+//! - [`FileDialog::open_file`] / [`FileDialog::save_file`] 立即返回，
+//!   对话框在专职线程阻塞等待；
 //! - UI 每帧 [`FileDialog::try_recv`] 非阻塞取结果；
 //! - 构造时可传 waker（如 `egui::Context::request_repaint` 包装），结果入队即唤醒。
 
@@ -90,30 +91,59 @@ impl FileDialog {
     /// - 连接 / 探测失败会**同步**返回 Err，便于 UI 立即提示。
     /// - 一个实例只产生一个事件；丢弃实例后结果仍会投递（发送失败被忽略）。
     pub fn open_file(title: &str, waker: Option<Waker>) -> Result<FileDialog, PortalError> {
-        let mut conn = dbus::Connection::connect()?;
-        filechooser::probe(&mut conn)?;
-        let title = title.to_owned();
-        let (tx, rx) = channel();
-        std::thread::Builder::new()
-            .name("portal-dialog".into())
-            .spawn(move || {
-                let event = match filechooser::open_file_blocking(&mut conn, &title) {
-                    Ok(Some(path)) => PortalEvent::Picked(path),
-                    Ok(None) => PortalEvent::Cancelled,
-                    Err(error) => PortalEvent::Failed(error),
-                };
-                if tx.send(event).is_ok()
-                    && let Some(waker) = waker
-                {
-                    waker();
-                }
-            })
-            .map_err(PortalError::Io)?;
-        Ok(Self { rx })
+        spawn_dialog(title, waker, |conn, title| {
+            filechooser::open_file_blocking(conn, title)
+        })
+    }
+
+    /// 发起「保存文件」对话框（默认文件名 `default_name`），**立即返回**；
+    /// 等待在专职线程进行。事件语义与 [`FileDialog::open_file`] 一致：
+    /// 确认位置 → [`PortalEvent::Picked`]，取消 → [`PortalEvent::Cancelled`]。
+    pub fn save_file(
+        title: &str,
+        default_name: &str,
+        waker: Option<Waker>,
+    ) -> Result<FileDialog, PortalError> {
+        let default_name = default_name.to_owned();
+        spawn_dialog(title, waker, move |conn, title| {
+            filechooser::save_file_blocking(conn, title, &default_name)
+        })
     }
 
     /// 非阻塞取结果；用户未操作完时立即返回 `None`（UI 每帧调用）。
     pub fn try_recv(&mut self) -> Option<PortalEvent> {
         self.rx.try_recv().ok()
     }
+}
+
+/// 连接会话总线 → 探测 portal → 专职线程阻塞等待对话框结果（打开与
+/// 保存共用：连接 / 探测留在调用线程同步报错，阻塞等待交给工作线程，
+/// 结果经 waker 唤醒 UI）。
+fn spawn_dialog(
+    title: &str,
+    waker: Option<Waker>,
+    wait: impl FnOnce(&mut dbus::Connection, &str) -> Result<Option<PathBuf>, PortalError>
+    + Send
+    + 'static,
+) -> Result<FileDialog, PortalError> {
+    let mut conn = dbus::Connection::connect()?;
+    filechooser::probe(&mut conn)?;
+    let title = title.to_owned();
+    let (tx, rx) = channel();
+    std::thread::Builder::new()
+        .name("portal-dialog".into())
+        .spawn(move || {
+            let event = match wait(&mut conn, &title) {
+                Ok(Some(path)) => PortalEvent::Picked(path),
+                Ok(None) => PortalEvent::Cancelled,
+                Err(error) => PortalEvent::Failed(error),
+            };
+            if tx.send(event).is_ok()
+                && let Some(waker) = waker
+            {
+                waker();
+            }
+        })
+        .map_err(PortalError::Io)?;
+    Ok(FileDialog { rx })
 }

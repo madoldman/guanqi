@@ -1,14 +1,15 @@
-//! [`eframe::App`] 实现：主题、字体、引擎接线、棋谱打开与主窗口布局
-//! （TASKS 3.3 / 4.2 / 5.3）。
+//! [`eframe::App`] 实现：主题、字体、引擎接线、棋谱打开 / 另存与主窗口
+//! 布局（TASKS 3.3 / 4.2 / 5.3 / 6.x）。
 //!
 //! 引擎生命周期由 [`AnalysisState`] 管理：启动即加载配置并拉起引擎，
 //! [`eframe::App::logic`] 每帧轮询引擎事件并按局面推进「分段加深」分析。
 //!
-//! 「打开棋谱」经 portal [`FileDialog`] 门面接线：`open_file` 立即返回、
-//! 对话框在专职线程等待，`logic` 每帧 `try_recv` 非阻塞取结果；选中后
-//! 读文件 → 解析 → 递归挂载整棵谱树（含变着分支）→ 整体替换棋盘
+//! 「打开棋谱」与「另存为」经 portal [`FileDialog`] 门面接线：发起立即
+//! 返回、对话框在专职线程等待，`logic` 每帧 `try_recv` 非阻塞取结果；
+//! 选中后读文件 → 解析 → 递归挂载整棵谱树（含变着分支）→ 整体替换棋盘
 //! （尺寸跟随 SGF），并清空分析快照与胜率历史（新对局不混旧曲线）。
-//! 本类型只负责把配置、动作与界面连起来。
+//! 另存把当前棋盘（含用户新建的变着）序列化为 SGF 写盘，未载入棋谱时
+//! 允许存出空盘谱。本类型只负责把配置、动作与界面连起来。
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -16,7 +17,7 @@ use std::time::Duration;
 use crate::board::{Board, IllegalReason, Size};
 use crate::engine::{load_settings, EngineConfig};
 use crate::portal::{FileDialog, PortalEvent};
-use crate::sgf::{GameMeta, load_from_bytes};
+use crate::sgf::{GameMeta, load_from_bytes, save_to_file};
 use crate::ui;
 use crate::ui::{
     analysis::{AnalysisState, EngineStatus, Waker},
@@ -52,12 +53,23 @@ pub struct GuanqiApp {
     waker: Waker,
     /// portal 文件对话框不可用时的原因（`None` = 可用，启动时探测一次）。
     portal_unavailable: Option<String>,
-    /// 等待中的「打开棋谱」对话框（`Some` = 正在等待用户选择）。
-    dialog: Option<FileDialog>,
+    /// 等待中的 portal 对话框及其用途（`Some` = 正在等待用户操作）。
+    dialog: Option<(FileDialog, PendingDialog)>,
     /// 已载入棋谱的元信息（`None` = 本次运行尚未打开过棋谱）。
     loaded: Option<GameMeta>,
     /// 最近一次「打开棋谱」的用户可见提示（成功 / 部分载入 / 失败）。
     load_notice: Option<LoadNotice>,
+    /// 最近一次「另存为」的用户可见提示（成功 / 失败）。
+    save_notice: Option<LoadNotice>,
+}
+
+/// 等待中的对话框用途：打开与保存各自独立接结果，互不串线。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingDialog {
+    /// 等待用户选择要打开的棋谱。
+    Open,
+    /// 等待用户确认另存位置。
+    Save,
 }
 
 impl GuanqiApp {
@@ -102,37 +114,70 @@ impl GuanqiApp {
             dialog: None,
             loaded: None,
             load_notice: None,
+            save_notice: None,
         }
     }
 
     /// 发起「打开棋谱」对话框（菜单入口与 Ctrl+O 共用）。
     ///
     /// - portal 不可用：不发起，提示原因（入口已置灰，快捷键仍会走到这里）；
-    /// - 已有对话框在等待：**忽略本次请求并提示**。portal 每次 `open_file`
-    ///   都会真实弹出一个原生对话框并占用一个专职等待线程，叠加调用会让
+    /// - 已有对话框在等待：**忽略本次请求并提示**。portal 每次调用都会
+    ///   真实弹出一个原生对话框并占用一个专职等待线程，叠加调用会让
     ///   多个对话框同时压到用户屏幕上（且先弹的那个仍会投递结果），故必须
     ///   等当前选择完成后再发起新的。
     fn open_file_dialog(&mut self) {
-        if let Some(reason) = &self.portal_unavailable {
-            self.load_notice =
-                Some(LoadNotice::Warn(format!("文件对话框不可用：{reason}")));
-            return;
-        }
-        if self.dialog.is_some() {
-            self.load_notice = Some(LoadNotice::Warn(
-                "已有「打开棋谱」对话框正在等待选择，请先完成或取消。".to_owned(),
-            ));
+        if let Some(notice) = self.dialog_guard() {
+            self.load_notice = Some(notice);
             return;
         }
         match FileDialog::open_file("打开棋谱（SGF）", Some(self.waker.clone())) {
             Ok(dialog) => {
-                self.dialog = Some(dialog);
+                self.dialog = Some((dialog, PendingDialog::Open));
                 self.load_notice = None;
             }
             Err(err) => {
                 self.load_notice = Some(LoadNotice::Failed(err.to_string()));
             }
         }
+    }
+
+    /// 发起「另存为」对话框（菜单入口与 Ctrl+Shift+S 共用）。
+    /// 未载入棋谱时同样可用（空盘存成空盘谱）；默认文件名取
+    /// 当前文件名（已含 `.sgf` 后缀）或 `guanqi.sgf`。
+    fn save_file_dialog(&mut self) {
+        if let Some(notice) = self.dialog_guard() {
+            self.save_notice = Some(notice);
+            return;
+        }
+        let default_name = self
+            .loaded
+            .as_ref()
+            .and_then(|meta| meta.source.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "guanqi.sgf".to_owned());
+        match FileDialog::save_file("另存棋谱（SGF）", &default_name, Some(self.waker.clone())) {
+            Ok(dialog) => {
+                self.dialog = Some((dialog, PendingDialog::Save));
+                self.save_notice = None;
+            }
+            Err(err) => {
+                self.save_notice = Some(LoadNotice::Failed(err.to_string()));
+            }
+        }
+    }
+
+    /// 对话框发起前的公共守卫：portal 不可用 / 已有对话框在等待时
+    /// 返回提示（等待中的对话框不区分用途——任一在等都不允许叠加）。
+    fn dialog_guard(&self) -> Option<LoadNotice> {
+        if let Some(reason) = &self.portal_unavailable {
+            return Some(LoadNotice::Warn(format!("文件对话框不可用：{reason}")));
+        }
+        if self.dialog.is_some() {
+            return Some(LoadNotice::Warn(
+                "已有文件对话框正在等待选择，请先完成或取消。".to_owned(),
+            ));
+        }
+        None
     }
 
     /// 载入选中的棋谱：读文件 → 解析 → 重放主变着 → 整体替换棋盘。
@@ -181,12 +226,50 @@ impl GuanqiApp {
     }
 
     /// 处理 portal 对话框结果（`logic` 每帧轮询取出，不阻塞）。
-    fn on_portal_event(&mut self, event: PortalEvent) {
-        match event {
-            PortalEvent::Picked(path) => self.load_game(path),
-            PortalEvent::Cancelled => {} // 用户取消：静默，界面保持原状
-            PortalEvent::Failed(err) => {
-                self.load_notice = Some(LoadNotice::Failed(err.to_string()));
+    fn on_portal_event(&mut self, kind: PendingDialog, event: PortalEvent) {
+        match kind {
+            PendingDialog::Open => match event {
+                PortalEvent::Picked(path) => self.load_game(path),
+                PortalEvent::Cancelled => {} // 用户取消：静默，界面保持原状
+                PortalEvent::Failed(err) => {
+                    self.load_notice = Some(LoadNotice::Failed(err.to_string()));
+                }
+            },
+            PendingDialog::Save => match event {
+                PortalEvent::Picked(path) => self.save_game(path),
+                PortalEvent::Cancelled => {} // 用户取消：静默，界面保持原状
+                PortalEvent::Failed(err) => {
+                    self.save_notice = Some(LoadNotice::Failed(err.to_string()));
+                }
+            },
+        }
+    }
+
+    /// 把当前棋盘（含用户新建的变着）写到用户确认的位置。
+    /// 未载入棋谱时存成空盘谱；写失败时提示可读原因，原状态不变。
+    fn save_game(&mut self, path: PathBuf) {
+        match save_to_file(&path, &self.board, self.loaded.as_ref()) {
+            Ok(()) => {
+                let size = self.board.size();
+                let branches = self.board.nodes().len() - 1;
+                self.loaded
+                    .as_mut()
+                    // 记住新路径：再次「另存为」默认名跟随最新位置。
+                    .map(|meta| meta.source = path.clone())
+                    // 空盘保存后也视作已有一份棋谱档案（下次默认名正确）。
+                    .unwrap_or_else(|| {
+                        self.loaded = Some(GameMeta::for_path(&path, self.board.size()));
+                    });
+                self.save_notice = Some(LoadNotice::Ok(format!(
+                    "已另存到 {}（{size}，{branches} 手）。",
+                    path.display()
+                )));
+            }
+            Err(err) => {
+                self.save_notice = Some(LoadNotice::Failed(format!(
+                    "保存到 {} 失败：{err}",
+                    path.display()
+                )));
             }
         }
     }
@@ -196,25 +279,41 @@ impl eframe::App for GuanqiApp {
     // eframe 0.36 起不再有 `App::update(&mut self, ctx, frame)`，
     // 改为直接发放根 `Ui`；用 CentralPanel 补上背景与边距。
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Ctrl+O 与菜单入口共用同一发起函数（内含等待中 / 不可用守卫）。
+        // Ctrl+O / Ctrl+Shift+S 与菜单入口共用同一批发起函数
+        // （内含等待中 / 不可用守卫）。
         if ui.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.ctrl) {
             self.open_file_dialog();
         }
-        // 顶部菜单栏：文件 → 打开棋谱…
+        if ui.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.ctrl && i.modifiers.shift) {
+            self.save_file_dialog();
+        }
+        // 顶部菜单栏：文件 → 打开棋谱… / 另存为…
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("文件", |ui| {
-                    let disabled_reason = self.portal_unavailable.as_deref();
+                    let disabled_reason = self.portal_unavailable.clone();
                     let mut entry = ui.add_enabled(
                         disabled_reason.is_none(),
                         egui::Button::new("打开棋谱…").shortcut_text("Ctrl+O"),
                     );
-                    if let Some(reason) = disabled_reason {
+                    if let Some(reason) = disabled_reason.as_deref() {
                         entry = entry.on_disabled_hover_text(reason.to_owned());
                     }
                     if entry.clicked() {
                         self.open_file_dialog();
                         // 菜单内的普通按钮不会自动收起菜单，显式关闭。
+                        ui.close();
+                    }
+                    ui.separator();
+                    let mut entry = ui.add_enabled(
+                        disabled_reason.is_none(),
+                        egui::Button::new("另存为…").shortcut_text("Ctrl+Shift+S"),
+                    );
+                    if let Some(reason) = disabled_reason.as_deref() {
+                        entry = entry.on_disabled_hover_text(reason.to_owned());
+                    }
+                    if entry.clicked() {
+                        self.save_file_dialog();
                         ui.close();
                     }
                 });
@@ -245,6 +344,7 @@ impl eframe::App for GuanqiApp {
                     self.loaded.as_ref(),
                     comment,
                     self.load_notice.as_ref(),
+                    self.save_notice.as_ref(),
                 );
             });
         match panel_action {
@@ -318,11 +418,15 @@ impl eframe::App for GuanqiApp {
 
     // 每帧 UI 之前轮询引擎事件（不阻塞）；窗口隐藏时同样被调用。
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 轮询「打开棋谱」对话框结果（结果入队时 waker 已请求立即重绘，
+        // 每帧轮询 portal 对话框结果（结果入队时 waker 已请求立即重绘，
         // 这里的 200ms 兜底刷新覆盖 waker 之外的边界情况）。
-        if let Some(event) = self.dialog.as_mut().and_then(FileDialog::try_recv) {
+        let event = match &mut self.dialog {
+            Some((dialog, kind)) => dialog.try_recv().map(|event| (*kind, event)),
+            None => None,
+        };
+        if let Some((kind, event)) = event {
             self.dialog = None;
-            self.on_portal_event(event);
+            self.on_portal_event(kind, event);
         }
         if self.dialog.is_some() {
             ctx.request_repaint_after(Duration::from_millis(200));

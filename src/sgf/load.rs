@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use super::tree::{GameInfo, GameTree, Node};
 use super::{SgfError, parse_bytes};
-use crate::board::{Action, Board, SetupError, Stone};
+use crate::board::{Action, Board, SetupError, Size, Stone};
 
 /// 载入整体失败（此时**不应替换**用户当前棋盘）。
 #[derive(Debug)]
@@ -70,6 +70,40 @@ pub struct GameMeta {
 }
 
 impl GameMeta {
+    /// 空棋谱元信息（空盘「另存为」后记录档案路径用）：无对局信息、
+    /// 无注释，尺寸按当前棋盘。
+    pub fn for_path(source: &Path, size: Size) -> Self {
+        Self {
+            source: source.to_path_buf(),
+            info: GameInfo {
+                size,
+                komi: None,
+                handicap: 0,
+                initial_player: None,
+                player_black: None,
+                player_white: None,
+                rank_black: None,
+                rank_white: None,
+                team_black: None,
+                team_white: None,
+                result: None,
+                date: None,
+                event: None,
+                round: None,
+                place: None,
+                game_name: None,
+                rules: None,
+                time_limit: None,
+                overtime: None,
+                application: None,
+                charset: None,
+                format: None,
+                root_comment: None,
+            },
+            comments: HashMap::new(),
+        }
+    }
+
     /// 当前局面（`board` 游标处）的注释；无注释返回 `None`。
     ///
     /// 键为「根到游标节点的着法序列」的签名：主变与变着各自的手数可能
@@ -78,6 +112,11 @@ impl GameMeta {
         self.comments
             .get(&position_sig(board.records()))
             .map(String::as_str)
+    }
+
+    /// 按局面签名取注释（「另存为」还原逐手注释用）。
+    pub fn comment_by_sig(&self, sig: u64) -> Option<&str> {
+        self.comments.get(&sig).map(String::as_str)
     }
 }
 
@@ -275,22 +314,34 @@ fn play_node(board: &mut Board, node: &Node) -> Result<bool, String> {
 /// FNV-1a。与 `ui::analysis` 的同名函数同构但更简（不含提子——同一
 /// 着法序列必然同一盘面，提子是派生结果）；两处语义独立，改动需同步。
 /// 仅作注释索引键，不要求抗碰撞。
+///
+/// 保存端（`save.rs`）逐节点增量混入各手还原同一签名，哈希实现经
+/// [`sig_with_record`] 共享，两侧按键必然一致。
 fn position_sig(records: &[crate::board::MoveRecord]) -> u64 {
+    let mut h = SIG_INIT;
+    for record in records {
+        sig_with_record(&mut h, record);
+    }
+    h
+}
+
+/// FNV-1a 初始值（空路径的签名；与 `ui::analysis` 的实现保持一致）。
+pub(super) const SIG_INIT: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// 把一手棋混入局面签名（[`position_sig`] 的增量步；保存端共用，
+/// 保证两处对同一着法序列算出同一签名）。
+pub(super) fn sig_with_record(sig: &mut u64, record: &crate::board::MoveRecord) {
     fn byte(h: &mut u64, b: u8) {
         *h ^= u64::from(b);
         *h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    let mut h = 0xcbf2_9ce4_8422_2325;
-    for r in records {
-        byte(&mut h, u8::from(matches!(r.player, Stone::Black)));
-        match r.action {
-            Action::Place(c) => {
-                byte(&mut h, 1);
-                byte(&mut h, c.x());
-                byte(&mut h, c.y());
-            }
-            Action::Pass => byte(&mut h, 0),
+    byte(sig, u8::from(matches!(record.player, Stone::Black)));
+    match record.action {
+        Action::Place(c) => {
+            byte(sig, 1);
+            byte(sig, c.x());
+            byte(sig, c.y());
         }
+        Action::Pass => byte(sig, 0),
     }
-    h
 }

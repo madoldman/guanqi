@@ -104,8 +104,9 @@ fn eval_lines(root: &RootInfo) -> (String, String) {
 /// `overlay` 为棋盘叠加层的层开关与定位状态（本面板读写）；
 /// `curve_open` 为胜率曲线底部面板的显示开关。
 /// `board` 提供总手数与各行棋方（失误汇总按手数现场派生）。
-/// `game` / `comment` / `load_notice` 为「打开棋谱」相关信息：已载入棋谱
-/// 的元信息、当前手注释与最近一次打开操作的提示（无则对应段落不显示）。
+/// `game` / `comment` 为「打开棋谱」相关信息：已载入棋谱的元信息与
+/// 当前手注释；`load_notice` / `save_notice` 为最近一次打开 / 另存
+/// 操作的提示（无则对应段落不显示）。
 /// 注释可能很长，整体包一层垂直滚动，避免侧栏内容被裁剪。
 #[allow(clippy::too_many_arguments)]
 pub fn show(
@@ -121,6 +122,7 @@ pub fn show(
     game: Option<&GameMeta>,
     comment: Option<&str>,
     load_notice: Option<&LoadNotice>,
+    save_notice: Option<&LoadNotice>,
 ) -> PanelAction {
     egui::ScrollArea::vertical().show(ui, |ui| {
         panel_body(
@@ -136,6 +138,7 @@ pub fn show(
             game,
             comment,
             load_notice,
+            save_notice,
         )
     })
     .inner
@@ -156,6 +159,7 @@ fn panel_body(
     game: Option<&GameMeta>,
     comment: Option<&str>,
     load_notice: Option<&LoadNotice>,
+    save_notice: Option<&LoadNotice>,
 ) -> PanelAction {
     let mut action = PanelAction::None;
     ui.heading("分析");
@@ -387,6 +391,10 @@ fn panel_body(
         hint = true;
     }
     if let Some(msg) = load_notice {
+        ui.colored_label(msg.color(), msg.text());
+        hint = true;
+    }
+    if let Some(msg) = save_notice {
         ui.colored_label(msg.color(), msg.text());
         hint = true;
     }
