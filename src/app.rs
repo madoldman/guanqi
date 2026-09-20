@@ -6,9 +6,9 @@
 //!
 //! 「打开棋谱」经 portal [`FileDialog`] 门面接线：`open_file` 立即返回、
 //! 对话框在专职线程等待，`logic` 每帧 `try_recv` 非阻塞取结果；选中后
-//! 读文件 → 解析 → 重放主变着 → 整体替换棋盘（尺寸跟随 SGF），并清空
-//! 分析快照与胜率历史（新对局不混旧曲线）。本类型只负责把配置、动作
-//! 与界面连起来。
+//! 读文件 → 解析 → 递归挂载整棵谱树（含变着分支）→ 整体替换棋盘
+//! （尺寸跟随 SGF），并清空分析快照与胜率历史（新对局不混旧曲线）。
+//! 本类型只负责把配置、动作与界面连起来。
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -151,7 +151,7 @@ impl GuanqiApp {
                     Some(LoadNotice::Failed(format!("打开棋谱失败：{err}")));
             }
             Ok(loaded) => {
-                let warning = loaded.warning.clone();
+                let (warning, partial) = (loaded.warning.clone(), loaded.partial);
                 let (board, meta) = loaded.into_parts();
                 // 新对局：清空分析快照与胜率历史（新对局不混旧曲线）；
                 // 定位高亮所指的局面已不存在，一并清除。
@@ -161,12 +161,18 @@ impl GuanqiApp {
                 let moves = board.move_count();
                 self.board = board;
                 self.loaded = Some(meta);
-                self.load_notice = Some(match warning {
-                    Some(warning) => LoadNotice::Warn(format!(
-                        "已部分载入 {size}（共 {moves} 手）：{warning}"
+                // 主变停止为「部分载入」（橙色留意）；仅变着分支被舍弃时
+                // 提示照样给出，但按成功（绿色）显示。
+                let notice = match warning {
+                    Some(warning) if partial => LoadNotice::Warn(format!(
+                        "已部分载入 {size}（全树共 {moves} 手）：{warning}"
                     )),
-                    None => LoadNotice::Ok(format!("已载入 {size} 棋谱，共 {moves} 手。")),
-                });
+                    Some(warning) => LoadNotice::Ok(format!(
+                        "已载入 {size}（全树共 {moves} 手，{warning}）"
+                    )),
+                    None => LoadNotice::Ok(format!("已载入 {size} 棋谱，全树共 {moves} 手。")),
+                };
+                self.load_notice = Some(notice);
             }
         }
     }
@@ -214,11 +220,11 @@ impl eframe::App for GuanqiApp {
         });
 
         // 分析侧栏（按钮动作在绘制后执行，避免借用冲突）。
-        // 当前手注释先借不可变借用取出（随游标联动）。
+        // 当前手注释先借不可变借用取出（随游标联动，按局面签名查询）。
         let comment = self
             .loaded
             .as_ref()
-            .and_then(|meta| meta.comment_at(self.board.cursor()));
+            .and_then(|meta| meta.comment_at(&self.board));
         let mut panel_action = analysis_panel::PanelAction::None;
         egui::Panel::right("analysis_panel")
             .default_size(240.0)

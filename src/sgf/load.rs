@@ -2,24 +2,32 @@
 //!
 //! 职责边界与容错策略：
 //!
-//! - 只走主变着 [`GameTree::mainline`]；变着分支的切换留待棋谱树控件；
+//! - 递归载入**整棵游戏树**：按 SGF 惯例，每层的第一个子树是主变，其余
+//!   子树按序挂成变着分支（[`Board::play`] 在非叶节点落子即建分支，已存在
+//!   的着法直接切换）；载入完成后定位到开局第 0 手，默认当前线即主变；
 //! - 根节点 `AB` / `AW` / `AE` 构成预设局面，经 [`Board::from_setup`]
 //!   进入棋盘（不计手数、不参与劫争，见 `board` 模块文档）；`PL` 决定
 //!   首着方，缺省时按 FF4 惯例：有摆子则白先，否则黑先；
 //! - 其后逐节点取 `B` / `W` 着点（空值与 `tt` 为弃着），用
-//!   [`Board::play`] / [`Board::pass`] 重放；
-//! - **非法着法不整体失败**：真实棋谱可能含规则层不接受的着法（超级劫、
-//!   记谱错误、行棋方颠倒）。遇到即停止重放，保留已载入部分，把
-//!   「第 N 手无法载入：原因」写入 [`LoadedGame::warning`]，载入结果仍为
-//!   成功；只有解析期错误（编码 / 结构 / 根属性非法 / 预设摆子非法）
-//!   才整体失败（返回 [`LoadError`]）；
-//! - 中途节点的 `AB` / `AW` / `AE`（对局中途摆子）本期不支持，静默忽略；
-//! - 逐手注释取自**产生该局面的节点**上的 `C`；独立注释节点（无着法的
-//!   纯注释节点）的注释本期丢弃。下标 = 手数（0 = 根节点注释）。
+//!   [`Board::play`] / [`Board::pass`] 重放；中途节点的摆子属性不支持，
+//!   忽略并在提示中说明（不静默丢数据）；无行棋属性的纯注释节点跳过，
+//!   其 `C` 注释随节点丢弃（与既有行为一致）；
+//! - **非法着法不整体失败**：主变上遇到即停止重放该线，保留已载入部分
+//!   （[`LoadedGame::partial`] = true）；变着分支上遇到只放弃该分支，
+//!   其它分支与主变不受影响；两类情况连同中途摆子一并汇入
+//!   [`LoadedGame::warning`]（「第 N 手无法载入：原因」「第 N 手（第 k 个
+//!   变着内）无法载入：原因」）；只有解析期错误（编码 / 结构 / 根属性非法 /
+//!   预设摆子非法）才整体失败（返回 [`LoadError`]）；
+//! - 逐手注释以**局面签名**（根到该节点着法路径的 FNV-1a，见
+//!   `position_sig`）为键存于 [`GameMeta`]：树形谱中不同分支的同一手数
+//!   是不同局面，按手数索引不再成立；局面签名保证「同一局面无论经主变
+//!   还是变着到达，注释都对应得上」。查询经 [`GameMeta::comment_at`]，
+//!   UI 无需关心键结构。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use super::tree::GameInfo;
+use super::tree::{GameInfo, GameTree, Node};
 use super::{SgfError, parse_bytes};
 use crate::board::{Action, Board, SetupError, Stone};
 
@@ -56,17 +64,20 @@ pub struct GameMeta {
     pub source: PathBuf,
     /// 根节点对局信息（`PB` / `PW` / `RE` / `KM` / `DT` / `HA` 等）。
     pub info: GameInfo,
-    /// 逐手注释：下标 = 手数（0 = 根节点注释），长度 = 已载入手数 + 1。
-    pub comments: Vec<Option<String>>,
+    /// 逐手注释：键 = 局面签名（根到该节点着法路径的 FNV-1a，见
+    /// `position_sig`）。不按手数索引的理由见模块文档。
+    comments: HashMap<u64, String>,
 }
 
 impl GameMeta {
-    /// 第 `turn` 手局面（0 = 开局）的注释；无注释或整理后为空串时不显示。
-    pub fn comment_at(&self, turn: usize) -> Option<&str> {
+    /// 当前局面（`board` 游标处）的注释；无注释返回 `None`。
+    ///
+    /// 键为「根到游标节点的着法序列」的签名：主变与变着各自的手数可能
+    /// 相同而局面不同，且 `Board::undo` 会重排节点 id，二者都不可作键。
+    pub fn comment_at(&self, board: &Board) -> Option<&str> {
         self.comments
-            .get(turn)
-            .and_then(Option::as_deref)
-            .filter(|text| !text.is_empty())
+            .get(&position_sig(board.records()))
+            .map(String::as_str)
     }
 }
 
@@ -74,10 +85,14 @@ impl GameMeta {
 pub struct LoadedGame {
     /// 棋谱元信息。
     pub meta: GameMeta,
-    /// 载入结果棋盘：`records()` 即已载入的着法（`move_count()` = 手数）。
+    /// 载入结果棋盘：含整棵谱树（`move_count()` = 全树着法数，
+    /// `line_len()` = 主变手数），游标在开局第 0 手。
     pub board: Board,
-    /// 部分载入提示（非法着法停止重放时给出「第 N 手无法载入：原因」）。
+    /// 载入提示汇总（主变停止 / 变着舍弃 / 中途摆子忽略），无提示为 `None`。
     pub warning: Option<String>,
+    /// 主变是否中途停止（非法着法 / 行棋方不符），即「部分载入」；
+    /// 仅变着分支被舍弃时为 `false`。
+    pub partial: bool,
 }
 
 impl LoadedGame {
@@ -111,47 +126,36 @@ pub fn load_from_bytes(source: &Path, bytes: &[u8]) -> Result<LoadedGame, LoadEr
     let mut board =
         Board::from_setup(size, &black, &white, &removed, to_play).map_err(LoadError::Setup)?;
 
-    // 逐手重放主变着。comments.len() 始终 = 已载入手数 + 1，
-    // 且 comments[0] 已是根注释，故下一手编号即 comments.len()。
-    let mut comments = vec![info.root_comment.clone()];
-    let mut warning: Option<String> = None;
+    // 根注释的路径为空序列；根节点的摆子属性已在预设局面处理，
+    // walk 从本层第二个节点起（skip_first）。
+    let mut comments = HashMap::new();
+    if let Some(text) = &info.root_comment {
+        comments.insert(position_sig(&[]), text.clone());
+    }
+    let mut warnings = Vec::new();
+    let mut partial = false;
+    walk(
+        &mut board,
+        &tree,
+        &mut comments,
+        &mut warnings,
+        &mut partial,
+        None,
+        true,
+    );
+
+    // 重放一遍主变，把沿途各分支点的选中子分支恢复为主变（载入变着时
+    // Board 会把新分支设为选中项）；已存在的着法直接切换，不建新分支。
+    // 遇到载入时同款失败即停（同局面同判定，不会建出多余分支）。
+    board.go_to(0);
     for node in tree.mainline() {
-        let action = match node.move_action(size) {
-            Ok(Some((stone, action))) => {
-                if stone != board.to_play() {
-                    warning = Some(format!(
-                        "第 {} 手无法载入：谱中行棋方为{}，实际轮到{}",
-                        comments.len(),
-                        stone.name(),
-                        board.to_play().name(),
-                    ));
-                    break;
-                }
-                action
-            }
-            // 无行棋属性的节点（注释 / 空节点 / 中途摆子等）跳过。
-            Ok(None) => continue,
-            Err(err) => {
-                warning = Some(format!("第 {} 手无法载入：{err}", comments.len()));
-                break;
-            }
-        };
-        let placed = match action {
-            Action::Place(at) => board.play(at).map_err(|reason| reason.to_string()),
-            Action::Pass => {
-                board.pass();
-                Ok(())
-            }
-        };
-        if let Err(reason) = placed {
-            warning = Some(format!("第 {} 手无法载入：{reason}", comments.len()));
+        if play_node(&mut board, node).is_err() {
             break;
         }
-        comments.push(node.comment().map(str::to_owned));
     }
-
     // 定位到开局第 0 手；载入只读谱，不落在末端。
     board.go_to(0);
+
     Ok(LoadedGame {
         meta: GameMeta {
             source: source.to_path_buf(),
@@ -159,6 +163,134 @@ pub fn load_from_bytes(source: &Path, bytes: &[u8]) -> Result<LoadedGame, LoadEr
             comments,
         },
         board,
-        warning,
+        warning: (!warnings.is_empty()).then(|| warnings.join("；")),
+        partial,
     })
+}
+
+/// 递归挂载一棵 SGF 子树：本层 `nodes` 依次落子（游标即配对的 board
+/// 节点），末节点后按序分叉到 `children`——第 0 个是主变（延续当前
+/// 线的选中项），其余是变着分支。
+///
+/// `label` 为所属变着的定位描述（如「第 3 手的第 2 个变着」），主线为
+/// `None`；`skip_first` 仅最外层调用为 true（根节点已按预设局面处理）。
+/// 任一节点的着法无法载入时放弃**当前分支**并返回：主线同时置
+/// `partial`，变着分支不影响已走完的其它分支。
+fn walk(
+    board: &mut Board,
+    tree: &GameTree,
+    comments: &mut HashMap<u64, String>,
+    warnings: &mut Vec<String>,
+    partial: &mut bool,
+    label: Option<&str>,
+    skip_first: bool,
+) {
+    // 提示文案的定位前缀：主线为「第 N 手」，分支追加变着路径。
+    let site = |turn: usize| match label {
+        None => format!("第 {turn} 手"),
+        Some(path) => format!("第 {turn} 手（{path}内）"),
+    };
+    for node in tree.nodes.iter().skip(if skip_first { 1 } else { 0 }) {
+        let turn = board.cursor() + 1;
+        // 中途摆子（AB/AW/AE）不支持：忽略但明确提示，不静默丢数据。
+        if node.get("AB").is_some() || node.get("AW").is_some() || node.get("AE").is_some() {
+            warnings.push(format!("{}含中途摆子（AB/AW/AE），已忽略", site(turn)));
+        }
+        match play_node(board, node) {
+            Ok(true) => {
+                // 注释挂在产生该局面的节点上，以落子后的局面签名为键。
+                if let Some(text) = node.comment().filter(|text| !text.is_empty()) {
+                    comments.insert(position_sig(board.records()), text.to_owned());
+                }
+            }
+            // 无行棋属性的节点（纯注释 / 空节点）跳过，注释随之丢弃。
+            Ok(false) => {}
+            Err(reason) => {
+                if label.is_none() {
+                    *partial = true;
+                    warnings.push(format!("{}无法载入：{reason}", site(turn)));
+                } else {
+                    warnings.push(format!(
+                        "{}无法载入：{reason}，该分支已舍弃",
+                        site(turn)
+                    ));
+                }
+                return;
+            }
+        }
+    }
+    // 本层走完后的游标即分叉点；各分支都从这里重新出发。
+    let fork = board.current_node();
+    for (i, child) in tree.children.iter().enumerate() {
+        board.go_to_node(fork);
+        // 变着的定位描述：主线记「第 N 手的第 i 个变着」（N = 分叉点
+        // 手数 + 1 = 分支首着手数），深层变着在路径上继续追加。
+        let child_label = if i == 0 {
+            label.map(str::to_owned)
+        } else {
+            let n = board.cursor() + 1;
+            Some(match label {
+                Some(path) => format!("{path}的第 {i} 个变着"),
+                None => format!("第 {n} 手的第 {i} 个变着"),
+            })
+        };
+        walk(
+            board,
+            child,
+            comments,
+            warnings,
+            partial,
+            child_label.as_deref(),
+            false,
+        );
+    }
+}
+
+/// 重放单个 SGF 节点的行棋属性到 `board`（游标处）。
+/// 返回 `Ok(true)` = 已落子 / 弃着；`Ok(false)` = 无行棋属性（跳过）；
+/// `Err` = 可显示的中文原因（坐标非法 / 行棋方不符 / 着法非法）。
+fn play_node(board: &mut Board, node: &Node) -> Result<bool, String> {
+    let (stone, action) = match node.move_action(board.size()) {
+        Ok(Some(pair)) => pair,
+        Ok(None) => return Ok(false),
+        Err(err) => return Err(err.to_string()),
+    };
+    if stone != board.to_play() {
+        return Err(format!(
+            "谱中行棋方为{}，实际轮到{}",
+            stone.name(),
+            board.to_play().name()
+        ));
+    }
+    match action {
+        Action::Place(at) => board.play(at).map(|_| true).map_err(|e| e.to_string()),
+        Action::Pass => {
+            board.pass();
+            Ok(true)
+        }
+    }
+}
+
+/// 局面签名：对根到当前节点的着法序列（行棋方 + 着点 / 弃着）做
+/// FNV-1a。与 `ui::analysis` 的同名函数同构但更简（不含提子——同一
+/// 着法序列必然同一盘面，提子是派生结果）；两处语义独立，改动需同步。
+/// 仅作注释索引键，不要求抗碰撞。
+fn position_sig(records: &[crate::board::MoveRecord]) -> u64 {
+    fn byte(h: &mut u64, b: u8) {
+        *h ^= u64::from(b);
+        *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut h = 0xcbf2_9ce4_8422_2325;
+    for r in records {
+        byte(&mut h, u8::from(matches!(r.player, Stone::Black)));
+        match r.action {
+            Action::Place(c) => {
+                byte(&mut h, 1);
+                byte(&mut h, c.x());
+                byte(&mut h, c.y());
+            }
+            Action::Pass => byte(&mut h, 0),
+        }
+    }
+    h
 }
