@@ -42,7 +42,8 @@ const LABEL: Color32 = Color32::from_rgb(160, 160, 168);
 /// 绘制胜率曲线面板内容。外层底部面板由 `app` 条件创建：
 /// 面板隐藏时不进入本函数，零额外计算。
 pub fn show(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
-    let total = board.move_count();
+    // 横轴取**当前线**长度（棋谱树里变着分支各成一条线，与棋盘显示口径一致）。
+    let total = board.line_len();
     // 已知点（按手数升序，含 0 = 初始空盘）；总手数以外的陈旧条目不取。
     let known: Vec<HistoryPoint> =
         (0..=total).filter_map(|turn| analysis.history_point(turn)).collect();

@@ -387,8 +387,8 @@ fn draw_hover(painter: &Painter, layout: &Layout, board: &Board, pos: Pos2) {
 fn draw_status(ui: &mut Ui, board: &Board, notice: Option<IllegalReason>) {
     ui.add_space(6.0);
     ui.horizontal_wrapped(|ui| {
-        ui.label(format!("第 {} / {} 手", board.cursor(), board.move_count()));
-        if board.cursor() < board.move_count() {
+        ui.label(format!("第 {} / {} 手", board.cursor(), board.line_len()));
+        if board.cursor() < board.line_len() {
             ui.weak("（回看中）");
         }
         ui.separator();

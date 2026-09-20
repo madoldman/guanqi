@@ -191,7 +191,8 @@ pub(crate) fn draw_mistakes(
     board: &Board,
     analysis: &AnalysisState,
 ) {
-    for i in 0..board.move_count() {
+    // 只沿**当前线**遍历：变着分支上的手数不与当前线混排。
+    for i in 0..board.line_len() {
         let Some(record) = board.record_at(i) else { continue };
         let Action::Place(at) = record.action else { continue }; // 弃着无处可标
         let Some(loss) = analysis.move_loss(i + 1, record.player) else { continue };

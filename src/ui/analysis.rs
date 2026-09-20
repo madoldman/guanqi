@@ -348,7 +348,8 @@ impl AnalysisState {
     /// 失误汇总统计：遍历全部手数现场派生（每手仅两次下标读取与算术，
     /// 可每帧调用）。「已分析」只计两端数据齐全的手数，缺口不计入分级。
     pub fn loss_summary(&self, board: &Board) -> LossSummary {
-        let mut summary = LossSummary { total: board.move_count(), ..LossSummary::default() };
+        // 只统计**当前线**：变着分支的手数不在当前线的复盘中。
+        let mut summary = LossSummary { total: board.line_len(), ..LossSummary::default() };
         for i in 0..summary.total {
             let Some(record) = board.record_at(i) else { continue };
             let Some(loss) = self.move_loss(i + 1, record.player) else { continue };
@@ -365,8 +366,8 @@ impl AnalysisState {
 
     /// 每帧调用（`App::logic`）：轮询引擎事件并按局面推进分析。
     pub fn sync(&mut self, board: &Board, cfg: &EngineConfig) {
-        // 局面签名 = 游标前的手数记录前缀：落子 / 导航 / 悔棋 / 改着都会使其变化。
-        let sig = &board.records()[..board.cursor()];
+        // 局面签名 = 根到当前节点的着法序列：落子 / 导航 / 悔棋 / 改着都会使其变化。
+        let sig = board.records();
         if Some(sig) != self.analyzed_sig.as_deref() {
             self.snapshot = None;
             self.transient_error = None;
@@ -471,7 +472,8 @@ impl AnalysisState {
         if is_final
             && let Some(root) = &root
         {
-            let sig = position_sig(&board.records()[..turn]);
+            // 在飞报告的 turn 恒等于发起查询时的游标，局面未变即当前线的全部着法。
+            let sig = position_sig(board.records());
             self.record_history(turn, root, sig);
         }
         if !report.no_results {
@@ -520,7 +522,8 @@ impl AnalysisState {
         let Some(handle) = self.handle.as_mut() else {
             return;
         };
-        let moves: Vec<(Stone, Action)> = board.records()[..board.cursor()]
+        let moves: Vec<(Stone, Action)> = board
+            .records()
             .iter()
             .map(|record| (record.player, record.action))
             .collect();
@@ -530,7 +533,7 @@ impl AnalysisState {
         // 此处为单点改动处，快 / 深两阶段都会带回。
         query.include_ownership = true;
         let id = handle.analyze(query);
-        self.analyzed_sig = Some(board.records()[..board.cursor()].to_vec());
+        self.analyzed_sig = Some(board.records().to_vec());
         self.inflight = Some(Inflight {
             id,
             turn: board.cursor(),
