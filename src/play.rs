@@ -17,43 +17,48 @@
 use crate::board::{Action, Board, Coord, Size, Stone};
 use crate::ui::analysis::Snapshot;
 
-/// 标准让子星位表（内部坐标，`x` 列、`y` 行自上向下，与 SGF 行序一致）。
+/// 让子摆子坐标：按 KataGo `PlayUtils::placeFixedHandicap`（对弈软件
+/// 事实标准，master 分支 playutils.cpp）的惯例逐让子数给出：
 ///
-/// 逐尺寸列出，取前 `n` 个作为 `n` 让子的摆子位置：
-/// - 9 / 13 路：对角双星 + 天元 + 另两角；
-/// - 19 路：四角星、四边星、天元（顺序按角 → 边 → 天元，
-///   让 2 / 3 取对角，让 5 以上补边星与天元，符合通行惯例）。
-fn handicap_stars(n: u8) -> &'static [(u8, u8)] {
-    match n {
-        9 => &[(2, 2), (6, 6), (4, 4), (6, 2), (2, 6)],
-        13 => &[(3, 3), (9, 9), (6, 6), (9, 3), (3, 9)],
-        19 => &[
-            (3, 3),
-            (15, 15),
-            (3, 15),
-            (15, 3),
-            (3, 9),
-            (15, 9),
-            (9, 3),
-            (9, 15),
-            (9, 9),
-        ],
-        _ => &[],
-    }
-}
-
-/// 让子摆子坐标：`handicap` 个星位（0 或 1 时为空表——让 1 不摆子，
-/// 由调用方按普通对局处理）。非法让子数（1 或 >9）返回空表，调用方
-/// 应在上游界面限制取值范围。
+/// - 让 2 对角双角，让 3 加相邻角，让 4 四角；
+/// - 让 5 加天元；让 6 改为四角 + 左右边星（**天元让位**）；
+/// - 让 7 再补天元；让 8 四边星全上（天元再次让位）；让 9 再补天元。
 ///
-/// 星位表条目数少于让子数时按表截断（当前三档尺寸不会发生，防御性约束）。
+/// 天元在 5 → 6、7 → 8 时先有后无，不是单一前缀序列，故按 n 分段写出。
+/// 角线：9 路在第 3 线（索引 2），13 / 19 路在第 4 线（索引 3）；
+/// 边星与天元取中线（索引 n/2）。
+///
+/// 让子数不在 2..=9 时返回空表（0 / 1 无摆子，调用方按普通对局处理；
+/// UI 已把可选取值限制在 0 与 2..=9，超界属防御分支）。
 pub fn handicap_stones(size: Size, handicap: usize) -> Vec<Coord> {
-    if handicap < 2 {
+    if !(2..=9).contains(&handicap) {
         return Vec::new();
     }
-    handicap_stars(size.n())
+    let n = size.n();
+    let (corner, mid) = match n {
+        9 => (2u8, 4),
+        13 => (3, 6),
+        19 => (3, 9),
+        _ => return Vec::new(),
+    };
+    let far = n - 1 - corner; // 对侧角线
+    let (a, b) = ((corner, corner), (far, far)); // 对角双角
+    let (c, d) = ((corner, far), (far, corner)); // 另两角
+    let (l, r) = ((corner, mid), (far, mid)); // 左右两边星
+    let (t, bo) = ((mid, corner), (mid, far)); // 上下两边星
+    let center = (mid, mid); // 天元
+    let points: &[(u8, u8)] = match handicap {
+        2 => &[a, b],
+        3 => &[a, b, c],
+        4 => &[a, b, c, d],
+        5 => &[a, b, c, d, center],
+        6 => &[a, b, c, d, l, r],
+        7 => &[a, b, c, d, l, r, center],
+        8 => &[a, b, c, d, l, r, t, bo],
+        _ => &[a, b, c, d, l, r, t, bo, center],
+    };
+    points
         .iter()
-        .take(handicap)
         .filter_map(|&(x, y)| Coord::new(size, x, y))
         .collect()
 }

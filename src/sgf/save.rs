@@ -77,13 +77,40 @@ pub fn board_to_sgf(board: &Board, meta: Option<&GameMeta>) -> String {
 }
 
 /// 序列化并写入文件（UTF-8 无 BOM；文本由 [`GameTree::write`] 生成）。
+/// 落盘为原子写（见 [`write_atomically`]），失败时已有文件不受影响。
 pub fn save_to_file(
     path: &Path,
     board: &Board,
     meta: Option<&GameMeta>,
 ) -> Result<(), SaveError> {
     let text = board_to_sgf(board, meta);
-    std::fs::write(path, text).map_err(SaveError::Io)
+    write_atomically(path, &text)
+}
+
+/// 原子落盘：先写**同目录**的临时文件（`原名.tmp`），再 `rename` 覆盖
+/// 目标——写到一半崩溃 / 断电只损失临时文件，已有棋谱不会被截断。
+/// 临时文件与目标同目录是 `rename` 原子性的前提（跨文件系统会退化为
+/// 拷贝）；写入或换名失败都删除临时文件，不留垃圾。
+///
+/// 不复用 `engine::config::write_atomically`：那是配置写入的模块私有
+/// 实现，语义不合——它会静默创建目标目录、失败时不清理临时文件；
+/// 「另存为」面对用户选定路径的目录缺失应当报错而非替用户建目录。
+fn write_atomically(path: &Path, text: &str) -> Result<(), SaveError> {
+    let name = path.file_name().ok_or_else(|| {
+        SaveError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "目标路径没有文件名",
+        ))
+    })?;
+    let tmp = path.with_file_name(format!("{}.tmp", name.to_string_lossy()));
+    let result = std::fs::write(&tmp, text)
+        .map_err(SaveError::Io)
+        .and_then(|()| std::fs::rename(&tmp, path).map_err(SaveError::Io));
+    if result.is_err() {
+        // 临时文件可能尚未建出，清理失败（已不存在）无碍，静默即可。
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// 从「当前链起点」`start` 起填充一棵游戏树：`start`（根或分支首手）的

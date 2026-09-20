@@ -11,7 +11,7 @@
 //! 另存把当前棋盘（含用户新建的变着）序列化为 SGF 写盘，未载入棋谱时
 //! 允许存出空盘谱。本类型只负责把配置、动作与界面连起来。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::board::{Board, IllegalReason, Size, Stone};
@@ -25,6 +25,15 @@ use crate::ui::{
     analysis_panel::{self, LoadNotice},
     curve, new_game, overlay, settings, tree,
 };
+
+/// 另存对话框的默认文件名：取档案路径的文件名，无法取得时退回
+/// `guanqi.sgf`（新对局的档案路径为占位符，走此默认）。
+fn default_sgf_name(source: &Path) -> String {
+    source
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "guanqi.sgf".to_owned())
+}
 
 /// 观棋主应用。
 pub struct GuanqiApp {
@@ -165,8 +174,7 @@ impl GuanqiApp {
     }
 
     /// 发起「另存为」对话框（菜单入口与 Ctrl+Shift+S 共用）。
-    /// 未载入棋谱时同样可用（空盘存成空盘谱）；默认文件名取
-    /// 当前文件名（已含 `.sgf` 后缀）或 `guanqi.sgf`。
+    /// 默认文件名取当前档案名（已含 `.sgf` 后缀），从未存过时 `guanqi.sgf`。
     fn save_file_dialog(&mut self) {
         if let Some(notice) = self.dialog_guard() {
             self.save_notice = Some(notice);
@@ -175,8 +183,7 @@ impl GuanqiApp {
         let default_name = self
             .loaded
             .as_ref()
-            .and_then(|meta| meta.source.file_name())
-            .map(|name| name.to_string_lossy().into_owned())
+            .map(|meta| default_sgf_name(&meta.source))
             .unwrap_or_else(|| "guanqi.sgf".to_owned());
         match FileDialog::save_file("另存棋谱（SGF）", &default_name, Some(self.waker.clone())) {
             Ok(dialog) => {
@@ -271,7 +278,7 @@ impl GuanqiApp {
     }
 
     /// 把当前棋盘（含用户新建的变着）写到用户确认的位置。
-    /// 未载入棋谱时存成空盘谱；写失败时提示可读原因，原状态不变。
+    /// 新对局后未另存过时用默认文件名存；写失败时提示可读原因，原状态不变。
     fn save_game(&mut self, path: PathBuf) {
         match save_to_file(&path, &self.board, self.loaded.as_ref()) {
             Ok(()) => {
@@ -281,7 +288,6 @@ impl GuanqiApp {
                     .as_mut()
                     // 记住新路径：再次「另存为」默认名跟随最新位置。
                     .map(|meta| meta.source = path.clone())
-                    // 空盘保存后也视作已有一份棋谱档案（下次默认名正确）。
                     .unwrap_or_else(|| {
                         self.loaded = Some(GameMeta::for_path(&path, self.board.size()));
                     });
@@ -317,6 +323,13 @@ impl GuanqiApp {
         self.board = board;
         // 棋盘整体替换：树布局指纹换代（与载谱同理）。
         self.tree_epoch = self.tree_epoch.wrapping_add(1);
+        // 元信息同样整体替换：旧棋谱的对局信息与逐手注释不能混进新对局
+        // 的另存文件；让子数记入 info，「另存」才能写出 HA[n]
+        // （普通对局为 0，不写 HA）。
+        let mut meta = GameMeta::for_path(Path::new("guanqi.sgf"), setup.size);
+        meta.info.komi = Some(setup.komi);
+        meta.info.handicap = handicap.min(9) as u8;
+        self.loaded = Some(meta);
         self.komi = setup.komi;
         self.play = PlayState::new_game(&setup);
         let size = setup.size;
