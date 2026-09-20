@@ -179,6 +179,11 @@ pub struct Snapshot {
     pub size: Size,
     /// 本快照的 visits 上限（快阶段为 [`FAST_VISITS`]，深阶段为配置值）。
     pub visits_cap: u32,
+    /// 是否为深阶段报告（visits 达配置值）。人机对弈的自动应手只认
+    /// 深阶段终态快照——快阶段结果只用于渐进显示，不能拿去走子。
+    pub deep: bool,
+    /// 是否为终态报告（`false` = 引擎的渐进中间报告，后续还会更新）。
+    pub is_final: bool,
     /// 从发起到收到报告的耗时。
     pub elapsed: std::time::Duration,
     /// 根节点统计；空报告（`noResults`）为 `None`。
@@ -385,7 +390,9 @@ impl AnalysisState {
     }
 
     /// 每帧调用（`App::logic`）：轮询引擎事件并按局面推进分析。
-    pub fn sync(&mut self, board: &Board, cfg: &EngineConfig) {
+    ///
+    /// `komi` 为当前对局的贴目（随查询发给引擎；复盘无贴目信息时用 7.5）。
+    pub fn sync(&mut self, board: &Board, cfg: &EngineConfig, komi: f64) {
         // 局面签名 = 根到当前节点的着法序列：落子 / 导航 / 悔棋 / 改着都会使其变化。
         let sig = board.records();
         if Some(sig) != self.analyzed_sig.as_deref() {
@@ -397,11 +404,11 @@ impl AnalysisState {
                 handle.terminate(inflight.id);
             }
             if matches!(self.engine, EngineStatus::Ready) {
-                self.request(board, cfg, Stage::Fast);
+                self.request(board, cfg, Stage::Fast, komi);
             }
         }
         while let Some(event) = self.handle.as_mut().and_then(Engine::try_recv) {
-            self.on_event(event, board, cfg);
+            self.on_event(event, board, cfg, komi);
         }
     }
 
@@ -429,15 +436,15 @@ impl AnalysisState {
 
     // ---- 内部 ----
 
-    fn on_event(&mut self, event: EngineEvent, board: &Board, cfg: &EngineConfig) {
+    fn on_event(&mut self, event: EngineEvent, board: &Board, cfg: &EngineConfig, komi: f64) {
         match event {
             EngineEvent::Ready => {
                 self.engine = EngineStatus::Ready;
                 self.transient_error = None;
-                self.request(board, cfg, Stage::Fast);
+                self.request(board, cfg, Stage::Fast, komi);
             }
             EngineEvent::Report { id, report, is_final } => {
-                self.on_report(id, report, is_final, board, cfg);
+                self.on_report(id, report, is_final, board, cfg, komi);
             }
             EngineEvent::Log(line) => self.last_log = Some(line),
             EngineEvent::Failed(err) => self.on_failed(err),
@@ -467,6 +474,7 @@ impl AnalysisState {
         is_final: bool,
         board: &Board,
         cfg: &EngineConfig,
+        komi: f64,
     ) {
         let Some(inflight) = self.inflight.as_ref() else {
             return;
@@ -482,6 +490,8 @@ impl AnalysisState {
             turn,
             size: board.size(),
             visits_cap: stage.cap(cfg),
+            deep: stage == Stage::Deep,
+            is_final,
             elapsed: started.elapsed(),
             root: root.clone(),
             moves,
@@ -502,7 +512,7 @@ impl AnalysisState {
             self.inflight = None;
             // 分段加深：快查询与深查询预算相同（配置值很小）时无需重复。
             if stage == Stage::Fast && stage.cap(cfg) < cfg.visits.max(1) {
-                self.request(board, cfg, Stage::Deep);
+                self.request(board, cfg, Stage::Deep, komi);
             }
         }
     }
@@ -531,8 +541,8 @@ impl AnalysisState {
         }
     }
 
-    /// 对当前局面发起查询（就绪且无在飞时才生效）。
-    fn request(&mut self, board: &Board, cfg: &EngineConfig, stage: Stage) {
+    /// 对当前局面发起查询（就绪且无在飞时才生效）。`komi` 随查询发给引擎。
+    fn request(&mut self, board: &Board, cfg: &EngineConfig, stage: Stage, komi: f64) {
         if self.inflight.is_some() {
             return;
         }
@@ -545,6 +555,7 @@ impl AnalysisState {
             .map(|record| (record.player, record.action))
             .collect();
         let mut query = AnalysisQuery::new(board.size(), moves);
+        query.komi = komi;
         query.max_visits = Some(stage.cap(cfg));
         // 热度图需要 ownership（opt-in，引擎缺省不返回该字段）：
         // 此处为单点改动处，快 / 深两阶段都会带回。

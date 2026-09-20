@@ -5,6 +5,7 @@
 //!
 //! - [`app`]：[`eframe::App`] 实现与整体接线；
 //! - [`board`]：坐标、规则与带历史的棋盘状态；
+//! - [`play`]：人机对弈（对局状态、引擎自动应手决策与终局判定）；
 //! - [`sgf`]：SGF 解析 / 序列化与棋谱载入；
 //! - [`engine`]：KataGo `analysis` 子进程桥接；
 //! - [`portal`]：零依赖调用系统原生文件对话框（XDG Desktop Portal）；
@@ -16,6 +17,7 @@
 pub mod app;
 pub mod board;
 pub mod engine;
+pub mod play;
 pub mod portal;
 pub mod sgf;
 pub mod ui;

@@ -14,15 +14,16 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::board::{Board, IllegalReason, Size};
+use crate::board::{Board, IllegalReason, Size, Stone};
 use crate::engine::{load_settings, EngineConfig};
+use crate::play::{self, GameSetup, PlayState};
 use crate::portal::{FileDialog, PortalEvent};
 use crate::sgf::{GameMeta, load_from_bytes, save_to_file};
 use crate::ui;
 use crate::ui::{
     analysis::{AnalysisState, EngineStatus, Waker},
     analysis_panel::{self, LoadNotice},
-    curve, overlay, settings,
+    curve, new_game, overlay, settings,
 };
 
 /// 观棋主应用。
@@ -61,6 +62,14 @@ pub struct GuanqiApp {
     load_notice: Option<LoadNotice>,
     /// 最近一次「另存为」的用户可见提示（成功 / 失败）。
     save_notice: Option<LoadNotice>,
+    /// 人机对弈状态：模式开关、人类执子、认输与无望提示（复盘初始态）。
+    play: PlayState,
+    /// 新对局设置窗口是否打开。
+    new_game_open: bool,
+    /// 新对局设置窗口状态（编辑草稿跨窗口开关保留）。
+    new_game: new_game::NewGameUi,
+    /// 当前生效的贴目（新对局时设置；查询随局面发给引擎）。
+    komi: f64,
 }
 
 /// 等待中的对话框用途：打开与保存各自独立接结果，互不串线。
@@ -115,6 +124,10 @@ impl GuanqiApp {
             loaded: None,
             load_notice: None,
             save_notice: None,
+            play: PlayState::review(),
+            new_game_open: false,
+            new_game: new_game::NewGameUi::new(),
+            komi: 7.5,
         }
     }
 
@@ -273,6 +286,36 @@ impl GuanqiApp {
             }
         }
     }
+    /// 开始新对局（新对局窗口「开始」按钮）：
+    /// 让子按标准星位预摆（白先），整体替换棋盘；清空分析快照与胜率
+    /// 历史（新对局不混旧曲线）；进入对弈模式并记录贴目。
+    fn start_new_game(&mut self, setup: GameSetup) {
+        let handicap = setup.effective_handicap();
+        let stones = play::handicap_stones(setup.size, handicap);
+        // 让子 > 1 时白先（标准让子棋惯例）；摆子只摆黑方星位。
+        let (black, white, to_play) = if handicap > 0 {
+            (stones, Vec::new(), Stone::White)
+        } else {
+            (Vec::new(), Vec::new(), Stone::Black)
+        };
+        let board = Board::from_setup(setup.size, &black, &white, &[], to_play)
+            .expect("新对局的尺寸与星位坐标均合法，构造必然成功");
+        self.analysis.reset();
+        self.overlay.focus = None;
+        self.board = board;
+        self.komi = setup.komi;
+        self.play = PlayState::new_game(&setup);
+        let size = setup.size;
+        let desc = if handicap > 0 {
+            format!("{size} 让{handicap}子")
+        } else {
+            size.to_string()
+        };
+        self.load_notice = Some(LoadNotice::Ok(format!(
+            "新对局已开始：{desc}，你执{}。",
+            setup.human.name()
+        )));
+    }
 }
 
 impl eframe::App for GuanqiApp {
@@ -287,7 +330,7 @@ impl eframe::App for GuanqiApp {
         if ui.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.ctrl && i.modifiers.shift) {
             self.save_file_dialog();
         }
-        // 顶部菜单栏：文件 → 打开棋谱… / 另存为…
+        // 顶部菜单栏：文件 → 打开棋谱… / 另存为…；对局 → 新对局…
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("文件", |ui| {
@@ -317,6 +360,12 @@ impl eframe::App for GuanqiApp {
                         ui.close();
                     }
                 });
+                ui.menu_button("对局", |ui| {
+                    if ui.button("新对局…").clicked() {
+                        self.new_game_open = true;
+                        ui.close();
+                    }
+                });
             });
         });
 
@@ -326,6 +375,27 @@ impl eframe::App for GuanqiApp {
             .loaded
             .as_ref()
             .and_then(|meta| meta.comment_at(&self.board));
+        // 引擎无望提示文本（深阶段终态报告里引擎方胜率过低时给出，
+        // 本帧检出后立即标记已提示，避免重复；确认按钮只清当前提示）。
+        let hopeless = play::should_show_hopeless(&self.play, self.analysis.snapshot.as_ref());
+        let hopeless_text = hopeless.then(|| {
+            let engine = self.play.human.opposite();
+            let wr = self
+                .analysis
+                .snapshot
+                .as_ref()
+                .and_then(|s| play::engine_winrate(engine, s))
+                .map_or_else(|| "—".to_owned(), |wr| format!("{:.1}%", wr * 100.0));
+            format!(
+                "引擎认为{}方已无望（胜率 {wr}）。\
+                 你可以判它认输（点「认输」并选择引擎认输），或继续对局。",
+                engine.name()
+            )
+        });
+        if hopeless {
+            // 展示即记录，本次对局不再重复提示。
+            play::mark_hopeless_shown(&mut self.play);
+        }
         let mut panel_action = analysis_panel::PanelAction::None;
         egui::Panel::right("analysis_panel")
             .default_size(240.0)
@@ -345,6 +415,9 @@ impl eframe::App for GuanqiApp {
                     comment,
                     self.load_notice.as_ref(),
                     self.save_notice.as_ref(),
+                    &mut self.play,
+                    &mut self.new_game_open,
+                    hopeless_text.as_deref(),
                 );
             });
         match panel_action {
@@ -357,6 +430,21 @@ impl eframe::App for GuanqiApp {
                 self.overlay.focus =
                     if same { None } else { Some(overlay::Focus { at, ghosts }) };
             }
+            // 人类弃着：与引擎弃着走同一入口（谱树挂弃着子节点）。
+            analysis_panel::PanelAction::HumanPass => {
+                if self.play.mode && !self.play.finished(&self.board) {
+                    self.board.pass();
+                }
+            }
+            // 人类认输：记录认输方并给出结果提示；之后自动应手停止。
+            analysis_panel::PanelAction::HumanResign => {
+                if self.play.mode && !self.play.finished(&self.board) {
+                    self.play.resigned = Some(self.play.human);
+                }
+            }
+            // 确认「引擎无望」提示：只收起提示，不自动替引擎认输。
+            analysis_panel::PanelAction::AckHopeless => {}
+            analysis_panel::PanelAction::OpenNewGame => {}
             analysis_panel::PanelAction::None => {}
         }
 
@@ -387,6 +475,9 @@ impl eframe::App for GuanqiApp {
                     if ui.button("设置…").clicked() {
                         self.settings_open = !self.settings_open;
                     }
+                    if ui.button("新对局…").clicked() {
+                        self.new_game_open = true;
+                    }
                 });
             });
             ui::show(
@@ -396,8 +487,18 @@ impl eframe::App for GuanqiApp {
                 &mut self.branch_notice,
                 &self.analysis,
                 &self.overlay,
+                Some(&self.play),
             );
         });
+
+        // 新对局设置窗口（确认后建盘、清分析状态并进入对弈模式）。
+        if self.new_game_open {
+            let ctx = ui.ctx().clone();
+            let action = new_game::show(&ctx, &mut self.new_game_open, &mut self.new_game, &self.analysis.engine);
+            if let new_game::NewGameAction::Start(setup) = action {
+                self.start_new_game(setup);
+            }
+        }
 
         // 设置窗口（「保存并重启引擎」在此触发引擎进程重启）。
         if self.settings_open {
@@ -432,11 +533,37 @@ impl eframe::App for GuanqiApp {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
 
-        self.analysis.sync(&self.board, &self.engine_cfg);
+        self.analysis.sync(&self.board, &self.engine_cfg, self.komi);
         // 局面变化会先作废快照（见 AnalysisState::sync），借此时机清除定位高亮。
         if self.analysis.snapshot.is_none() {
             self.overlay.focus = None;
         }
+
+        // 人机对弈自动应手：轮到引擎且收到该局面的深阶段终态报告时，
+        // 取首选着法落子（`mv = None` 即引擎弃着）。回看历史 / 快阶段 /
+        // 非终态等一切不该走的情况都由决策函数守卫（见 play 模块文档）。
+        let engine_ready = matches!(self.analysis.engine, EngineStatus::Ready);
+        let decision = play::engine_move_decision(
+            self.play.mode,
+            self.play.human,
+            &self.board,
+            self.analysis.snapshot.as_ref(),
+            engine_ready,
+        );
+        // 认输状态独立短路：决策函数只看棋盘，看不到 resigned。
+        // 首选着法由引擎对当前盘面搜索得出；除非盘面在报告间隙被人为
+        // 改过（对弈流程内不会发生），落子必然合法，非法结果忽略。
+        if self.play.resigned.is_none()
+            && let Some(action) = decision
+        {
+            match action {
+                crate::board::Action::Place(at) => {
+                    let _ = self.board.play(at);
+                }
+                crate::board::Action::Pass => self.board.pass(),
+            }
+        }
+
         // 启动 / 分析期间保持低频重绘，让状态与计时可见
         // （事件到达时 waker 已会触发立即重绘）。
         if matches!(self.analysis.engine, EngineStatus::Starting) || self.analysis.analyzing() {

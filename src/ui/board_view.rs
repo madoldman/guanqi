@@ -15,6 +15,7 @@
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 
 use crate::board::{Action, Board, Coord, IllegalReason, Size, Stone};
+use crate::play::{PlayState, resign_text, undo_to_human};
 
 use super::analysis::AnalysisState;
 use super::overlay::{self, Overlay};
@@ -49,6 +50,8 @@ const BRANCH_HEIGHT: f32 = 26.0;
 /// 回看中新建变着分支时写入后者，任何一次成功操作后清除，
 /// 使提示能跨帧稳定显示。`analysis` 提供当前局面快照（候选点 / 热度图）
 /// 与当前线历史（失误标注）；`overlay` 持有层开关与侧栏定位状态。
+/// `play` 为人机对弈状态（`None` = 尚未初始化，按纯复盘处理）；
+/// 对弈模式开启时 Ctrl+Z 悔棋回到「轮到人类」的状态（见 [`undo_to_human`]）。
 pub fn show(
     ui: &mut Ui,
     board: &mut Board,
@@ -56,8 +59,9 @@ pub fn show(
     branch_notice: &mut Option<String>,
     analysis: &AnalysisState,
     overlay: &Overlay,
+    play: Option<&PlayState>,
 ) {
-    handle_keyboard(ui, board, notice, branch_notice);
+    handle_keyboard(ui, board, notice, branch_notice, play);
 
     // 分支点时在棋盘上方给一行选择器（按钮动作在落子处理前执行，
     // 因为选择器只读棋盘、落子要可变借用，二者借用不冲突）；
@@ -134,7 +138,7 @@ pub fn show(
         BranchSel::None => {}
     }
 
-    draw_status(ui, board, *notice, branch_notice.as_deref());
+    draw_status(ui, board, *notice, branch_notice.as_deref(), play);
 }
 
 /// 分支选择器的一帧交互结果（绘制期间收集，绘制后统一执行）。
@@ -193,11 +197,17 @@ fn draw_branch_selector(ui: &mut Ui, board: &Board) -> BranchSel {
 /// ← 后退一手，→ 前进一手，Ctrl+Z 悔棋；
 /// Ctrl+← / Ctrl+→ 在相邻子分支间切换（不占用 ←/→ 的前进后退）；
 /// 任何一次成功的导航都清除非法落子与建分支两类提示。
+///
+/// 对弈模式开启时 Ctrl+Z 语义变化：回到人类该走的**上一个决策点**
+/// （撤掉引擎应手 + 人类上一手，或仅撤人类刚落的一手，至多 2 手，
+/// 见 [`undo_to_human`]）；复盘模式保持原单步语义。
+/// 悔棋失败（无棋可悔）不弹窗——状态行无变化即反馈。
 fn handle_keyboard(
     ui: &Ui,
     board: &mut Board,
     notice: &mut Option<IllegalReason>,
     branch_notice: &mut Option<String>,
+    play: Option<&PlayState>,
 ) {
     let (back, forward, undo, prev, next) = ui.input(|i| {
         (
@@ -208,10 +218,15 @@ fn handle_keyboard(
             i.key_pressed(egui::Key::ArrowRight) && i.modifiers.ctrl,
         )
     });
+    let play_undo = undo && play.is_some_and(|p| p.mode);
     let moved = if back {
         board.step_back()
     } else if forward {
         board.step_forward()
+    } else if play_undo {
+        // 对弈悔棋：撤到人类该走的状态（不可能时棋盘保持原状）。
+        let human = play.map_or(Stone::Black, |p| p.human);
+        undo_to_human(board, human)
     } else if undo {
         board.undo().is_some()
     } else if prev {
@@ -502,9 +517,18 @@ fn draw_hover(painter: &Painter, layout: &Layout, board: &Board, pos: Pos2) {
     }
 }
 
-/// 最小状态行：手数 / 行棋方 / 提子 / 非法提示 / 建分支提示 / 快捷键说明
-/// （完整侧栏在阶段 4）。
-fn draw_status(ui: &mut Ui, board: &Board, notice: Option<IllegalReason>, branch_notice: Option<&str>) {
+/// 最小状态行：手数 / 行棋方 / 提子 / 对弈轮次 / 非法提示 / 建分支提示 /
+/// 快捷键说明（完整侧栏在阶段 4）。
+///
+/// 对弈模式开启时行棋方一栏改为明确的「轮到你 / 引擎思考中…」提示
+/// （含对局已结束的原因）；复盘模式保持原「轮到黑/白」文案。
+fn draw_status(
+    ui: &mut Ui,
+    board: &mut Board,
+    notice: Option<IllegalReason>,
+    branch_notice: Option<&str>,
+    play: Option<&PlayState>,
+) {
     ui.add_space(6.0);
     ui.horizontal_wrapped(|ui| {
         ui.label(format!("第 {} / {} 手", board.cursor(), board.line_len()));
@@ -512,7 +536,31 @@ fn draw_status(ui: &mut Ui, board: &Board, notice: Option<IllegalReason>, branch
             ui.weak("（回看中）");
         }
         ui.separator();
-        ui.label(format!("轮到{}", board.to_play().name()));
+        match play {
+            Some(play) if play.mode => {
+                if play.finished(board) {
+                    let text = match play.resigned {
+                        Some(side) => format!("{}认输，{}", side.name(), resign_text(side)),
+                        None => "对局结束：双方连续弃着".to_owned(),
+                    };
+                    ui.colored_label(Color32::from_rgb(255, 190, 90), text);
+                } else if board.to_play() == play.human {
+                    ui.label(
+                        RichText::new(format!("轮到你（你执{}）", play.human.name()))
+                            .color(Color32::from_rgb(140, 220, 140))
+                            .strong(),
+                    );
+                } else {
+                    ui.colored_label(
+                        Color32::from_rgb(140, 220, 140),
+                        format!("引擎思考中…（引擎执{}）", play.human.opposite().name()),
+                    );
+                }
+            }
+            _ => {
+                ui.label(format!("轮到{}", board.to_play().name()));
+            }
+        }
         ui.separator();
         ui.label(format!(
             "黑提 {} · 白提 {}",

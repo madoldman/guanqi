@@ -11,6 +11,7 @@ use egui::{Color32, Pos2, Rect, RichText, Sense, Ui, Vec2};
 
 use crate::board::{Board, Coord, IllegalReason, Stone};
 use crate::engine::{EngineConfig, RootInfo};
+use crate::play::{PlayState, resign_text};
 use crate::sgf::GameMeta;
 
 use super::analysis::{AnalysisState, EngineStatus, Severity};
@@ -35,6 +36,14 @@ pub enum PanelAction {
         /// 主变幽灵子（已剔除断着与盘面已有棋子的点由绘制端处理）。
         ghosts: Vec<(Coord, Stone)>,
     },
+    /// 人类点了「弃着」按钮。
+    HumanPass,
+    /// 人类点了「认输」按钮。
+    HumanResign,
+    /// 确认「引擎无望」提示（不再重复提示；是否判引擎认输由用户另行决定）。
+    AckHopeless,
+    /// 打开「新对局」设置窗口。
+    OpenNewGame,
 }
 
 /// 「打开棋谱」流程的用户可见提示（App 写入，随侧栏提示行显示）。
@@ -107,6 +116,8 @@ fn eval_lines(root: &RootInfo) -> (String, String) {
 /// `game` / `comment` 为「打开棋谱」相关信息：已载入棋谱的元信息与
 /// 当前手注释；`load_notice` / `save_notice` 为最近一次打开 / 另存
 /// 操作的提示（无则对应段落不显示）。
+/// `play` 为人机对弈状态；`new_game_open` 为新对局窗口开关（共享）；
+/// `hopeless` 为引擎无望提示文本（`Some` = 显示提示与确认按钮）。
 /// 注释可能很长，整体包一层垂直滚动，避免侧栏内容被裁剪。
 #[allow(clippy::too_many_arguments)]
 pub fn show(
@@ -123,6 +134,9 @@ pub fn show(
     comment: Option<&str>,
     load_notice: Option<&LoadNotice>,
     save_notice: Option<&LoadNotice>,
+    play: &mut PlayState,
+    new_game_open: &mut bool,
+    hopeless: Option<&str>,
 ) -> PanelAction {
     egui::ScrollArea::vertical().show(ui, |ui| {
         panel_body(
@@ -139,6 +153,9 @@ pub fn show(
             comment,
             load_notice,
             save_notice,
+            play,
+            new_game_open,
+            hopeless,
         )
     })
     .inner
@@ -160,8 +177,63 @@ fn panel_body(
     comment: Option<&str>,
     load_notice: Option<&LoadNotice>,
     save_notice: Option<&LoadNotice>,
+    play: &mut PlayState,
+    new_game_open: &mut bool,
+    hopeless: Option<&str>,
 ) -> PanelAction {
     let mut action = PanelAction::None;
+    ui.heading("对局");
+    ui.add_space(4.0);
+    ui.checkbox(&mut play.mode, "人机对弈");
+    if play.mode {
+        let engine_ready = matches!(analysis.engine, EngineStatus::Ready);
+        let finished = play.finished(board);
+        let human_turn = !finished && board.to_play() == play.human;
+        let engine_turn = !finished && !human_turn && engine_ready
+            && board.cursor() == board.line_len();
+        // 回看中不显示「引擎思考中」：该状态下引擎不会自动应手。
+        let engine_thinking = engine_turn && engine_ready && analysis.analyzing();
+        ui.label(format!("你执{}", play.human.name()));
+        if finished {
+            let reason = match play.resigned {
+                Some(side) => format!("{}认输：{}", side.name(), resign_text(side)),
+                None => "对局结束：双方连续弃着".to_owned(),
+            };
+            ui.colored_label(Color32::from_rgb(255, 190, 90), reason);
+            // 结束后进入纯复盘浏览：对弈开关保持，但不再自动应手
+            // （决策函数的 two_passes / resigned 守卫兜底）。
+        } else if engine_thinking {
+            ui.colored_label(Color32::from_rgb(140, 220, 140), "引擎思考中…");
+        } else if human_turn {
+            ui.colored_label(Color32::from_rgb(140, 220, 140), "轮到你");
+        } else {
+            ui.weak("等待引擎…");
+        }
+        if !finished && human_turn && board.cursor() == board.line_len() {
+            ui.horizontal(|ui| {
+                if ui.button("弃着").clicked() {
+                    action = PanelAction::HumanPass;
+                }
+                if ui.button("认输").clicked() {
+                    action = PanelAction::HumanResign;
+                }
+            });
+        }
+    }
+    if ui.button("新对局…").clicked() {
+        *new_game_open = true;
+        action = PanelAction::OpenNewGame;
+    }
+    if let Some(text) = hopeless {
+        ui.add_space(4.0);
+        ui.colored_label(Color32::from_rgb(255, 190, 90), text);
+        if ui.button("确认，继续对局").clicked() {
+            action = PanelAction::AckHopeless;
+        }
+    }
+
+    ui.add_space(6.0);
+    ui.separator();
     ui.heading("分析");
     ui.add_space(4.0);
 
