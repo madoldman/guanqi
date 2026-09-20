@@ -111,7 +111,7 @@ fn eval_lines(root: &RootInfo) -> (String, String) {
 
 /// 绘制分析侧栏。`settings_open` 由本面板与顶部按钮共享；
 /// `overlay` 为棋盘叠加层的层开关与定位状态（本面板读写）；
-/// `curve_open` 为胜率曲线底部面板的显示开关。
+/// `curve_open` / `tree_open` 为胜率曲线 / 棋谱树底部面板的显示开关。
 /// `board` 提供总手数与各行棋方（失误汇总按手数现场派生）。
 /// `game` / `comment` 为「打开棋谱」相关信息：已载入棋谱的元信息与
 /// 当前手注释；`load_notice` / `save_notice` 为最近一次打开 / 另存
@@ -130,6 +130,7 @@ pub fn show(
     settings_open: &mut bool,
     overlay: &mut Overlay,
     curve_open: &mut bool,
+    tree_open: &mut bool,
     game: Option<&GameMeta>,
     comment: Option<&str>,
     load_notice: Option<&LoadNotice>,
@@ -149,6 +150,7 @@ pub fn show(
             settings_open,
             overlay,
             curve_open,
+            tree_open,
             game,
             comment,
             load_notice,
@@ -173,6 +175,7 @@ fn panel_body(
     settings_open: &mut bool,
     overlay: &mut Overlay,
     curve_open: &mut bool,
+    tree_open: &mut bool,
     game: Option<&GameMeta>,
     comment: Option<&str>,
     load_notice: Option<&LoadNotice>,
@@ -422,6 +425,7 @@ fn panel_body(
     ui.checkbox(&mut overlay.show_heat, "局势热度图");
     ui.checkbox(&mut overlay.show_mistakes, "失误标注");
     ui.checkbox(curve_open, "胜率曲线面板");
+    ui.checkbox(tree_open, "棋谱树面板");
     // 胜率色阶图例：与棋盘候选点共用 overlay::winrate_color 同一映射。
     ui.horizontal(|ui| {
         ui.weak("白优");

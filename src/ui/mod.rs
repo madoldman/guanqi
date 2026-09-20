@@ -7,6 +7,7 @@ pub mod curve;
 pub mod new_game;
 pub mod overlay;
 pub mod settings;
+pub mod tree;
 
 pub use board_view::show;
 

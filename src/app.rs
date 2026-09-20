@@ -23,7 +23,7 @@ use crate::ui;
 use crate::ui::{
     analysis::{AnalysisState, EngineStatus, Waker},
     analysis_panel::{self, LoadNotice},
-    curve, new_game, overlay, settings,
+    curve, new_game, overlay, settings, tree,
 };
 
 /// 观棋主应用。
@@ -42,6 +42,13 @@ pub struct GuanqiApp {
     overlay: overlay::Overlay,
     /// 胜率曲线底部面板是否显示（面板隐藏时不创建，零开销）。
     curve_open: bool,
+    /// 棋谱树底部面板是否显示（面板隐藏时不创建，零开销）。
+    tree_open: bool,
+    /// 棋谱树控件跨帧状态（布局缓存与自动滚动记忆）。
+    tree_ui: tree::TreeUi,
+    /// 棋盘替换代数：整体替换棋盘（载谱 / 新对局）时递增，混入树布局
+    /// 指纹，防止「着法序列恰好相同的另一盘棋」复用过期布局。
+    tree_epoch: u64,
     /// 当前生效的引擎配置（设置保存后更新）。
     engine_cfg: EngineConfig,
     /// 设置窗口状态（编辑草稿与权重缓存）。
@@ -114,6 +121,9 @@ impl GuanqiApp {
                 focus: None,
             },
             curve_open: true,
+            tree_open: false,
+            tree_ui: tree::TreeUi::default(),
+            tree_epoch: 0,
             engine_cfg,
             settings,
             settings_open: false,
@@ -222,6 +232,8 @@ impl GuanqiApp {
                 let moves = board.move_count();
                 self.board = board;
                 self.loaded = Some(meta);
+                // 棋盘整体替换：树布局指纹换代，不复用旧谱布局。
+                self.tree_epoch = self.tree_epoch.wrapping_add(1);
                 // 主变停止为「部分载入」（橙色留意）；仅变着分支被舍弃时
                 // 提示照样给出，但按成功（绿色）显示。
                 let notice = match warning {
@@ -303,6 +315,8 @@ impl GuanqiApp {
         self.analysis.reset();
         self.overlay.focus = None;
         self.board = board;
+        // 棋盘整体替换：树布局指纹换代（与载谱同理）。
+        self.tree_epoch = self.tree_epoch.wrapping_add(1);
         self.komi = setup.komi;
         self.play = PlayState::new_game(&setup);
         let size = setup.size;
@@ -411,6 +425,7 @@ impl eframe::App for GuanqiApp {
                     &mut self.settings_open,
                     &mut self.overlay,
                     &mut self.curve_open,
+                    &mut self.tree_open,
                     self.loaded.as_ref(),
                     comment,
                     self.load_notice.as_ref(),
@@ -456,6 +471,24 @@ impl eframe::App for GuanqiApp {
                 .resizable(true)
                 .show(ui, |ui| {
                     curve::show(ui, &self.analysis, &self.board);
+                });
+        }
+
+        // 棋谱树底部面板：整棵对局树可视化 + 点击跳转（见 ui::tree 模块
+        // 文档）。与曲线面板同为可开关面板，隐藏时不创建，零额外计算。
+        // 注释索引随 `loaded` 传入（无棋谱时无注释标记）。
+        if self.tree_open {
+            egui::Panel::bottom("tree_panel")
+                .default_size(160.0)
+                .resizable(true)
+                .show(ui, |ui| {
+                    tree::show(
+                        ui,
+                        &mut self.board,
+                        self.loaded.as_ref(),
+                        &mut self.tree_ui,
+                        self.tree_epoch,
+                    );
                 });
         }
 
