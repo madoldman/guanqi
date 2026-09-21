@@ -59,6 +59,11 @@ impl std::error::Error for LoadError {
 }
 
 /// 载入后留在应用里的棋谱元信息（棋盘本体由 App 单独持有）。
+///
+/// `Clone` 供「研究副本」复制元信息：副本与原谱共享同一批局面签名
+/// （副本由原谱当前线前缀重放而来），逐手注释因此自动跟随；本类型
+/// 无外部可变状态，克隆是纯数据拷贝。
+#[derive(Clone)]
 pub struct GameMeta {
     /// 来源路径（原样回显，供显示与将来「另存」复用）。
     pub source: PathBuf,

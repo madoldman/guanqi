@@ -274,6 +274,46 @@ impl Board {
         })
     }
 
+    /// 裁出「预设局面 + 当前线前 `upto` 手」的线性棋盘（研究副本的数据层）。
+    ///
+    /// 根盘面**直接克隆**：让子 / 摆子 / 清除原样保留。不走 [`Board::from_setup`]
+    /// 的理由——摆子列表未公开，且 `AE` 清除在结果盘面上不留痕迹、无法反推，
+    /// 只有拿到根盘面本体才无损。随后按当前线重放前 `upto` 手：重放路径与
+    /// 原谱逐手盘面一致，劫争判定（比较父节点盘面）结果也一致，合法性必然
+    /// 成立，失败即程序缺陷（panic 暴露）。`upto` 超出当前线长时按线长截取。
+    pub fn linear_prefix(&self, upto: usize) -> Self {
+        let upto = upto.min(self.line_len());
+        let mut copy = Self {
+            size: self.size,
+            root_to_play: self.root_to_play,
+            nodes: vec![Node {
+                record: None,
+                parent: None,
+                children: Vec::new(),
+                grid: self.nodes[0].grid.clone(),
+                depth: 0,
+                selected: 0,
+                last_depth: 0,
+            }],
+            current: 0,
+            line_records: Vec::new(),
+            captured_by_black: 0,
+            captured_by_white: 0,
+        };
+        for (i, record) in self.line_records[..upto].iter().enumerate() {
+            match record.action {
+                Action::Place(at) => {
+                    if let Err(reason) = copy.play(at) {
+                        panic!("研究副本重放第 {} 手失败：{reason}", i + 1);
+                    }
+                }
+                // 弃着总是合法，无失败路径。
+                Action::Pass => copy.pass(),
+            }
+        }
+        copy
+    }
+
     // ---- 只读查询 ----
 
     /// 棋盘尺寸。

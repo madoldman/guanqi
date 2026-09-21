@@ -40,6 +40,12 @@ pub enum PanelAction {
     HumanPass,
     /// 人类点了「认输」按钮。
     HumanResign,
+    /// 从当前手创建研究副本（App 完成实际创建与切换）。
+    CreateCopy,
+    /// 切换到另一份文档（原谱 ↔ 研究副本）。
+    SwitchDoc,
+    /// 丢弃研究副本（有研究成果时由 App 先弹确认框）。
+    DropCopy,
     /// 确认「引擎无望」提示（不再重复提示；是否判引擎认输由用户另行决定）。
     AckHopeless,
     /// 打开「新对局」设置窗口。
@@ -73,6 +79,18 @@ impl LoadNotice {
             Self::Failed(_) => Color32::from_rgb(255, 120, 110),
         }
     }
+}
+
+/// 侧栏「棋谱」区的研究副本上下文（由 App 现场派生传入）。
+pub struct CopyState {
+    /// 副本是否存在（存在时显示切换 / 丢弃按钮）。
+    pub exists: bool,
+    /// 当前主槽是否为研究副本（标签与按钮文案随之变化）。
+    pub on_copy: bool,
+    /// 创建副本时的前缀手数（标签「自第 N 手起」用）。
+    pub from_move: usize,
+    /// 副本里用户的研究成果（超出前缀的着法数）。
+    pub research_moves: usize,
 }
 
 /// 状态文本与配色。
@@ -118,6 +136,7 @@ fn eval_lines(root: &RootInfo) -> (String, String) {
 /// 操作的提示（无则对应段落不显示）。
 /// `play` 为人机对弈状态；`new_game_open` 为新对局窗口开关（共享）；
 /// `hopeless` 为引擎无望提示文本（`Some` = 显示提示与确认按钮）。
+/// `copy_state` 为研究副本上下文（空盘时为 `None`，入口禁用）。
 /// 注释可能很长，整体包一层垂直滚动，避免侧栏内容被裁剪。
 #[allow(clippy::too_many_arguments)]
 pub fn show(
@@ -138,6 +157,7 @@ pub fn show(
     play: &mut PlayState,
     new_game_open: &mut bool,
     hopeless: Option<&str>,
+    copy_state: Option<&CopyState>,
 ) -> PanelAction {
     egui::ScrollArea::vertical().show(ui, |ui| {
         panel_body(
@@ -158,6 +178,7 @@ pub fn show(
             play,
             new_game_open,
             hopeless,
+            copy_state,
         )
     })
     .inner
@@ -183,6 +204,7 @@ fn panel_body(
     play: &mut PlayState,
     new_game_open: &mut bool,
     hopeless: Option<&str>,
+    copy_state: Option<&CopyState>,
 ) -> PanelAction {
     let mut action = PanelAction::None;
     ui.heading("对局");
@@ -278,6 +300,18 @@ fn panel_body(
         ui.add_space(6.0);
         ui.separator();
         ui.heading("棋谱");
+
+        // 当前文档标签（原谱 / 研究副本）与研究副本操作按钮：
+        // 让「现在看的是哪份」一眼可见，入口就近放置便于发现。
+        let (tag, tag_color) = match copy_state {
+            Some(state) if state.on_copy => (
+                format!("研究副本（自第 {} 手起）", state.from_move),
+                Color32::from_rgb(140, 220, 140),
+            ),
+            _ => ("原谱".to_owned(), Color32::from_rgb(120, 200, 255)),
+        };
+        ui.label(RichText::new(tag).color(tag_color).strong());
+
         let file = game
             .source
             .file_name()
@@ -313,6 +347,44 @@ fn panel_body(
         if let Some(text) = comment {
             ui.add_space(4.0);
             ui.label(text);
+        }
+
+        // ---- 研究副本操作（空盘无谱可复制时给出可读提示）----
+        ui.add_space(4.0);
+        match copy_state {
+            None => {
+                ui.weak("打开棋谱后可从当前手复制研究副本。");
+            }
+            Some(state) => {
+                ui.horizontal_wrapped(|ui| {
+                    if !state.exists {
+                        // 创建入口：仅原谱侧可用（副本已存在时切换即可回去）。
+                        if ui.button("复制为研究副本").clicked() {
+                            action = PanelAction::CreateCopy;
+                        }
+                    } else {
+                        // 标签显示另一份的身份：在副本 → 「切换到原谱」。
+                        let target =
+                            if state.on_copy { "切换到原谱" } else { "切换到研究副本" };
+                        if ui.button(target).clicked() {
+                            action = PanelAction::SwitchDoc;
+                        }
+                        let mut drop = ui.button("丢弃研究副本");
+                        if state.on_copy && state.research_moves > 0 {
+                            drop = drop.on_hover_text(format!(
+                                "副本含 {} 手研究成果，丢弃前将确认",
+                                state.research_moves
+                            ));
+                        }
+                        if drop.clicked() {
+                            action = PanelAction::DropCopy;
+                        }
+                    }
+                });
+                if state.on_copy && state.research_moves > 0 {
+                    ui.weak(format!("副本含 {} 手研究成果", state.research_moves));
+                }
+            }
         }
     }
 

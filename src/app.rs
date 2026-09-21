@@ -10,6 +10,13 @@
 //! （尺寸跟随 SGF），并清空分析快照与胜率历史（新对局不混旧曲线）。
 //! 另存把当前棋盘（含用户新建的变着）序列化为 SGF 写盘，未载入棋谱时
 //! 允许存出空盘谱。本类型只负责把配置、动作与界面连起来。
+//!
+//! 「研究副本」（[`StudyDoc`]）：从当前手把棋谱复制成一份**独立文档**来
+//! 随便试、随便研究，原谱完全不受影响。副本内容 = 预设局面 + 当前线前缀
+//! 重放（[`Board::linear_prefix`]），与原谱两份文档都驻留内存，切换即互换
+//! 主显示槽位（`board` / `loaded`）；副本的 [`GameMeta`] 克隆自原谱（注释
+//! 按局面签名自动跟随），`source` 换成「-副本」名供另存默认名。副本里
+//! 已有研究着法时，丢弃 / 载入新谱 / 新对局都先经 [`PendingConfirm`] 确认。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -86,6 +93,17 @@ pub struct GuanqiApp {
     new_game: new_game::NewGameUi,
     /// 当前生效的贴目（新对局时设置；查询随局面发给引擎）。
     komi: f64,
+    /// 研究副本槽位（`Some` = 副本已创建，驻留内存可切换）。
+    ///
+    /// 槽内是「另一份文档」：主槽显示原谱时存副本，主槽显示副本时存
+    /// 原谱（整体互换，两份树互不干扰）。`App::on_copy` 标志区分主槽
+    /// 当前是哪份；`from_move` 固定为创建时前缀手数，副本的研究成果
+    /// = 副本树着法数超出它的部分。
+    study: Option<StudyDoc>,
+    /// 主槽当前是否为研究副本（与 `study` 配合区分当前文档身份）。
+    on_copy: bool,
+    /// 待确认的破坏性动作（丢弃副本 / 带副本载谱 / 带副本开新局）。
+    pending_confirm: PendingConfirm,
 }
 
 /// 等待中的对话框用途：打开与保存各自独立接结果，互不串线。
@@ -95,6 +113,48 @@ enum PendingDialog {
     Open,
     /// 等待用户确认另存位置。
     Save,
+}
+
+/// 研究副本：与主显示槽位（`board` / `loaded`）互换的驻留文档。
+///
+/// 主槽始终显示当前文档；创建副本时主槽换入副本、本槽退存原谱，
+/// 切换时整体互换。槽里是哪份由 `App::on_copy` 标志区分。
+struct StudyDoc {
+    /// 另一份文档的棋盘（独立谱树，与主槽互换）。
+    board: Board,
+    /// 另一份文档的元信息（`Option` 仅为与主槽 `loaded` 同型，互换零成本）。
+    meta: Option<GameMeta>,
+    /// 创建时的前缀手数（`cursor()`）；副本超出它的着法即研究成果。
+    from_move: usize,
+}
+
+/// 待确认的破坏性动作（涉及丢弃副本研究成果时先经用户确认）。
+/// 取消则不做任何事；确认则执行对应原动作。
+#[derive(Default)]
+enum PendingConfirm {
+    #[default]
+    None,
+    /// 丢弃研究副本本身。
+    DropCopy,
+    /// 确认后重新发起「打开棋谱」对话框（路径在确认后才产生）。
+    LoadGame(#[allow(dead_code)] PathBuf),
+    /// 确认后开始新对局。
+    NewGame(crate::play::GameSetup),
+}
+
+impl PendingConfirm {
+    /// 确认框说明文本（列出将丢失的研究着法数）。
+    fn text(&self, moves: usize) -> String {
+        let base = match self {
+            Self::DropCopy => "丢弃研究副本后".to_owned(),
+            Self::LoadGame(_) => "载入新棋谱会替换原谱".to_owned(),
+            Self::NewGame(_) => "开始新对局会替换原谱".to_owned(),
+            Self::None => String::new(),
+        };
+        format!(
+            "{base}，研究副本将被丢弃，其中 {moves} 手研究成果无法恢复。继续吗？"
+        )
+    }
 }
 
 impl GuanqiApp {
@@ -147,6 +207,9 @@ impl GuanqiApp {
             new_game_open: false,
             new_game: new_game::NewGameUi::new(),
             komi: 7.5,
+            study: None,
+            on_copy: false,
+            pending_confirm: PendingConfirm::None,
         }
     }
 
@@ -158,6 +221,12 @@ impl GuanqiApp {
     ///   多个对话框同时压到用户屏幕上（且先弹的那个仍会投递结果），故必须
     ///   等当前选择完成后再发起新的。
     fn open_file_dialog(&mut self) {
+        // 副本有研究成果时先确认：载入会替换原谱、副本连同研究一起丢弃；
+        // 用户选中的棋谱路径在确认前尚未取得，确认即重新发起对话框。
+        if self.research_moves() > 0 {
+            self.pending_confirm = PendingConfirm::LoadGame(PathBuf::new());
+            return;
+        }
         if let Some(notice) = self.dialog_guard() {
             self.load_notice = Some(notice);
             return;
@@ -170,6 +239,14 @@ impl GuanqiApp {
             Err(err) => {
                 self.load_notice = Some(LoadNotice::Failed(err.to_string()));
             }
+        }
+    }
+
+    /// 确认「丢弃副本研究后载入」之后重新发起打开对话框。
+    /// 此时研究成果已随确认清除（`drop_copy` 无副作用地放行了守卫）。
+    fn open_file_dialog_after_confirm(&mut self) {
+        if self.research_moves() == 0 {
+            self.open_file_dialog();
         }
     }
 
@@ -212,6 +289,7 @@ impl GuanqiApp {
 
     /// 载入选中的棋谱：读文件 → 解析 → 重放主变着 → 整体替换棋盘。
     /// 读取或解析失败时**保留原棋盘**，只提示错误。
+    /// 副本有研究成果时先替换掉它（确认框在 `open_file_dialog` 前已守卫）。
     fn load_game(&mut self, path: PathBuf) {
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
@@ -238,6 +316,13 @@ impl GuanqiApp {
                 self.overlay.focus = None;
                 self.branch_notice = None;
                 self.notice = None;
+                // 副本是原谱的附属品，离开这份棋谱即弃。带研究成果时
+                // 用户已在确认框里同意（见 `open_file_dialog`），无成果
+                // 时静默丢弃并在提示里带一句。
+                let dropped = self.research_moves();
+                self.study = None;
+                self.on_copy = false;
+                self.pending_confirm = PendingConfirm::None;
                 let size = board.size();
                 let moves = board.move_count();
                 self.board = board;
@@ -254,6 +339,16 @@ impl GuanqiApp {
                         "已载入 {size}（全树共 {moves} 手，{warning}）"
                     )),
                     None => LoadNotice::Ok(format!("已载入 {size} 棋谱，全树共 {moves} 手。")),
+                };
+                // 顺带说明副本去向：副本的「-副本」元信息随棋盘替换失效，
+                // 一并清掉（副本已在上面的 `self.study = None` 丢弃）。
+                let notice = if dropped > 0 {
+                    LoadNotice::Warn(format!(
+                        "{}（研究副本连同 {dropped} 手研究成果已丢弃。）",
+                        notice.text()
+                    ))
+                } else {
+                    notice
                 };
                 self.load_notice = Some(notice);
             }
@@ -310,6 +405,7 @@ impl GuanqiApp {
     /// 开始新对局（新对局窗口「开始」按钮）：
     /// 让子按标准星位预摆（白先），整体替换棋盘；清空分析快照与胜率
     /// 历史（新对局不混旧曲线）；进入对弈模式并记录贴目。
+    /// 副本有研究成果时用户已在确认框里同意（见「新对局」入口）。
     fn start_new_game(&mut self, setup: GameSetup) {
         let handicap = setup.effective_handicap();
         let stones = play::handicap_stones(setup.size, handicap);
@@ -326,6 +422,11 @@ impl GuanqiApp {
         // 旧棋盘的临时提示随棋盘替换失效。
         self.branch_notice = None;
         self.notice = None;
+        // 副本同样随原谱离开（研究成果已在「新对局」入口确认过）。
+        let kept_research = self.research_moves();
+        self.study = None;
+        self.on_copy = false;
+        self.pending_confirm = PendingConfirm::None;
         self.board = board;
         // 棋盘整体替换：树布局指纹换代（与载谱同理）。
         self.tree_epoch = self.tree_epoch.wrapping_add(1);
@@ -345,9 +446,120 @@ impl GuanqiApp {
             size.to_string()
         };
         self.load_notice = Some(LoadNotice::Ok(format!(
-            "新对局已开始：{desc}，你执{}。",
-            setup.human.name()
+            "新对局已开始：{desc}，你执{}。{}",
+            setup.human.name(),
+            if kept_research > 0 {
+                format!("（研究副本连同 {kept_research} 手研究成果已丢弃。）")
+            } else {
+                String::new()
+            }
         )));
+    }
+
+    // ---- 研究副本 ----
+
+    /// 副本里用户的研究成果（超出创建时前缀的着法数）；无副本为 0。
+    /// 判据只看树规模：从既有节点上「切换分支 / 回看」不算新研究，
+    /// 落子与建分支（含后续整棵试验子树）都会增加全树着法数。
+    /// 副本可能在主槽（正在查看）也可能在副本槽（正在看原谱），按
+    /// `on_copy` 取对应棋盘；`from_move` 恒存于副本槽不随互换变化。
+    fn research_moves(&self) -> usize {
+        let Some(doc) = self.study.as_ref() else {
+            return 0;
+        };
+        let copy_moves = if self.on_copy {
+            self.board.move_count()
+        } else {
+            doc.board.move_count()
+        };
+        copy_moves.saturating_sub(doc.from_move)
+    }
+
+    /// 副本另存的默认文件名：原文件名主干 + 「-副本」（保留原扩展名前
+    /// 的主干，无主干时退回整名）。原始路径仅在主槽为**原谱**时有意义。
+    fn copy_default_name(&self) -> String {
+        self.loaded
+            .as_ref()
+            .map(|meta| default_sgf_name(&meta.source))
+            .unwrap_or_else(|| "guanqi.sgf".to_owned())
+            .split_once('.')
+            .filter(|(stem, _)| !stem.is_empty())
+            .map_or_else(
+                || "研究副本.sgf".to_owned(),
+                |(stem, ext)| format!("{stem}-副本.{ext}"),
+            )
+    }
+
+    /// 从当前手创建研究副本：预设局面 + 当前线前缀重放（独立树），元信息
+    /// 克隆自原谱（注释按局面签名自动跟随），`source` 换成「-副本」名。
+    /// 成功后自动切到副本。对弈模式在此关闭：两份文档不能同时自动应手。
+    ///
+    /// 前置条件（UI 已守卫，此处 assert 兜底）：已载入棋谱、当前在原谱、
+    /// 尚无副本。
+    fn create_copy(&mut self) {
+        assert!(
+            !self.on_copy && self.loaded.is_some() && self.study.is_none(),
+            "创建副本的前置条件不满足（UI 入口应已置灰）"
+        );
+        let from_move = self.board.cursor();
+        let board = self.board.linear_prefix(from_move);
+        let mut meta = self
+            .loaded
+            .as_ref()
+            .expect("前置条件已检查 loaded 存在")
+            .clone();
+        // 「另存为」默认名：xxx.sgf → xxx-副本.sgf（名字只影响默认名，
+        // 用户在另存对话框里可任意改名）。
+        meta.source = PathBuf::from(self.copy_default_name());
+        self.play = PlayState::review();
+        // 一次性完成「原谱退到副本槽、副本进主槽」：不经过
+        // `switch_to_copy`（那会再翻一次 `on_copy`）。
+        self.study = Some(StudyDoc { board: std::mem::replace(&mut self.board, board), meta: self.loaded.take(), from_move });
+        self.loaded = Some(meta);
+        self.on_copy = true;
+        self.tree_epoch = self.tree_epoch.wrapping_add(1);
+        self.overlay.focus = None;
+        self.branch_notice = None;
+        self.notice = None;
+        let notice = LoadNotice::Ok(format!(
+            "已创建研究副本（自第 {from_move} 手起），原谱保持不变；\
+             当前在研究副本中。"
+        ));
+        self.load_notice = Some(notice);
+    }
+
+    /// 切换到另一份文档（原谱 ↔ 研究副本）：主显示槽位与副本槽整体互换。
+    ///
+    /// **不 `analysis.reset()`**：胜率历史按局面签名索引，副本与原谱同一
+    /// 局面共享同一曲线；切换后由既有 `sync()` 检测局面签名变化并自动
+    /// 发起新查询。棋盘整体替换 → `tree_epoch` 换代（树布局不复用）；
+    /// 旧文档的临时提示与定位高亮一并清除。
+    fn switch_to_copy(&mut self) {
+        let Some(doc) = self.study.take() else {
+            return;
+        };
+        let StudyDoc { board, meta, from_move } = doc;
+        self.study = Some(StudyDoc {
+            board: std::mem::replace(&mut self.board, board),
+            meta: self.loaded.take(),
+            from_move,
+        });
+        self.loaded = meta;
+        self.on_copy = !self.on_copy;
+        self.tree_epoch = self.tree_epoch.wrapping_add(1);
+        self.overlay.focus = None;
+        self.branch_notice = None;
+        self.notice = None;
+    }
+
+    /// 丢弃研究副本（研究成果由 UI 层先经确认框守卫）：当前在副本时
+    /// 先切回原谱再丢弃，保证主槽最终显示原谱。
+    fn drop_copy(&mut self) {
+        if self.on_copy {
+            self.switch_to_copy();
+        }
+        self.study = None;
+        self.load_notice = Some(LoadNotice::Ok("研究副本已丢弃。".to_owned()));
     }
 }
 
@@ -392,6 +604,46 @@ impl eframe::App for GuanqiApp {
                         self.save_file_dialog();
                         ui.close();
                     }
+                    ui.separator();
+                    // 研究副本：仅原谱侧可用（空盘 / 已在副本 / 副本已存在
+                    // 时置灰，悬停说明原因）。
+                    let copy_disabled = match (&self.study, self.loaded.is_some()) {
+                        // 未载入棋谱：空盘无谱可复制。
+                        (_, false) => Some("未载入棋谱，无谱可复制"),
+                        (Some(_), _) => Some("研究副本已存在，可用「切换」来回查看"),
+                        // 已在副本中：副本里落子即建分支，无需再复制。
+                        (None, true) if self.on_copy => {
+                            Some("已在研究副本中，落子即创建试验分支")
+                        }
+                        (None, true) => None,
+                    };
+                    let mut entry = ui.add_enabled(
+                        copy_disabled.is_none(),
+                        egui::Button::new("从当前手复制为研究副本"),
+                    );
+                    if let Some(reason) = copy_disabled {
+                        entry = entry.on_disabled_hover_text(reason.to_owned());
+                    }
+                    if entry.clicked() {
+                        self.create_copy();
+                        ui.close();
+                    }
+                    if let Some(_doc) = self.study.as_ref() {
+                        let target = if self.on_copy { "切换到原谱" } else { "切换到研究副本" };
+                        if ui.button(target).clicked() {
+                            self.switch_to_copy();
+                            ui.close();
+                        }
+                        if ui.button("丢弃研究副本").clicked() {
+                            // 有研究成果时经确认框（菜单收起后弹出）。
+                            if self.research_moves() > 0 {
+                                self.pending_confirm = PendingConfirm::DropCopy;
+                            } else {
+                                self.drop_copy();
+                            }
+                            ui.close();
+                        }
+                    }
                 });
                 ui.menu_button("对局", |ui| {
                     if ui.button("新对局…").clicked() {
@@ -430,6 +682,16 @@ impl eframe::App for GuanqiApp {
             play::mark_hopeless_shown(&mut self.play);
         }
         let mut panel_action = analysis_panel::PanelAction::None;
+        // 研究副本上下文（侧栏「棋谱」区标签与按钮；空盘时为 None）。
+        let copy_state = self.loaded.as_ref().map(|_| analysis_panel::CopyState {
+            exists: self.study.is_some(),
+            on_copy: self.on_copy,
+            from_move: self
+                .study
+                .as_ref()
+                .map_or(0, |doc| doc.from_move),
+            research_moves: self.research_moves(),
+        });
         egui::Panel::right("analysis_panel")
             .default_size(240.0)
             .resizable(true)
@@ -452,6 +714,7 @@ impl eframe::App for GuanqiApp {
                     &mut self.play,
                     &mut self.new_game_open,
                     hopeless_text.as_deref(),
+                    copy_state.as_ref(),
                 );
             });
         match panel_action {
@@ -479,6 +742,18 @@ impl eframe::App for GuanqiApp {
             // 确认「引擎无望」提示：只收起提示，不自动替引擎认输。
             analysis_panel::PanelAction::AckHopeless => {}
             analysis_panel::PanelAction::OpenNewGame => {}
+            // 从当前手创建研究副本（前置条件由入口置灰与 assert 双重守卫）。
+            analysis_panel::PanelAction::CreateCopy => self.create_copy(),
+            // 原谱 ↔ 研究副本互换。
+            analysis_panel::PanelAction::SwitchDoc => self.switch_to_copy(),
+            // 有研究成果时先弹确认框（无成果直接丢弃）。
+            analysis_panel::PanelAction::DropCopy => {
+                if self.research_moves() > 0 {
+                    self.pending_confirm = PendingConfirm::DropCopy;
+                } else {
+                    self.drop_copy();
+                }
+            }
             analysis_panel::PanelAction::None => {}
         }
 
@@ -548,9 +823,14 @@ impl eframe::App for GuanqiApp {
             let ctx = ui.ctx().clone();
             let action = new_game::show(&ctx, &mut self.new_game_open, &mut self.new_game, &self.analysis.engine);
             if let new_game::NewGameAction::Start(setup) = action {
-                // 面板完成使命即关闭：否则继续浮在棋盘左上角遮挡落子。
-                self.new_game_open = false;
-                self.start_new_game(setup);
+                // 副本有研究成果时先确认（中止 = 新对局窗口已关，保持现状）。
+                if self.research_moves() > 0 {
+                    self.pending_confirm = PendingConfirm::NewGame(setup);
+                } else {
+                    // 面板完成使命即关闭：否则继续浮在棋盘左上角遮挡落子。
+                    self.new_game_open = false;
+                    self.start_new_game(setup);
+                }
             }
         }
 
@@ -567,6 +847,56 @@ impl eframe::App for GuanqiApp {
                 // 已保存的配置不会再有损坏提示。
                 self.startup_notice = None;
                 self.analysis.start_engine(&self.engine_cfg, &self.waker);
+            }
+        }
+
+        // 破坏性动作确认框（丢弃副本 / 带副本研究载谱 / 开新局）：
+        // 模态小窗，确认才执行原动作；取消即清除，保持现状。
+        if !matches!(self.pending_confirm, PendingConfirm::None) {
+            let moves = self.research_moves();
+            let ctx = ui.ctx().clone();
+            let text = self.pending_confirm.text(moves);
+            let mut verdict: Option<bool> = None;
+            let mut confirm_open = true;
+            egui::Window::new("丢弃研究副本？")
+                .open(&mut confirm_open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(&ctx, |ui| {
+                    ui.label(text);
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("继续（丢弃研究成果）").clicked() {
+                            verdict = Some(true);
+                        }
+                        if ui.button("取消").clicked() {
+                            verdict = Some(false);
+                        }
+                    });
+                });
+            match verdict {
+                Some(true) => {
+                    let action = std::mem::take(&mut self.pending_confirm);
+                    match action {
+                        PendingConfirm::DropCopy => self.drop_copy(),
+                        // 载入的路径在确认后才由用户选择，此处重新发起对话框。
+                        PendingConfirm::LoadGame(_) => self.open_file_dialog_after_confirm(),
+                        PendingConfirm::NewGame(setup) => self.start_new_game(setup),
+                        PendingConfirm::None => {}
+                    }
+                }
+                Some(false) => {
+                    // 取消：若是「载入新谱」则连等待中的文件对话框一起收起，
+                    // 用户重新点「打开棋谱」即可（对话框结果被忽略）。
+                    if matches!(self.pending_confirm, PendingConfirm::LoadGame(_)) {
+                        self.dialog = None;
+                    }
+                    self.pending_confirm = PendingConfirm::None;
+                }
+                // 点窗口 X（或 ESC）等同取消：确认框不得常驻。
+                None if !confirm_open => self.pending_confirm = PendingConfirm::None,
+                None => {}
             }
         }
     }
