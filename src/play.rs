@@ -1,14 +1,14 @@
 //! 人机对弈：对局状态、引擎自动应手决策与对局结束判定。
 //!
 //! 引擎走子**不引入第二套协议**：复用 analysis 引擎——对当前局面发起
-//! 分析查询，取**深阶段（Deep）终态报告**的首选着法
-//! （[`crate::ui::analysis::Snapshot::moves`] 的第 0 条；`mv` 为 `None`
-//! 表示引擎选择弃着）。引擎的「思考量」即用户配置的 visits。
+//! 分析查询，取**按难度档位 visits 完整搜索**的终态报告首选着法
+//! （[`AnalysisState::play_snapshot`]；`mv` 为 `None` 表示引擎选择弃着）。
+//! 引擎的「思考量」即难度档位对应的 visits，与展示分析（快查询 → 配置
+//! 的 visits）口径分离：展示可以比走子浅，走子绝不能比难度浅。
 //!
 //! 自动应手的触发条件（全部满足才落子，见 [`engine_move_decision`]）：
 //! 对弈模式开启、引擎就绪、轮到引擎、棋盘处于活子位置（回看历史时
-//! **绝不**自动落子）、对局未结束、且收到的是该局面的深阶段终态报告
-//! （快阶段报告只用于渐进显示，绝不能拿浅搜索结果走子）。
+//! **绝不**自动落子）、对局未结束、且收到的是该局面的走子口径终态报告。
 //!
 //! 模块刻意不含 UI 与引擎接线：决策函数为纯函数，输入即状态、输出即
 //! 动作（或 `None`），便于逐条件验证；对局结束（认输 / 双方连续弃着）
@@ -74,6 +74,9 @@ pub struct GameSetup {
     pub handicap: usize,
     /// 人类执子。
     pub human: Stone,
+    /// 人机对弈难度（引擎走子的 visits 档位）。落位到
+    /// [`crate::engine::EngineConfig::play_difficulty`] 持久化。
+    pub difficulty: crate::engine::Difficulty,
 }
 
 impl Default for GameSetup {
@@ -83,6 +86,7 @@ impl Default for GameSetup {
             komi: 7.5,
             handicap: 0,
             human: Stone::Black,
+            difficulty: crate::engine::Difficulty::default(),
         }
     }
 }
@@ -150,7 +154,9 @@ pub fn two_passes(board: &Board) -> bool {
 /// - `mode`：对弈模式开关（关闭 = 纯复盘，永不自动走子）；
 /// - `human`：人类执子，轮到人类时引擎不走；
 /// - `board`：当前棋盘（取行棋方 / 游标 / 当前线与着法记录）；
-/// - `snapshot`：最新分析快照（`None` = 尚无任何报告）；
+/// - `play_snapshot`：**走子口径**的最新分析快照（`None` = 尚无符合难度
+///   的终态报告）。注意与展示快照（`AnalysisState::snapshot`）区分：
+///   展示允许是浅查询结果，走子必须来自按难度 visits 的完整搜索；
 /// - `engine_ready`：引擎状态是否为 [`crate::ui::analysis::EngineStatus::Ready`]。
 ///
 /// 命中条件时返回 `Some(Action::Place(c))`（落子）或 `Some(Action::Pass)`
@@ -160,7 +166,7 @@ pub fn engine_move_decision(
     mode: bool,
     human: Stone,
     board: &Board,
-    snapshot: Option<&Snapshot>,
+    play_snapshot: Option<&Snapshot>,
     engine_ready: bool,
 ) -> Option<Action> {
     // 1. 对弈模式未开启：纯复盘，绝不自动走子。
@@ -185,12 +191,13 @@ pub fn engine_move_decision(
     if two_passes(board) {
         return None;
     }
-    // 6. 快照必须是**当前局面**的深阶段终态报告：
+    // 6. 快照必须是**当前局面**的走子口径终态报告（按难度 visits 完整
+    //    搜索，由 `AnalysisState::play_snapshot` 按签名与难度把关）：
     //    - turn 对不上 = 旧局面的报告（局面已变、快照未作废前的间隙）；
-    //    - 非深阶段 = 快查询（低 visits）结果，拿它走子等于让引擎欠思考；
     //    - 非终态 = 渐进中间报告，后续还会有更完整的终态。
-    let snapshot = snapshot?;
-    if snapshot.turn != board.cursor() || !snapshot.deep || !snapshot.is_final {
+    //    浅查询（快阶段）报告只会进展示快照，不会出现在这里。
+    let snapshot = play_snapshot?;
+    if snapshot.turn != board.cursor() || !snapshot.is_final {
         return None;
     }
     // 7. 取引擎首选着法；`mv = None` 即引擎认为当前最好的一手是弃着。
@@ -231,7 +238,7 @@ pub fn undo_to_human(board: &mut Board, human: Stone) -> bool {
     board.to_play() == human
 }
 
-/// 引擎方在深阶段终态报告中的胜率（黑方视角 → 引擎方视角换算）。
+/// 引擎方在终态报告中的胜率（黑方视角 → 引擎方视角换算）。
 /// `snapshot.root` 缺失（空报告）时返回 `None`。
 pub fn engine_winrate(engine: Stone, snapshot: &Snapshot) -> Option<f64> {
     let root = snapshot.root.as_ref()?;
@@ -242,14 +249,14 @@ pub fn engine_winrate(engine: Stone, snapshot: &Snapshot) -> Option<f64> {
     })
 }
 
-/// 引擎「无望」提示是否应当给出：深阶段终态报告里引擎方胜率 ≤ 5%，
+/// 引擎「无望」提示是否应当给出：走子口径终态报告里引擎方胜率 ≤ 5%，
 /// 且本次对局尚未提示过。提示**不自动认输**——是否判引擎认输由人类确认。
 pub fn should_show_hopeless(state: &PlayState, snapshot: Option<&Snapshot>) -> bool {
     if !state.mode || state.resigned.is_some() || state.hopeless_shown {
         return false;
     }
     snapshot.is_some_and(|s| {
-        s.deep && s.is_final && engine_winrate(state.human.opposite(), s).is_some_and(|wr| wr <= 0.05)
+        s.is_final && engine_winrate(state.human.opposite(), s).is_some_and(|wr| wr <= 0.05)
     })
 }
 

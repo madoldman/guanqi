@@ -1,11 +1,13 @@
-//! 「新对局」设置窗口：棋盘尺寸 / 贴目 / 让子 / 执子选择。
+//! 「新对局」设置窗口：棋盘尺寸 / 贴目 / 让子 / 执子 / 难度选择。
 //!
 //! 与引擎设置窗口（[`super::settings`]）同一形态：独立 `egui::Window`、
 //! 编辑草稿与状态分离、动作交回调用方执行。确认后由 `app` 用
 //! `Board::from_setup` 建盘（让子按标准星位摆放并置白先）、清空分析
-//! 状态与胜率历史、进入对弈模式。
+//! 状态与胜率历史、进入对弈模式。难度只决定引擎走子的 visits 档位，
+//! 随配置持久化，新对局窗口与侧栏「对局」分区改的是同一份设置。
 
 use crate::board::Size;
+use crate::engine::Difficulty;
 use crate::play::GameSetup;
 use crate::ui::analysis::EngineStatus;
 
@@ -30,9 +32,12 @@ impl NewGameUi {
         Self::default()
     }
 
-    /// 当前草稿（无则给默认值）；「开始」按钮直接返回它。
-    fn draft(&mut self) -> &mut GameSetup {
-        self.draft.get_or_insert_with(GameSetup::default)
+    /// 当前草稿（无则按 `current_difficulty` 补默认值）；「开始」按钮
+    /// 直接返回它。难度默认值取当前生效配置（打开窗口前用户已在侧栏
+    /// 选过的档位不被草稿覆盖回硬编码默认）。
+    fn draft_mut(&mut self, current_difficulty: Difficulty) -> &mut GameSetup {
+        self.draft
+            .get_or_insert_with(|| GameSetup { difficulty: current_difficulty, ..GameSetup::default() })
     }
 }
 
@@ -46,17 +51,24 @@ pub fn show(
     open: &mut bool,
     state: &mut NewGameUi,
     engine: &EngineStatus,
+    current_difficulty: Difficulty,
 ) -> NewGameAction {
     let mut action = NewGameAction::None;
     egui::Window::new("新对局")
         .open(open)
         .default_width(320.0)
-        .show(ctx, |ui| body(ui, state, engine, &mut action));
+        .show(ctx, |ui| body(ui, state, engine, current_difficulty, &mut action));
     action
 }
 
-fn body(ui: &mut egui::Ui, state: &mut NewGameUi, engine: &EngineStatus, action: &mut NewGameAction) {
-    let draft = state.draft();
+fn body(
+    ui: &mut egui::Ui,
+    state: &mut NewGameUi,
+    engine: &EngineStatus,
+    current_difficulty: Difficulty,
+    action: &mut NewGameAction,
+) {
+    let draft = state.draft_mut(current_difficulty);
     egui::Grid::new("new_game_grid")
         .num_columns(2)
         .spacing([10.0, 6.0])
@@ -97,6 +109,21 @@ fn body(ui: &mut egui::Ui, state: &mut NewGameUi, engine: &EngineStatus, action:
             ui.horizontal(|ui| {
                 ui.radio_value(&mut draft.human, crate::board::Stone::Black, "黑");
                 ui.radio_value(&mut draft.human, crate::board::Stone::White, "白");
+            });
+            ui.end_row();
+
+            ui.label("难度");
+            ui.vertical(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for d in Difficulty::ALL {
+                        ui.radio_value(&mut draft.difficulty, d, d.name());
+                    }
+                });
+                ui.weak(format!(
+                    "引擎走子 {} visits，预计每手约 {} 秒",
+                    draft.difficulty.visits(),
+                    draft.difficulty.estimate_secs()
+                ));
             });
             ui.end_row();
         });

@@ -10,7 +10,7 @@
 use egui::{Color32, Pos2, Rect, RichText, Sense, Ui, Vec2};
 
 use crate::board::{Board, Coord, IllegalReason, Stone};
-use crate::engine::{EngineConfig, RootInfo};
+use crate::engine::{Difficulty, EngineConfig, RootInfo};
 use crate::play::{PlayState, resign_text};
 use crate::sgf::GameMeta;
 
@@ -48,6 +48,8 @@ pub enum PanelAction {
     DropCopy(usize),
     /// 确认「引擎无望」提示（不再重复提示；是否判引擎认输由用户另行决定）。
     AckHopeless,
+    /// 切换人机对弈难度档位（App 持久化；下一手应手即生效）。
+    SetDifficulty(Difficulty),
     /// 打开「新对局」设置窗口。
     OpenNewGame,
 }
@@ -158,6 +160,7 @@ pub fn show(
     comment: Option<&str>,
     load_notice: Option<&LoadNotice>,
     save_notice: Option<&LoadNotice>,
+    persist_notice: Option<&str>,
     play: &mut PlayState,
     new_game_open: &mut bool,
     hopeless: Option<&str>,
@@ -179,6 +182,7 @@ pub fn show(
             comment,
             load_notice,
             save_notice,
+            persist_notice,
             play,
             new_game_open,
             hopeless,
@@ -205,6 +209,7 @@ fn panel_body(
     comment: Option<&str>,
     load_notice: Option<&LoadNotice>,
     save_notice: Option<&LoadNotice>,
+    persist_notice: Option<&str>,
     play: &mut PlayState,
     new_game_open: &mut bool,
     hopeless: Option<&str>,
@@ -214,14 +219,43 @@ fn panel_body(
     ui.heading("对局");
     ui.add_space(4.0);
     ui.checkbox(&mut play.mode, "人机对弈");
+    // 难度选择（对弈模式外也可预选）：五档 visits 预设，改变后引擎
+    // **下一手应手即生效**（无需重开对局）。显示各档 visits 与预计等待，
+    // 用户对「较强/最强要等十几秒到半分钟」有预期。
+    ui.horizontal_wrapped(|ui| {
+        ui.label("难度：");
+        for &d in Difficulty::ALL.iter() {
+            if ui
+                .selectable_label(cfg.play_difficulty == d, d.name())
+                .on_hover_text(format!(
+                    "{} visits，预计每手约 {} 秒",
+                    d.visits(),
+                    d.estimate_secs()
+                ))
+                .clicked()
+            {
+                action = PanelAction::SetDifficulty(d);
+            }
+        }
+    });
+    ui.weak(format!(
+        "当前：{}（{} visits，引擎每手预计约 {} 秒）",
+        cfg.play_difficulty.name(),
+        cfg.play_difficulty.visits(),
+        cfg.play_difficulty.estimate_secs()
+    ));
     if play.mode {
         let engine_ready = matches!(analysis.engine, EngineStatus::Ready);
         let finished = play.finished(board);
         let human_turn = !finished && board.to_play() == play.human;
         let engine_turn = !finished && !human_turn && engine_ready
             && board.cursor() == board.line_len();
-        // 回看中不显示「引擎思考中」：该状态下引擎不会自动应手。
-        let engine_thinking = engine_turn && engine_ready && analysis.analyzing();
+        // 「思考中」两种情况：展示查询在飞，或展示已齐而走子口径查询
+        // （按难度 visits）还在飞——后者才是应手快慢的决定因素。
+        let engine_thinking = engine_turn
+            && engine_ready
+            && (analysis.analyzing()
+                || analysis.play_pending(board, cfg.play_difficulty));
         ui.label(format!("你执{}", play.human.name()));
         if finished {
             let reason = match play.resigned {
@@ -232,7 +266,14 @@ fn panel_body(
             // 结束后进入纯复盘浏览：对弈开关保持，但不再自动应手
             // （决策函数的 two_passes / resigned 守卫兜底）。
         } else if engine_thinking {
-            ui.colored_label(Color32::from_rgb(140, 220, 140), "引擎思考中…");
+            ui.colored_label(
+                Color32::from_rgb(140, 220, 140),
+                format!(
+                    "引擎思考中…（{}，约 {} 秒/手）",
+                    cfg.play_difficulty.name(),
+                    cfg.play_difficulty.estimate_secs()
+                ),
+            );
         } else if human_turn {
             ui.colored_label(Color32::from_rgb(140, 220, 140), "轮到你");
         } else {
@@ -385,8 +426,9 @@ fn panel_body(
                             action = PanelAction::SwitchDoc(entry.number);
                         }
                         // 丢弃入口：仅副本有（原谱不可丢弃）；悬停说明成果。
+                        // 用带边框的小按钮（"×" 纯文字可点区域太小、不显眼）。
                         if entry.from_move.is_some() {
-                            let mut drop = ui.small_button("×");
+                            let mut drop = ui.button("丢弃");
                             drop = drop.on_hover_text(if entry.research > 0 {
                                 format!("丢弃研究副本 {}（含 {} 手研究成果，将确认）", entry.number, entry.research)
                             } else {
@@ -400,6 +442,7 @@ fn panel_body(
                 }
                 ui.add_space(2.0);
                 // 创建入口：任何已载入文档（原谱或副本）的当前手皆可再开副本。
+                // 用真按钮（有边框与 hover 高亮），纯文字太不明显。
                 if ui.button("复制为研究副本").clicked() {
                     action = PanelAction::CreateCopy;
                 }
@@ -563,6 +606,10 @@ fn panel_body(
     }
     if let Some(msg) = save_notice {
         ui.colored_label(msg.color(), msg.text());
+        hint = true;
+    }
+    if let Some(text) = persist_notice {
+        ui.colored_label(Color32::from_rgb(255, 120, 110), text);
         hint = true;
     }
     if !hint {

@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::board::{Board, IllegalReason, Size, Stone};
-use crate::engine::{load_settings, EngineConfig};
+use crate::engine::{load_settings, save_settings, Difficulty, EngineConfig};
 use crate::play::{self, GameSetup, PlayState};
 use crate::portal::{FileDialog, PortalEvent};
 use crate::sgf::{GameMeta, load_from_bytes, save_to_file};
@@ -76,6 +76,8 @@ pub struct GuanqiApp {
     settings_open: bool,
     /// 首次读取配置的提示（文件损坏回退等），直到用户保存过新配置。
     startup_notice: Option<String>,
+    /// 最近一次难度/设置保存失败的用户提示（成功时不显示）。
+    persist_notice: Option<String>,
     /// 引擎事件唤醒回调（重启引擎时复用）。
     waker: Waker,
     /// portal 文件对话框不可用时的原因（`None` = 可用，启动时探测一次）。
@@ -207,6 +209,7 @@ impl GuanqiApp {
             settings,
             settings_open: false,
             startup_notice,
+            persist_notice: None,
             waker,
             portal_unavailable,
             dialog: None,
@@ -452,6 +455,9 @@ impl GuanqiApp {
         meta.info.handicap = handicap.min(9) as u8;
         self.loaded = Some(meta);
         self.komi = setup.komi;
+        // 难度是新对局设置的一部分：落位到引擎配置并持久化（与侧栏切换
+        // 同一落点），下一手应手即按该档搜索。
+        self.set_difficulty(setup.difficulty);
         self.play = PlayState::new_game(&setup);
         let size = setup.size;
         let desc = if handicap > 0 {
@@ -460,14 +466,31 @@ impl GuanqiApp {
             size.to_string()
         };
         self.load_notice = Some(LoadNotice::Ok(format!(
-            "新对局已开始：{desc}，你执{}。{}",
+            "新对局已开始：{desc}，你执{}，难度{}（{} visits）。{}",
             setup.human.name(),
+            setup.difficulty.name(),
+            setup.difficulty.visits(),
             if kept_research > 0 {
                 format!("（研究副本连同 {kept_research} 手研究成果已丢弃。）")
             } else {
                 String::new()
             }
         )));
+    }
+
+    /// 切换人机对弈难度：写回引擎配置并持久化。引擎的走子查询按当前
+    /// 难度发起（`AnalysisState::sync` 逐帧比对），**下一手应手即生效**，
+    /// 无需重开对局。持久化失败不影响本运行内的生效值，只提示。
+    fn set_difficulty(&mut self, difficulty: Difficulty) {
+        if self.engine_cfg.play_difficulty == difficulty {
+            return;
+        }
+        self.engine_cfg.play_difficulty = difficulty;
+        if let Err(text) = save_settings(&self.engine_cfg) {
+            self.persist_notice = Some(text);
+        } else {
+            self.persist_notice = None;
+        }
     }
 
     // ---- 研究副本 ----
@@ -822,6 +845,7 @@ impl eframe::App for GuanqiApp {
                     comment,
                     self.load_notice.as_ref(),
                     self.save_notice.as_ref(),
+                    self.persist_notice.as_deref(),
                     &mut self.play,
                     &mut self.new_game_open,
                     hopeless_text.as_deref(),
@@ -852,6 +876,11 @@ impl eframe::App for GuanqiApp {
             }
             // 确认「引擎无望」提示：只收起提示，不自动替引擎认输。
             analysis_panel::PanelAction::AckHopeless => {}
+            // 切换难度：立即生效（下一手应手即按新难度搜索）并持久化；
+            // 保存失败只提示，当前运行内仍按新难度对弈。
+            analysis_panel::PanelAction::SetDifficulty(d) => {
+                self.set_difficulty(d);
+            }
             analysis_panel::PanelAction::OpenNewGame => {}
             // 从当前手创建研究副本（前置条件由入口置灰与 assert 双重守卫）。
             analysis_panel::PanelAction::CreateCopy => self.create_copy(),
@@ -900,12 +929,11 @@ impl eframe::App for GuanqiApp {
                 });
         }
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            // 顶部一行标识；设置入口靠右。
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("观棋").size(20.0).strong());
-                ui.label(egui::RichText::new("围棋 AI 引擎图形前端").weak());
-                if !self.fonts_ok {
+            egui::CentralPanel::default().show(ui, |ui| {
+                // 顶部一行标识；设置入口靠右。
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("观棋").size(20.0).strong());
+                    if !self.fonts_ok {
                     ui.colored_label(
                         egui::Color32::from_rgb(255, 190, 90),
                         "未找到中文字体，中文将显示为方框。\
@@ -935,7 +963,13 @@ impl eframe::App for GuanqiApp {
         // 新对局设置窗口（确认后建盘、清分析状态并进入对弈模式）。
         if self.new_game_open {
             let ctx = ui.ctx().clone();
-            let action = new_game::show(&ctx, &mut self.new_game_open, &mut self.new_game, &self.analysis.engine);
+            let action = new_game::show(
+                &ctx,
+                &mut self.new_game_open,
+                &mut self.new_game,
+                &self.analysis.engine,
+                self.engine_cfg.play_difficulty,
+            );
             if let new_game::NewGameAction::Start(setup) = action {
                 // 副本有研究成果时先确认（中止 = 新对局窗口已关，保持现状）。
                 if self.research_moves() > 0 {
@@ -1038,21 +1072,30 @@ impl eframe::App for GuanqiApp {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
 
-        self.analysis.sync(&self.board, &self.engine_cfg, self.komi);
+        // 走子查询需求（App 判定，AnalysisState 不感知对弈状态）：对弈
+        // 模式开启、未认输、未双方连续弃着、轮到引擎且在活子位置。
+        let want_play_query = self.play.mode
+            && self.play.resigned.is_none()
+            && !play::two_passes(&self.board)
+            && self.board.to_play() != self.play.human
+            && self.board.cursor() == self.board.line_len();
+        self.analysis.sync(&self.board, &self.engine_cfg, self.komi, want_play_query);
         // 局面变化会先作废快照（见 AnalysisState::sync），借此时机清除定位高亮。
         if self.analysis.snapshot.is_none() {
             self.overlay.focus = None;
         }
 
-        // 人机对弈自动应手：轮到引擎且收到该局面的深阶段终态报告时，
-        // 取首选着法落子（`mv = None` 即引擎弃着）。回看历史 / 快阶段 /
-        // 非终态等一切不该走的情况都由决策函数守卫（见 play 模块文档）。
+        // 人机对弈自动应手：轮到引擎且收到该局面**按当前难度完整搜索**的
+        // 终态报告时，取首选着法落子（`mv = None` 即引擎弃着）。走子依据
+        // 取 `play_snapshot`（走子口径）而非展示快照——展示允许比走子浅，
+        // 否则难度设置形同虚设。回看历史 / 非终态等一切不该走的情况都由
+        // 决策函数守卫（见 play 模块文档）。
         let engine_ready = matches!(self.analysis.engine, EngineStatus::Ready);
         let decision = play::engine_move_decision(
             self.play.mode,
             self.play.human,
             &self.board,
-            self.analysis.snapshot.as_ref(),
+            self.analysis.play_snapshot(&self.board, self.engine_cfg.play_difficulty),
             engine_ready,
         );
         // 认输状态独立短路：决策函数只看棋盘，看不到 resigned。

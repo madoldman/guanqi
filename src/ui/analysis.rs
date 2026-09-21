@@ -7,10 +7,14 @@
 //! - `katago analysis` 对每个 turn 只回一份**终态**报告，渐进体验靠
 //!   「同局面先发低 visits 快查询、出结果后自动加深到配置值」实现
 //!   （引擎搜索树跨查询复用，实测加深几乎免费）；
+//! - **人机对弈的走子查询（[`Stage::Play`]）单独成口径**：按难度档位的
+//!   visits 完整搜索，报告落 [`AnalysisState::play_snapshot`]，决策取自
+//!   它而非展示快照。轮到引擎时应手局面**先发 Play 再加深展示**——
+//!   反过来展示的树缓存会让低难度查询立刻返回高 visits 结果；
 //! - 局面变化时 [`Engine::terminate`] 旧查询，并按 id 丢弃过期补发报告；
 //! - 进程退出（[`EngineEvent::Exited`]）进入可重试的 [`EngineStatus::Failed`]。
 //!
-//! [`AnalysisState::snapshot`] 是分析结果的唯一存放点：侧栏读它显示，
+//! [`AnalysisState::snapshot`] 是展示分析结果的唯一存放点：侧栏读它显示，
 //! 棋盘候选点叠加层 / 热度图也直接取用，避免二次搬运。
 //! 逐手胜率历史（[`AnalysisState::history`]，TASKS 4.3 曲线用）只是
 //! 终态快照的转存：键为**局面签名**（根到该局面着法前缀的 FNV-1a），
@@ -25,8 +29,8 @@ use std::time::Instant;
 
 use crate::board::{Board, MoveRecord, Size, Stone, Action};
 use crate::engine::{
-    AnalysisQuery, AnalysisReport, Engine, EngineConfig, EngineError, EngineEvent, QueryId,
-    RootInfo, MoveInfo,
+    AnalysisQuery, AnalysisReport, Difficulty, Engine, EngineConfig, EngineError, EngineEvent,
+    QueryId, RootInfo, MoveInfo,
 };
 
 /// 引擎事件唤醒回调：与 `engine::process::Waker` 同构（类型别名未公开，
@@ -259,20 +263,31 @@ pub fn loss_from_points(
         severity: Severity::from_score_loss(score_loss),
     })
 }
-/// 查询阶段：先快后深。
+/// 查询阶段：先快后深，另有对局走子的独立口径。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Stage {
     Fast,
     Deep,
+    /// 人机对弈的走子查询：按**难度档位**的 visits 完整搜索。
+    /// 与展示口径分开的理由：
+    /// - 若难度低于展示值，直接按难度值发起（**不能**先发 Fast 再发 Play：
+    ///   引擎的搜索树跨查询存活，Fast 阶段已把树加深到 100，随后按 30 的
+    ///   查询会立刻用满缓存返回，难度形同虚设——实测 protocol.rs 注明
+    ///   「同局面再次查询即使更小 maxVisits 也立刻返回」）；
+    /// - 走子报告不进展示快照（`Snapshot`），避免侧栏/叠加层随难度值变浅。
+    Play,
 }
 
 impl Stage {
-    /// 该阶段的 visits 上限（配置值为 0 时夹到 1，避免无效查询）。
+    /// 该阶段的 visits 上限。配置值为 0 时夹到 1，避免无效查询。
     fn cap(self, cfg: &EngineConfig) -> u32 {
         let visits = cfg.visits.max(1);
         match self {
             Self::Fast => FAST_VISITS.min(visits),
             Self::Deep => visits,
+            // 走子口径永远按**难度值**（任务口径：难度低于展示值时按难度
+            // 搜完走子再加深展示；高于展示值时同样以难度为准）。
+            Self::Play => cfg.play_difficulty.visits().max(1),
         }
     }
 }
@@ -283,6 +298,10 @@ struct Inflight {
     turn: usize,
     stage: Stage,
     started: Instant,
+    /// 查询发起时的局面签名（手数记录前缀）。走子口径的查询以此判断
+    /// 「该查询还算不算当前局面的应手依据」——对弈中难度可被用户随时
+    /// 改变，改难度后旧口径的终态报告不得再驱动应手。
+    sig: Vec<MoveRecord>,
 }
 
 /// 引擎接线与分析状态。
@@ -305,6 +324,13 @@ pub struct AnalysisState {
     inflight: Option<Inflight>,
     /// 上次发起查询时的局面签名（手数记录前缀）；`None` 表示尚未分析过。
     analyzed_sig: Option<Vec<MoveRecord>>,
+    /// 当前局面的**走子口径**终态报告（按难度 visits 完整搜索后落位）。
+    /// 与展示快照分离：展示可以比走子浅（快阶段 / 配置值），绝不能反过来；
+    /// `engine_move_decision` 只认这里的报告，难度设置才真正生效。
+    play_snapshot: Option<Snapshot>,
+    /// 走子口径报告对应的局面签名与查询难度：签名不符（局面已变）或
+    /// 难度不符（对弈中改了难度）即作废并重新发起走子查询。
+    play_sig: Option<(Vec<MoveRecord>, Difficulty)>,
 }
 
 impl AnalysisState {
@@ -318,6 +344,8 @@ impl AnalysisState {
             handle: None,
             inflight: None,
             analyzed_sig: None,
+            play_snapshot: None,
+            play_sig: None,
         }
     }
 
@@ -329,6 +357,7 @@ impl AnalysisState {
         }
         self.inflight = None;
         self.analyzed_sig = None;
+        self.play_sig = None;
         self.snapshot = None;
         self.transient_error = None;
         self.engine = if cfg.model_path.is_some() {
@@ -392,7 +421,14 @@ impl AnalysisState {
     /// 每帧调用（`App::logic`）：轮询引擎事件并按局面推进分析。
     ///
     /// `komi` 为当前对局的贴目（随查询发给引擎；复盘无贴目信息时用 7.5）。
-    pub fn sync(&mut self, board: &Board, cfg: &EngineConfig, komi: f64) {
+    /// `want_play_query`：是否需要为本局面准备**走子口径**的依据
+    /// （对弈模式开启、未结束、轮到引擎且在活子位置时为 `true`，
+    /// 由 `app` 判定——本层不感知对弈状态，避免复盘时白烧走子预算）。
+    ///
+    /// 查询顺序：轮到引擎应手的局面**先发 Play（难度值）再加深展示**——
+    /// 引擎的搜索树跨查询存活，若先跑展示的 Fast(100)/Deep，随后按更低
+    /// 难度值的查询会立刻用满缓存返回，难度形同虚设（见任务实测）。
+    pub fn sync(&mut self, board: &Board, cfg: &EngineConfig, komi: f64, want_play_query: bool) {
         // 局面签名 = 根到当前节点的着法序列：落子 / 导航 / 悔棋 / 改着都会使其变化。
         let sig = board.records();
         if Some(sig) != self.analyzed_sig.as_deref() {
@@ -404,11 +440,26 @@ impl AnalysisState {
                 handle.terminate(inflight.id);
             }
             if matches!(self.engine, EngineStatus::Ready) {
-                self.request(board, cfg, Stage::Fast, komi);
+                let stage = if want_play_query { Stage::Play } else { Stage::Fast };
+                self.request(board, cfg, stage, komi);
             }
         }
         while let Some(event) = self.handle.as_mut().and_then(Engine::try_recv) {
             self.on_event(event, board, cfg, komi);
+        }
+        // 走子口径补发（同一局面、引擎空闲时）：难度刚改 / 对弈模式后开
+        // / 上一份走子报告被丢弃。展示已加深过的局面受树缓存影响，
+        // 本次查询的 visits 可能高于难度值（至多一手，见模块文档）。
+        let play_stale = self
+            .play_sig
+            .as_ref()
+            .is_none_or(|(sig, d)| *d != cfg.play_difficulty || !sig.eq(board.records()));
+        if matches!(self.engine, EngineStatus::Ready)
+            && want_play_query
+            && play_stale
+            && self.inflight.is_none()
+        {
+            self.request(board, cfg, Stage::Play, komi);
         }
     }
 
@@ -425,6 +476,8 @@ impl AnalysisState {
         self.snapshot = None;
         self.transient_error = None;
         self.history.clear();
+        self.play_snapshot = None;
+        self.play_sig = None;
     }
 
     /// 退出时优雅关闭引擎进程（`App::on_exit` 调用）。
@@ -486,17 +539,24 @@ impl AnalysisState {
         let mut moves = report.move_infos;
         moves.sort_by_key(|info| info.order);
         let root = report.root_info;
-        self.snapshot = Some(Snapshot {
+        let snapshot = Snapshot {
             turn,
             size: board.size(),
             visits_cap: stage.cap(cfg),
-            deep: stage == Stage::Deep,
+            deep: stage == Stage::Deep || stage == Stage::Play,
             is_final,
             elapsed: started.elapsed(),
             root: root.clone(),
             moves,
             ownership: report.ownership,
-        });
+        };
+        // 走子口径落位：只认终态（中间报告对决策无意义）。局面签名随查询
+        // 记录，难度变更由 `sync` 的 want_play 比对触发重新查询。
+        if stage == Stage::Play && is_final {
+            self.play_snapshot = Some(snapshot.clone());
+            self.play_sig = Some((inflight.sig.clone(), cfg.play_difficulty));
+        }
+        self.snapshot = Some(snapshot);
         // 终态转存进逐手历史：局面未变时 visits 更高者胜（深阶段覆盖快阶段）。
         if is_final
             && let Some(root) = &root
@@ -510,11 +570,36 @@ impl AnalysisState {
         }
         if is_final {
             self.inflight = None;
-            // 分段加深：快查询与深查询预算相同（配置值很小）时无需重复。
+            // 分段加深：快查询与深查询预算相同（配置值很小）时无需重复；
+            // 对局中快查询也要加深展示（走子口径已单独发起，互不妨碍）。
             if stage == Stage::Fast && stage.cap(cfg) < cfg.visits.max(1) {
                 self.request(board, cfg, Stage::Deep, komi);
             }
         }
+    }
+
+    /// 引擎当前是否应该应手、走子依据是否已就绪（`App::logic` 转接用）。
+    ///
+    /// 返回「该局面按当前难度完整搜索」的终态报告；`None` = 尚未就绪
+    /// （查询在飞 / 未发起 / 难度刚变 / 局面已变）。**决策必须取自这里
+    /// 而非展示快照**：展示口径可以是浅查询（快阶段 100 visits），拿来
+    /// 走子会让难度设置形同虚设。
+    pub fn play_snapshot(&self, board: &Board, difficulty: Difficulty) -> Option<&Snapshot> {
+        let (sig, d) = self.play_sig.as_ref()?;
+        if *d != difficulty || !sig.eq(board.records()) {
+            return None;
+        }
+        self.play_snapshot.as_ref()
+    }
+
+    /// 走子口径的查询是否在飞（侧栏「引擎思考中」的判定依据之一：
+    /// 展示快照已齐但走子查询未回时，引擎实际仍在为应手思考）。
+    pub fn play_pending(&self, board: &Board, difficulty: Difficulty) -> bool {
+        self.play_snapshot(board, difficulty).is_none()
+            && self
+                .inflight
+                .as_ref()
+                .is_some_and(|inflight| inflight.stage == Stage::Play && inflight.sig.eq(board.records()))
     }
 
     /// 终态结果转存进逐手历史：键 = 局面签名（该报告对应的着法前缀）。
@@ -567,6 +652,7 @@ impl AnalysisState {
             turn: board.cursor(),
             stage,
             started: Instant::now(),
+            sig: board.records().to_vec(),
         });
     }
 }

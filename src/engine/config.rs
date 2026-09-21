@@ -39,6 +39,65 @@ impl EngineBackend {
     }
 }
 
+/// 人机对弈难度档位：预设**引擎走子**使用的访问量（visits）。
+///
+/// 只影响引擎应手的思考量，不影响展示分析（展示口径仍是「快查询 →
+/// 配置的 visits」）。档位幅度依据（b18 权重、本机 OpenCL 实测约
+/// 60 visits/s，见任务实测记录）：visits 有限时引擎更容易选中次优着法，
+/// 9 路战斗局面实测 30/100 → 首选 C2、300 → B7、800/2000 → D2，
+/// 各档首选着法有实际区分。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Difficulty {
+    /// 入门：30 visits，很弱，会明显失误。
+    Beginner,
+    /// 简单：100 visits，弱。
+    Easy,
+    /// 中等：300 visits（缺省档）。
+    #[default]
+    Medium,
+    /// 较强：800 visits，每手需等十几秒。
+    Strong,
+    /// 最强：2000 visits，每手需等半分钟以上。
+    Max,
+}
+
+/// 等待时间估算用的搜索速率：b18 权重 OpenCL 后端本机实测约 60 visits/s。
+/// 仅用于界面提示（「预计每手约 N 秒」），非保证值。
+const ESTIMATED_VISITS_PER_SEC: f64 = 60.0;
+
+impl Difficulty {
+    /// 全部档位（界面按此顺序罗列）。
+    pub const ALL: [Difficulty; 5] =
+        [Self::Beginner, Self::Easy, Self::Medium, Self::Strong, Self::Max];
+
+    /// 该档引擎走子使用的 visits 上限。
+    pub fn visits(self) -> u32 {
+        match self {
+            Self::Beginner => 30,
+            Self::Easy => 100,
+            Self::Medium => 300,
+            Self::Strong => 800,
+            Self::Max => 2000,
+        }
+    }
+
+    /// 档位中文名（界面直接显示）。
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Beginner => "入门",
+            Self::Easy => "简单",
+            Self::Medium => "中等",
+            Self::Strong => "较强",
+            Self::Max => "最强",
+        }
+    }
+
+    /// 按实测速率估算的每手等待秒数（向上取整，提示用）。
+    pub fn estimate_secs(self) -> u32 {
+        (f64::from(self.visits()) / ESTIMATED_VISITS_PER_SEC).ceil() as u32
+    }
+}
+
 /// 引擎配置（持久化到 `settings.json`）。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -58,6 +117,9 @@ pub struct EngineConfig {
     pub search_threads: u32,
     /// 自用引擎配置文件（`-config` 参数）路径；`None` 用默认生成路径。
     pub analysis_cfg: Option<PathBuf>,
+    /// 人机对弈难度（引擎走子的 visits 档位）。旧配置文件缺此键时
+    /// 回退中等档（struct 级 `#[serde(default)]`）。
+    pub play_difficulty: Difficulty,
 }
 
 impl Default for EngineConfig {
@@ -70,6 +132,7 @@ impl Default for EngineConfig {
             visits: 500,
             search_threads: default_search_threads(),
             analysis_cfg: None,
+            play_difficulty: Difficulty::default(),
         }
     }
 }

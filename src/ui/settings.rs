@@ -63,6 +63,8 @@ impl SettingsUi {
             visits: self.draft.visits.max(1),
             search_threads: base.search_threads,
             analysis_cfg: base.analysis_cfg.clone(),
+            // 对弈难度不在本窗口编辑（侧栏 / 新对局窗口改），原值保留。
+            play_difficulty: base.play_difficulty,
         }
     }
 
