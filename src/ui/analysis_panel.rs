@@ -6,8 +6,12 @@
 //! 不按行棋方翻转。棋盘候选点叠加 / 热度图 / 失误标注（`overlay` 模块）
 //! 直接取 `AnalysisState` 的快照与历史缓冲，本面板只提供层开关、失误汇总、
 //! 胜率色阶图例与候选点点击定位。
+//!
+//! 呈现结构（纯外观，动作仍经 [`PanelAction`] 交回 `App` 执行）：各分区用
+//! [`theme::card_frame`] 包成圆角卡片；难度做成分段选择器；棋谱文档与
+//! 候选点做成全宽按钮行；全部可交互项都有底色 / 边框 / hover 高亮。
 
-use egui::{Color32, Pos2, Rect, RichText, Sense, Ui, Vec2};
+use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2};
 
 use crate::board::{Board, Coord, IllegalReason, Stone};
 use crate::engine::{Difficulty, EngineConfig, RootInfo};
@@ -16,6 +20,7 @@ use crate::sgf::GameMeta;
 
 use super::analysis::{AnalysisState, EngineStatus, Severity};
 use super::overlay::{self, Overlay};
+use super::theme;
 
 /// 侧栏展示的候选点条数（空盘时引擎可回上百条，只取前几条；
 /// 与棋盘叠加层 `CANDIDATE_LIMIT` 解耦，各自维护）。
@@ -76,9 +81,9 @@ impl LoadNotice {
     /// 提示配色（与侧栏既有提示一致：绿 = 成功，橙 = 留意，红 = 失败）。
     fn color(&self) -> Color32 {
         match self {
-            Self::Ok(_) => Color32::from_rgb(140, 220, 140),
-            Self::Warn(_) => Color32::from_rgb(255, 190, 90),
-            Self::Failed(_) => Color32::from_rgb(255, 120, 110),
+            Self::Ok(_) => theme::colors::OK,
+            Self::Warn(_) => theme::colors::WARN,
+            Self::Failed(_) => theme::colors::ERROR,
         }
     }
 }
@@ -88,8 +93,7 @@ pub struct DocEntry {
     /// 文档的稳定编号（原谱 0，副本创建时单调分配；切换 / 丢弃动作
     /// 以此定位，丢弃其它副本后编号不变）。
     pub number: usize,
-    /// 列表显示名：原谱 = 文件名；副本 = 「研究副本 N（自第 M 手起）
-    /// ，含 K 手研究成果」（有成果时）。
+    /// 列表显示名：原谱 = 文件名；副本 = 「研究副本 N」。
     pub name: String,
     /// 创建前缀手数（`None` = 原谱；副本为 `Some(n)`）。
     pub from_move: Option<usize>,
@@ -102,18 +106,16 @@ pub struct DocEntry {
 /// 状态文本与配色。
 fn status_label(status: &EngineStatus, analyzing: bool) -> (String, Color32) {
     match status {
-        EngineStatus::Unconfigured => {
-            ("未配置权重".to_owned(), Color32::from_rgb(255, 190, 90))
-        }
-        EngineStatus::Starting => ("引擎启动中…".to_owned(), Color32::from_rgb(255, 190, 90)),
+        EngineStatus::Unconfigured => ("未配置权重".to_owned(), theme::colors::WARN),
+        EngineStatus::Starting => ("引擎启动中…".to_owned(), theme::colors::WARN),
         EngineStatus::Ready => {
             if analyzing {
-                ("分析中…".to_owned(), Color32::from_rgb(140, 220, 140))
+                ("分析中…".to_owned(), theme::colors::OK)
             } else {
-                ("就绪".to_owned(), Color32::from_rgb(140, 220, 140))
+                ("就绪".to_owned(), theme::colors::OK)
             }
         }
-        EngineStatus::Failed(_) => ("引擎错误".to_owned(), Color32::from_rgb(255, 120, 110)),
+        EngineStatus::Failed(_) => ("引擎错误".to_owned(), theme::colors::ERROR),
     }
 }
 
@@ -131,6 +133,44 @@ fn eval_lines(root: &RootInfo) -> (String, String) {
         format!("黑方胜率 {:.1}%", root.winrate * 100.0),
         format!("目差 {:+.1}", root.score_lead),
     )
+}
+
+/// 用分区卡片包住一段内容：卡片底色 + 细边框 + 圆角 + 内边距。
+///
+/// 布局注意：这里用 `ui.vertical`（默认 top_down 布局）即可 —— 容器 Ui
+/// 的 `max_rect` 已经是面板可用宽，Frame 会自然横向铺满；**不要**用
+/// `allocate_ui_with_layout + with_cross_justify + set_min_width` 的组合
+/// 造一个固定宽度的子区域（egui 0.36 下该模式会把 Panel 的自然宽度
+/// 反复撑大，面板被逐帧挤满整个窗口）。
+fn card<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.vertical(|ui| theme::card_frame().show(ui, add_contents).inner)
+        .inner
+}
+
+/// 全宽强调按钮（主操作：新对局 / 复制副本 / 重试引擎等）。
+/// 不固定填充色，保留全局 hover / active 三态底色反馈。
+fn primary_button(ui: &mut Ui, text: &str) -> egui::Response {
+    ui.add_sized(
+        [ui.available_width(), 0.0],
+        egui::Button::new(
+            RichText::new(text)
+                .strong()
+                .color(Color32::from_rgb(255, 196, 96)),
+        ),
+    )
+}
+
+/// 全宽普通按钮（侧栏内统一宽度，行动作走 `Response`）。
+fn wide_button(ui: &mut Ui, text: &str) -> egui::Response {
+    ui.add_sized([ui.available_width(), 0.0], egui::Button::new(text))
+}
+
+/// 信息行：弱色前缀 + 正文值（引擎状态 / 棋谱属性这类「标签：值」行）。
+fn info_line(ui: &mut Ui, label: &str, value: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(label).weak());
+        ui.label(RichText::new(value).size(12.5));
+    });
 }
 
 /// 绘制分析侧栏。`settings_open` 由本面板与顶部按钮共享；
@@ -166,33 +206,34 @@ pub fn show(
     hopeless: Option<&str>,
     docs: &[DocEntry],
 ) -> PanelAction {
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        panel_body(
-            ui,
-            analysis,
-            board,
-            cfg,
-            notice,
-            startup_notice,
-            settings_open,
-            overlay,
-            curve_open,
-            tree_open,
-            game,
-            comment,
-            load_notice,
-            save_notice,
-            persist_notice,
-            play,
-            new_game_open,
-            hopeless,
-            docs,
-        )
-    })
-    .inner
+    egui::ScrollArea::vertical()
+        .show(ui, |ui| {
+            panel_body(
+                ui,
+                analysis,
+                board,
+                cfg,
+                notice,
+                startup_notice,
+                settings_open,
+                overlay,
+                curve_open,
+                tree_open,
+                game,
+                comment,
+                load_notice,
+                save_notice,
+                persist_notice,
+                play,
+                new_game_open,
+                hopeless,
+                docs,
+            )
+        })
+        .inner
 }
 
-/// 侧栏正文（[`show`] 的滚动内容）。
+/// 侧栏正文（[`show`] 的滚动内容）：各分区卡片化排布。
 #[allow(clippy::too_many_arguments)]
 fn panel_body(
     ui: &mut Ui,
@@ -216,184 +257,307 @@ fn panel_body(
     docs: &[DocEntry],
 ) -> PanelAction {
     let mut action = PanelAction::None;
-    ui.heading("对局");
-    ui.add_space(4.0);
-    ui.checkbox(&mut play.mode, "人机对弈");
-    // 难度选择（对弈模式外也可预选）：五档 visits 预设，改变后引擎
-    // **下一手应手即生效**（无需重开对局）。显示各档 visits 与预计等待，
-    // 用户对「较强/最强要等十几秒到半分钟」有预期。
-    ui.horizontal_wrapped(|ui| {
-        ui.label("难度：");
-        for &d in Difficulty::ALL.iter() {
-            if ui
-                .selectable_label(cfg.play_difficulty == d, d.name())
-                .on_hover_text(format!(
-                    "{} visits，预计每手约 {} 秒",
-                    d.visits(),
-                    d.estimate_secs()
-                ))
-                .clicked()
-            {
-                action = PanelAction::SetDifficulty(d);
-            }
-        }
-    });
-    ui.weak(format!(
-        "当前：{}（{} visits，引擎每手预计约 {} 秒）",
-        cfg.play_difficulty.name(),
-        cfg.play_difficulty.visits(),
-        cfg.play_difficulty.estimate_secs()
-    ));
-    if play.mode {
-        let engine_ready = matches!(analysis.engine, EngineStatus::Ready);
-        let finished = play.finished(board);
-        let human_turn = !finished && board.to_play() == play.human;
-        let engine_turn = !finished && !human_turn && engine_ready
-            && board.cursor() == board.line_len();
-        // 「思考中」两种情况：展示查询在飞，或展示已齐而走子口径查询
-        // （按难度 visits）还在飞——后者才是应手快慢的决定因素。
-        let engine_thinking = engine_turn
-            && engine_ready
-            && (analysis.analyzing()
-                || analysis.play_pending(board, cfg.play_difficulty));
-        ui.label(format!("你执{}", play.human.name()));
-        if finished {
-            let reason = match play.resigned {
-                Some(side) => format!("{}认输：{}", side.name(), resign_text(side)),
-                None => "对局结束：双方连续弃着".to_owned(),
-            };
-            ui.colored_label(Color32::from_rgb(255, 190, 90), reason);
-            // 结束后进入纯复盘浏览：对弈开关保持，但不再自动应手
-            // （决策函数的 two_passes / resigned 守卫兜底）。
-        } else if engine_thinking {
-            ui.colored_label(
-                Color32::from_rgb(140, 220, 140),
-                format!(
-                    "引擎思考中…（{}，约 {} 秒/手）",
-                    cfg.play_difficulty.name(),
-                    cfg.play_difficulty.estimate_secs()
-                ),
-            );
-        } else if human_turn {
-            ui.colored_label(Color32::from_rgb(140, 220, 140), "轮到你");
-        } else {
-            ui.weak("等待引擎…");
-        }
-        if !finished && human_turn && board.cursor() == board.line_len() {
-            ui.horizontal(|ui| {
-                if ui.button("弃着").clicked() {
-                    action = PanelAction::HumanPass;
-                }
-                if ui.button("认输").clicked() {
-                    action = PanelAction::HumanResign;
-                }
-            });
-        }
-    }
-    if ui.button("新对局…").clicked() {
-        *new_game_open = true;
-        action = PanelAction::OpenNewGame;
-    }
-    if let Some(text) = hopeless {
-        ui.add_space(4.0);
-        ui.colored_label(Color32::from_rgb(255, 190, 90), text);
-        if ui.button("确认，继续对局").clicked() {
-            action = PanelAction::AckHopeless;
-        }
-    }
 
-    ui.add_space(6.0);
-    ui.separator();
-    ui.heading("分析");
-    ui.add_space(4.0);
+    // ---- 对局（人机开关 / 难度 / 对局操作）----
+    action = card_play(
+        ui,
+        analysis,
+        board,
+        cfg,
+        play,
+        new_game_open,
+        hopeless,
+        action,
+    );
 
     // ---- 引擎状态 ----
-    let (status_text, status_color) = status_label(&analysis.engine, analysis.analyzing());
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(status_text).color(status_color).strong());
-    });
-    if let EngineStatus::Failed(message) = &analysis.engine {
-        ui.colored_label(status_color, message);
-        if ui.button("重试启动引擎").clicked() {
-            action = PanelAction::RetryEngine;
-        }
-    }
-    if matches!(analysis.engine, EngineStatus::Unconfigured) {
-        ui.weak("请在设置中选择一个网络权重文件。");
-    }
-    if matches!(analysis.engine, EngineStatus::Starting) {
-        ui.weak("模型加载或显卡调优可能需要数十秒，请稍候。");
-    }
-    ui.label(format!("权重：{}", model_name(cfg)));
-    ui.label(format!("后端：{}", cfg.backend.name()));
-    ui.label(format!("思考量：{} visits", cfg.visits.max(1)));
-    if let Some(snapshot) = &analysis.snapshot {
-        ui.label(format!(
-            "最近耗时：{:.1} 秒（visits 上限 {}）",
-            snapshot.elapsed.as_secs_f32(),
-            snapshot.visits_cap
-        ));
-    }
-    ui.horizontal(|ui| {
-        if ui.button("设置…").clicked() {
-            *settings_open = !*settings_open;
-        }
-    });
+    card_engine(ui, analysis, cfg, settings_open, &mut action);
 
     // ---- 棋谱信息（打开棋谱后显示；属性存在才显示对应行）----
     if let Some(game) = game {
-        ui.add_space(6.0);
-        ui.separator();
-        ui.heading("棋谱");
+        card_game(ui, game, comment, docs, &mut action);
+    }
+
+    // ---- 胜率 / 目差 ----
+    card_winrate(ui, analysis);
+
+    // ---- 候选点 ----
+    card_candidates(ui, analysis, overlay, &mut action);
+
+    // ---- 失误统计（TASKS 4.4）----
+    card_mistakes(ui, analysis, board);
+
+    // ---- 叠加层 ----
+    card_overlay(ui, overlay, curve_open, tree_open);
+
+    // ---- 消息（非法落子 / 载入另存 / 引擎错误等提示；无则不占位）----
+    card_messages(
+        ui,
+        notice,
+        startup_notice,
+        load_notice,
+        save_notice,
+        persist_notice,
+        &analysis.transient_error,
+    );
+
+    action
+}
+
+/// 「对局」卡片：人机对弈开关、难度分段选择器、对局状态与操作按钮。
+#[allow(clippy::too_many_arguments)]
+fn card_play(
+    ui: &mut Ui,
+    analysis: &AnalysisState,
+    board: &Board,
+    cfg: &EngineConfig,
+    play: &mut PlayState,
+    new_game_open: &mut bool,
+    hopeless: Option<&str>,
+    action: PanelAction,
+) -> PanelAction {
+    let mut action = action;
+    card(ui, |ui| {
+        theme::section_title(ui, "对局");
+        ui.checkbox(&mut play.mode, "人机对弈");
+
+        // 难度选择（对弈模式外也可预选）：五档 visits 预设的分段选择器，
+        // 改变后引擎**下一手应手即生效**（无需重开对局）。显示各档 visits
+        // 与预计等待，用户对「较强/最强要等十几秒到半分钟」有预期。
+        ui.label(RichText::new("难度").weak());
+        ui.add_space(2.0);
+        egui::Frame::default()
+            .fill(theme::colors::STATUS_BG)
+            .corner_radius(6.0)
+            .inner_margin(3.0)
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                // 各段等分整行（预留 4 个段间空隙）。注意不能用
+                // `Layout::with_main_justify` —— 水平布局下它会把每个
+                // 控件都拉伸到整行宽，5 段就会把面板宽度棘轮式撑大。
+                let seg_w =
+                    (ui.available_width() - 4.0 * ui.spacing().item_spacing.x)
+                        / Difficulty::ALL.len() as f32;
+                ui.horizontal(|ui| {
+                    for &d in Difficulty::ALL.iter() {
+                        let selected = cfg.play_difficulty == d;
+                        let mut button = egui::Button::selectable(selected, d.name())
+                            .min_size(Vec2::new(seg_w, 0.0));
+                        if selected {
+                            // 选中段：琥珀系填充 + 深琥珀描边（比默认
+                            // selection 底更醒目，呈「实心段」观感）。
+                            button = button
+                                .fill(theme::colors::ACCENT_DIM)
+                                .stroke(Stroke::new(1.0, theme::colors::ACCENT_BAR));
+                        }
+                        let response = ui.add(button).on_hover_text(format!(
+                            "{} visits，预计每手约 {} 秒",
+                            d.visits(),
+                            d.estimate_secs()
+                        ));
+                        if response.clicked() {
+                            action = PanelAction::SetDifficulty(d);
+                        }
+                    }
+                });
+            });
+        ui.weak(format!(
+            "当前：{}（{} visits，引擎每手预计约 {} 秒）",
+            cfg.play_difficulty.name(),
+            cfg.play_difficulty.visits(),
+            cfg.play_difficulty.estimate_secs()
+        ));
+
+        if play.mode {
+            let engine_ready = matches!(analysis.engine, EngineStatus::Ready);
+            let finished = play.finished(board);
+            let human_turn = !finished && board.to_play() == play.human;
+            let engine_turn =
+                !finished && !human_turn && engine_ready && board.cursor() == board.line_len();
+            // 「思考中」两种情况：展示查询在飞，或展示已齐而走子口径查询
+            // （按难度 visits）还在飞——后者才是应手快慢的决定因素。
+            let engine_thinking = engine_turn
+                && engine_ready
+                && (analysis.analyzing() || analysis.play_pending(board, cfg.play_difficulty));
+            ui.label(format!("你执{}", play.human.name()));
+            if finished {
+                let reason = match play.resigned {
+                    Some(side) => format!("{}认输：{}", side.name(), resign_text(side)),
+                    None => "对局结束：双方连续弃着".to_owned(),
+                };
+                ui.colored_label(theme::colors::WARN, reason);
+                // 结束后进入纯复盘浏览：对弈开关保持，但不再自动应手
+                // （决策函数的 two_passes / resigned 守卫兜底）。
+            } else if engine_thinking {
+                ui.colored_label(
+                    theme::colors::OK,
+                    format!(
+                        "引擎思考中…（{}，约 {} 秒/手）",
+                        cfg.play_difficulty.name(),
+                        cfg.play_difficulty.estimate_secs()
+                    ),
+                );
+            } else if human_turn {
+                ui.colored_label(theme::colors::OK, "轮到你");
+            } else {
+                ui.weak("等待引擎…");
+            }
+            if !finished && human_turn && board.cursor() == board.line_len() {
+                ui.add_space(2.0);
+                // 弃着 / 认输等宽并排，像一组操作按钮而非文字。
+                ui.horizontal(|ui| {
+                    let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                    if ui
+                        .add_sized([width, 0.0], egui::Button::new("弃着"))
+                        .clicked()
+                    {
+                        action = PanelAction::HumanPass;
+                    }
+                    if ui
+                        .add_sized([width, 0.0], egui::Button::new("认输"))
+                        .clicked()
+                    {
+                        action = PanelAction::HumanResign;
+                    }
+                });
+            }
+        }
+        ui.add_space(2.0);
+        if primary_button(ui, "新对局…").clicked() {
+            *new_game_open = true;
+            action = PanelAction::OpenNewGame;
+        }
+        if let Some(text) = hopeless {
+            ui.add_space(4.0);
+            ui.colored_label(theme::colors::WARN, text);
+            if wide_button(ui, "确认，继续对局").clicked() {
+                action = PanelAction::AckHopeless;
+            }
+        }
+    });
+    action
+}
+
+/// 「引擎」卡片：状态点 + 权重 / 后端 / 思考量信息与设置入口。
+fn card_engine(
+    ui: &mut Ui,
+    analysis: &AnalysisState,
+    cfg: &EngineConfig,
+    settings_open: &mut bool,
+    action: &mut PanelAction,
+) {
+    card(ui, |ui| {
+        theme::section_title(ui, "引擎");
+        let (status_text, status_color) = status_label(&analysis.engine, analysis.analyzing());
+        ui.horizontal(|ui| {
+            // 状态点：圆形色标，一眼可辨引擎健康状态。
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+            ui.painter_at(rect)
+                .circle_filled(rect.center(), 4.0, status_color);
+            ui.label(RichText::new(status_text).color(status_color).strong());
+        });
+        if let EngineStatus::Failed(message) = &analysis.engine {
+            ui.colored_label(status_color, message);
+            let retry = ui
+                .add(
+                    egui::Button::new("重试启动引擎")
+                        .stroke(Stroke::new(1.0, theme::colors::ERROR)),
+                )
+                .on_hover_text("用当前配置重新拉起引擎进程");
+            if retry.clicked() {
+                *action = PanelAction::RetryEngine;
+            }
+        }
+        if matches!(analysis.engine, EngineStatus::Unconfigured) {
+            ui.weak("请在设置中选择一个网络权重文件。");
+        }
+        if matches!(analysis.engine, EngineStatus::Starting) {
+            ui.weak("模型加载或显卡调优可能需要数十秒，请稍候。");
+        }
+        info_line(ui, "权重", &model_name(cfg));
+        info_line(ui, "后端", cfg.backend.name());
+        info_line(ui, "思考量", &format!("{} visits", cfg.visits.max(1)));
+        if let Some(snapshot) = &analysis.snapshot {
+            info_line(
+                ui,
+                "最近耗时",
+                &format!(
+                    "{:.1} 秒（visits 上限 {}）",
+                    snapshot.elapsed.as_secs_f32(),
+                    snapshot.visits_cap
+                ),
+            );
+        }
+        ui.add_space(2.0);
+        if wide_button(ui, "设置…").clicked() {
+            *settings_open = !*settings_open;
+        }
+    });
+}
+
+/// 「棋谱」卡片：对局信息、当前手注释与文档列表（原谱 + 研究副本）。
+fn card_game(
+    ui: &mut Ui,
+    game: &GameMeta,
+    comment: Option<&str>,
+    docs: &[DocEntry],
+    action: &mut PanelAction,
+) {
+    card(ui, |ui| {
+        theme::section_title(ui, "棋谱");
 
         // 当前文档标签（原谱 / 研究副本 N）：让「现在看的是哪份」一眼可见。
         let tag = match docs.iter().find(|entry| entry.active) {
             Some(entry) if entry.from_move.is_some() => {
-                format!("研究副本 {}（自第 {} 手起）", entry.number, entry.from_move.unwrap_or(0))
+                format!(
+                    "研究副本 {}（自第 {} 手起）",
+                    entry.number,
+                    entry.from_move.unwrap_or(0)
+                )
             }
             _ => "原谱".to_owned(),
         };
         let tag_color = if tag == "原谱" {
             Color32::from_rgb(120, 200, 255)
         } else {
-            Color32::from_rgb(140, 220, 140)
+            theme::colors::OK
         };
         ui.label(RichText::new(tag).color(tag_color).strong());
 
-        let file = game
-            .source
-            .file_name()
-            .map_or_else(|| "（无文件名）".to_owned(), |n| n.to_string_lossy().into_owned());
+        let file = game.source.file_name().map_or_else(
+            || "（无文件名）".to_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
         let file_label = ui.label(RichText::new(file).strong());
         file_label.on_hover_text(game.source.display().to_string());
         let info = &game.info;
         if let Some(line) = player_line(&info.player_black, &info.rank_black) {
-            ui.label(format!("黑：{line}"));
+            info_line(ui, "黑", &line);
         }
         if let Some(line) = player_line(&info.player_white, &info.rank_white) {
-            ui.label(format!("白：{line}"));
+            info_line(ui, "白", &line);
         }
         if let Some(result) = &info.result {
-            ui.label(format!("结果：{result}"));
+            info_line(ui, "结果", result);
         }
         if let Some(komi) = info.komi {
-            ui.label(format!("贴目：{komi}"));
+            info_line(ui, "贴目", &komi.to_string());
         }
         if info.handicap > 0 {
-            ui.label(format!("让子：{}", info.handicap));
+            info_line(ui, "让子", &info.handicap.to_string());
         }
         if let Some(date) = &info.date {
-            ui.label(format!("日期：{date}"));
+            info_line(ui, "日期", date);
         }
         if let Some(event) = &info.event {
-            ui.label(format!("赛事：{event}"));
+            info_line(ui, "赛事", event);
         }
         if let Some(rules) = &info.rules {
-            ui.label(format!("规则：{rules}"));
+            info_line(ui, "规则", rules);
         }
         // 当前手的 `C` 注释（无则不显示）。
         if let Some(text) = comment {
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             ui.label(text);
         }
 
@@ -407,215 +571,408 @@ fn panel_body(
             entries => {
                 ui.weak("点击切换文档：");
                 for entry in entries {
-                    ui.horizontal(|ui| {
-                        let (text, color) = if entry.active {
-                            (RichText::new(&entry.name).strong(), Color32::from_rgb(140, 220, 140))
-                        } else if entry.from_move.is_some() {
-                            (RichText::new(&entry.name), Color32::from_rgb(200, 200, 200))
-                        } else {
-                            // 非活动的原谱用淡蓝色与副本区分。
-                            (
-                                RichText::new(&entry.name),
-                                Color32::from_rgb(120, 200, 255),
-                            )
-                        };
-                        // 列表项即切换入口；当前活动项高亮且仍可点
-                        // （点了无副作用，切换到自己是空操作）。
-                        let label = ui.selectable_label(entry.active, text.color(color));
-                        if label.clicked() {
-                            action = PanelAction::SwitchDoc(entry.number);
-                        }
-                        // 丢弃入口：仅副本有（原谱不可丢弃）；悬停说明成果。
-                        // 用带边框的小按钮（"×" 纯文字可点区域太小、不显眼）。
-                        if entry.from_move.is_some() {
-                            let mut drop = ui.button("丢弃");
-                            drop = drop.on_hover_text(if entry.research > 0 {
-                                format!("丢弃研究副本 {}（含 {} 手研究成果，将确认）", entry.number, entry.research)
-                            } else {
-                                format!("丢弃研究副本 {}", entry.number)
-                            });
-                            if drop.clicked() {
-                                action = PanelAction::DropCopy(entry.number);
-                            }
-                        }
-                    });
+                    doc_row(ui, entry, action);
                 }
-                ui.add_space(2.0);
+                ui.add_space(4.0);
                 // 创建入口：任何已载入文档（原谱或副本）的当前手皆可再开副本。
-                // 用真按钮（有边框与 hover 高亮），纯文字太不明显。
-                if ui.button("复制为研究副本").clicked() {
-                    action = PanelAction::CreateCopy;
+                if primary_button(ui, "复制为研究副本").clicked() {
+                    *action = PanelAction::CreateCopy;
                 }
             }
         }
-    }
+    });
+}
 
-    ui.add_space(6.0);
-    ui.separator();
-
-    // ---- 胜率 / 目差 ----
-    ui.heading("胜率");
-    match &analysis.snapshot {
-        Some(snapshot) => match &snapshot.root {
-            Some(root) => {
-                let (winrate, lead) = eval_lines(root);
-                ui.label(RichText::new(winrate).size(22.0).strong());
-                ui.label(RichText::new(lead).size(16.0));
-            }
-            None => {
-                ui.weak("引擎未返回数据（空报告）。");
-            }
-        },
-        None => {
-            ui.weak(if matches!(analysis.engine, EngineStatus::Ready) {
-                "正在分析当前局面…"
-            } else {
-                "等待引擎可用后自动分析。"
-            });
-        }
-    }
-
-    ui.add_space(6.0);
-    ui.separator();
-
-    // ---- 候选点 ----
-    ui.heading("候选点");
-    match &analysis.snapshot {
-        Some(snapshot) if !snapshot.moves.is_empty() => {
-            ui.weak("点 / 黑方胜率 / visits（点击定位）");
-            for info in snapshot.moves.iter().take(MOVE_LIMIT) {
-                let mv = info.mv.map_or_else(|| "弃着".to_owned(), |c| c.to_gtp(snapshot.size));
-                let row = format!(
-                    "{:<4}{:>7} {:>7}",
-                    mv,
-                    format!("{:.1}%", info.winrate * 100.0),
-                    info.visits
-                );
-                // 当前被定位的行保持选中态，与棋盘高亮呼应。
-                let selected = overlay.focus.as_ref().is_some_and(|f| Some(f.at) == info.mv);
-                let response =
-                    ui.selectable_label(selected, RichText::new(row).monospace());
-                let response = if info.mv.is_some() {
-                    response.on_hover_text("点击在棋盘上定位该点")
-                } else {
-                    response.on_hover_text("弃着无处定位")
-                };
-                if response.clicked()
-                    && let Some(at) = info.mv
-                {
-                    let ghosts = snapshot.root.as_ref().map_or_else(Vec::new, |root| {
-                        overlay::ghosts_from_pv(&info.pv, root.current_player)
-                    });
-                    action = PanelAction::Focus { at, ghosts };
-                }
-            }
-        }
-        Some(_) => {
-            ui.weak("引擎未返回候选点。");
-        }
-        None => {
-            ui.weak("—");
-        }
-    }
-
-    ui.add_space(6.0);
-    ui.separator();
-
-    // ---- 失误统计（TASKS 4.4）----
-    ui.heading("失误");
-    let summary = analysis.loss_summary(board);
-    if summary.total == 0 {
-        ui.weak("—");
-    } else {
-        // 「已分析 / 总手数」必须显式给出：数据随浏览逐步积累，
-        // 不写清楚会被误认为整盘都算过了。
-        ui.weak(format!(
-            "已分析 {} / {} 手（随浏览逐步积累）",
-            summary.analyzed, summary.total
-        ));
-        ui.horizontal_wrapped(|ui| {
-            // 计数与棋盘标记共用同一套严重程度配色。
-            for (label, count, severity) in [
-                ("疑问手", summary.questionable, Severity::Questionable),
-                ("失误", summary.mistake, Severity::Mistake),
-                ("恶手", summary.blunder, Severity::Blunder),
-            ] {
-                ui.label(
-                    RichText::new(format!("{label} {count}"))
-                        .color(overlay::severity_color(severity))
-                        .strong(),
-                );
-            }
-        });
-        ui.weak("棋盘标注：目差损失 ≥1 目疑问手 / ≥3 目失误 / ≥6 目恶手");
-    }
-
-    ui.add_space(6.0);
-    ui.separator();
-
-    // ---- 叠加层 ----
-    ui.heading("叠加层");
-    ui.checkbox(&mut overlay.show_candidates, "候选点圆圈");
-    ui.checkbox(&mut overlay.show_heat, "局势热度图");
-    ui.checkbox(&mut overlay.show_mistakes, "失误标注");
-    ui.checkbox(curve_open, "胜率曲线面板");
-    ui.checkbox(tree_open, "棋谱树面板");
-    // 胜率色阶图例：与棋盘候选点共用 overlay::winrate_color 同一映射。
+/// 文档列表的一行：全宽按钮行，活动项琥珀填充 + 左侧强调条；
+/// 行尾「丢弃」按钮仅副本有，与整行点击区域互不重叠。
+fn doc_row(ui: &mut Ui, entry: &DocEntry, action: &mut PanelAction) {
+    let row_height = 34.0;
+    // 行尾动作按钮宽度；原谱无丢弃按钮，右侧留空 54px 对齐。
+    let tail = 54.0;
     ui.horizontal(|ui| {
-        ui.weak("白优");
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(80.0, 10.0), Sense::hover());
+        let row_width = (ui.available_width() - tail).max(60.0);
+        let (rect, row) = ui.allocate_exact_size(Vec2::new(row_width, row_height), Sense::click());
+        let row = row.on_hover_text(if entry.active {
+            "当前文档".to_owned()
+        } else {
+            "点击切换到该文档".to_owned()
+        });
         let painter = ui.painter_at(rect);
-        const SEGMENTS: usize = 24;
-        let w = rect.width() / SEGMENTS as f32;
-        for i in 0..SEGMENTS {
-            let t = i as f64 / (SEGMENTS - 1) as f64;
-            let x = rect.min.x + i as f32 * w;
-            painter.rect_filled(
-                Rect::from_min_size(Pos2::new(x, rect.min.y), Vec2::new(w + 0.5, rect.height())),
-                0.0,
-                overlay::winrate_color(t),
+        // 三态：活动 = 琥珀暗底；hover = 控件亮底；常态 = 卡片内凹底。
+        let fill = if entry.active {
+            theme::colors::ACCENT_DIM
+        } else if row.hovered() || row.is_pointer_button_down_on() {
+            Color32::from_rgb(52, 57, 70)
+        } else {
+            Color32::from_rgb(39, 43, 53)
+        };
+        painter.rect_filled(rect, 6.0, fill);
+        if entry.active {
+            // 左侧强调条（琥珀），与棋盘分支选择器同源。
+            let bar = Rect::from_min_size(
+                rect.min + Vec2::new(3.0, 4.0),
+                Vec2::new(3.0, row_height - 8.0),
+            );
+            painter.rect_filled(bar, 1.5, theme::colors::ACCENT_BAR);
+        }
+        if entry.active || row.is_pointer_button_down_on() {
+            painter.rect_stroke(
+                rect,
+                6.0,
+                Stroke::new(1.0, theme::colors::ACCENT_DEEP),
+                StrokeKind::Middle,
+            );
+        } else if row.hovered() {
+            painter.rect_stroke(
+                rect,
+                6.0,
+                Stroke::new(1.0, Stroke::new(1.0, theme::colors::ACCENT_DEEP).color),
+                StrokeKind::Middle,
             );
         }
-        ui.weak("黑优");
-    });
-    ui.weak("圆圈大小 ∝ √visits，白环为主选点；热度深色 = 黑势、浅色 = 白势");
-
-    ui.add_space(6.0);
-    ui.separator();
-
-    // ---- 提示行 ----
-    let mut hint = false;
-    if let Some(reason) = notice {
-        ui.colored_label(
-            Color32::from_rgb(255, 152, 82),
-            format!("非法落子：{reason}"),
+        // 两行排版：文档名 + 副行（来源手数 / 研究成果）。
+        let name_color = if entry.active {
+            Color32::from_rgb(255, 214, 140)
+        } else if entry.from_move.is_some() {
+            Color32::from_rgb(208, 212, 220)
+        } else {
+            Color32::from_rgb(126, 196, 250)
+        };
+        painter.text(
+            rect.min + Vec2::new(12.0, 6.0),
+            Align2::LEFT_TOP,
+            &entry.name,
+            FontId::proportional(12.5),
+            name_color,
         );
-        hint = true;
+        let sub = match entry.from_move {
+            None => "原谱".to_owned(),
+            Some(from) if entry.research > 0 => {
+                format!("自第 {from} 手起 · 研究成果 {} 手", entry.research)
+            }
+            Some(from) => format!("自第 {from} 手起"),
+        };
+        painter.text(
+            rect.min + Vec2::new(12.0, row_height - 13.0),
+            Align2::LEFT_TOP,
+            &sub,
+            FontId::proportional(10.0),
+            Color32::from_rgb(150, 156, 166),
+        );
+        if row.clicked() {
+            *action = PanelAction::SwitchDoc(entry.number);
+        }
+
+        // 行尾「丢弃」按钮：仅副本有；独立交互区，不与整行点击冲突。
+        if entry.from_move.is_some() {
+            let (drect, drop) = ui.allocate_exact_size(Vec2::new(44.0, row_height), Sense::click());
+            let drop_hover = drop.hovered() || drop.is_pointer_button_down_on();
+            let painter = ui.painter_at(drect);
+            painter.rect_filled(
+                drect,
+                6.0,
+                if drop_hover {
+                    Color32::from_rgb(72, 44, 46)
+                } else {
+                    Color32::from_rgb(48, 42, 46)
+                },
+            );
+            painter.rect_stroke(
+                drect,
+                6.0,
+                Stroke::new(
+                    1.0,
+                    if drop_hover {
+                        theme::colors::ERROR
+                    } else {
+                        Color32::from_rgb(78, 60, 62)
+                    },
+                ),
+                StrokeKind::Middle,
+            );
+            painter.text(
+                drect.center(),
+                Align2::CENTER_CENTER,
+                "丢弃",
+                FontId::proportional(11.0),
+                if drop_hover {
+                    Color32::from_rgb(255, 150, 140)
+                } else {
+                    Color32::from_rgb(196, 168, 168)
+                },
+            );
+            let drop = drop.on_hover_text(if entry.research > 0 {
+                format!(
+                    "丢弃研究副本 {}（含 {} 手研究成果，将确认）",
+                    entry.number, entry.research
+                )
+            } else {
+                format!("丢弃研究副本 {}", entry.number)
+            });
+            if drop.clicked() {
+                *action = PanelAction::DropCopy(entry.number);
+            }
+        }
+    });
+}
+
+/// 「胜率」卡片：大字号黑方胜率与目差。
+fn card_winrate(ui: &mut Ui, analysis: &AnalysisState) {
+    card(ui, |ui| {
+        theme::section_title(ui, "胜率");
+        match &analysis.snapshot {
+            Some(snapshot) => match &snapshot.root {
+                Some(root) => {
+                    let (winrate, lead) = eval_lines(root);
+                    ui.label(RichText::new(winrate).size(24.0).strong());
+                    ui.label(RichText::new(lead).size(15.0).weak());
+                }
+                None => {
+                    ui.weak("引擎未返回数据（空报告）。");
+                }
+            },
+            None => {
+                ui.weak(if matches!(analysis.engine, EngineStatus::Ready) {
+                    "正在分析当前局面…"
+                } else {
+                    "等待引擎可用后自动分析。"
+                });
+            }
+        }
+    });
+}
+
+/// 「候选点」卡片：全宽按钮行，点 / 胜率 / visits 三段排版，点击定位。
+fn card_candidates(
+    ui: &mut Ui,
+    analysis: &AnalysisState,
+    overlay: &Overlay,
+    action: &mut PanelAction,
+) {
+    card(ui, |ui| {
+        theme::section_title(ui, "候选点");
+        match &analysis.snapshot {
+            Some(snapshot) if !snapshot.moves.is_empty() => {
+                ui.weak("点 / 黑方胜率 / visits（点击定位）");
+                // 幽灵子推导所需的行棋方（主变序列交替推演的起点）。
+                let to_play = snapshot.root.as_ref().map(|root| root.current_player);
+                for info in snapshot.moves.iter().take(MOVE_LIMIT) {
+                    candidate_row(ui, info, overlay, snapshot.size, to_play, action);
+                }
+            }
+            Some(_) => {
+                ui.weak("引擎未返回候选点。");
+            }
+            None => {
+                ui.weak("—");
+            }
+        }
+    });
+}
+
+/// 候选点行：自绘全宽按钮（左坐标 / 中胜率 / 右 visits），选中态与
+/// 棋盘定位高亮呼应（琥珀填充）；弃着行不可点。
+#[allow(clippy::too_many_arguments)]
+fn candidate_row(
+    ui: &mut Ui,
+    info: &crate::engine::MoveInfo,
+    overlay: &Overlay,
+    size: crate::board::Size,
+    to_play: Option<Stone>,
+    action: &mut PanelAction,
+) {
+    let mv = info
+        .mv
+        .map_or_else(|| "弃着".to_owned(), |c| c.to_gtp(size));
+    let winrate = format!("{:.1}%", info.winrate * 100.0);
+    let visits = format!("{}", info.visits);
+    // 当前被定位的行保持选中态，与棋盘高亮呼应。
+    let selected = overlay
+        .focus
+        .as_ref()
+        .is_some_and(|f| Some(f.at) == info.mv);
+    let interactive = info.mv.is_some();
+
+    let height = 24.0;
+    let (rect, mut response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), height),
+        if interactive {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let painter = ui.painter_at(rect);
+    let fill = if selected {
+        theme::colors::ACCENT_DIM
+    } else if interactive && (response.hovered() || response.is_pointer_button_down_on()) {
+        Color32::from_rgb(52, 57, 70)
+    } else {
+        Color32::from_rgb(39, 43, 53)
+    };
+    painter.rect_filled(rect, 5.0, fill);
+    if selected {
+        painter.rect_stroke(
+            rect,
+            5.0,
+            Stroke::new(1.0, theme::colors::ACCENT_DEEP),
+            StrokeKind::Middle,
+        );
     }
-    if let Some(text) = startup_notice {
-        ui.colored_label(Color32::from_rgb(255, 190, 90), text);
-        hint = true;
+    let text_color = if selected {
+        Color32::from_rgb(255, 214, 140)
+    } else {
+        Color32::from_rgb(214, 218, 226)
+    };
+    painter.text(
+        rect.min + Vec2::new(10.0, height / 2.0),
+        Align2::LEFT_CENTER,
+        &mv,
+        FontId::monospace(13.0),
+        text_color,
+    );
+    painter.text(
+        Pos2::new(rect.left() + 64.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        &winrate,
+        FontId::monospace(12.0),
+        text_color,
+    );
+    painter.text(
+        rect.max - Vec2::new(10.0, height / 2.0),
+        Align2::RIGHT_CENTER,
+        &visits,
+        FontId::monospace(11.0),
+        Color32::from_rgb(150, 156, 166),
+    );
+    response = if info.mv.is_some() {
+        response.on_hover_text("点击在棋盘上定位该点")
+    } else {
+        response.on_hover_text("弃着无处定位")
+    };
+    if response.clicked()
+        && let Some(at) = info.mv
+    {
+        let ghosts = to_play.map_or_else(Vec::new, |to_play| {
+            overlay::ghosts_from_pv(&info.pv, to_play)
+        });
+        *action = PanelAction::Focus { at, ghosts };
     }
-    if let Some(text) = &analysis.transient_error {
-        ui.colored_label(Color32::from_rgb(255, 190, 90), text);
-        hint = true;
+}
+
+/// 「失误」卡片：已分析进度与各严重程度计数。
+fn card_mistakes(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
+    card(ui, |ui| {
+        theme::section_title(ui, "失误");
+        let summary = analysis.loss_summary(board);
+        if summary.total == 0 {
+            ui.weak("—");
+        } else {
+            // 「已分析 / 总手数」必须显式给出：数据随浏览逐步积累，
+            // 不写清楚会被误认为整盘都算过了。
+            ui.weak(format!(
+                "已分析 {} / {} 手（随浏览逐步积累）",
+                summary.analyzed, summary.total
+            ));
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                // 计数与棋盘标记共用同一套严重程度配色。
+                for (label, count, severity) in [
+                    ("疑问手", summary.questionable, Severity::Questionable),
+                    ("失误", summary.mistake, Severity::Mistake),
+                    ("恶手", summary.blunder, Severity::Blunder),
+                ] {
+                    ui.label(
+                        RichText::new(format!("{label} {count}"))
+                            .color(overlay::severity_color(severity))
+                            .strong(),
+                    );
+                }
+            });
+            ui.weak("棋盘标注：目差损失 ≥1 目疑问手 / ≥3 目失误 / ≥6 目恶手");
+        }
+    });
+}
+
+/// 「叠加层」卡片：各层开关（复选框）与胜率色阶图例。
+fn card_overlay(ui: &mut Ui, overlay: &mut Overlay, curve_open: &mut bool, tree_open: &mut bool) {
+    card(ui, |ui| {
+        theme::section_title(ui, "叠加层");
+        ui.checkbox(&mut overlay.show_candidates, "候选点圆圈");
+        ui.checkbox(&mut overlay.show_heat, "局势热度图");
+        ui.checkbox(&mut overlay.show_mistakes, "失误标注");
+        ui.checkbox(curve_open, "胜率曲线面板");
+        ui.checkbox(tree_open, "棋谱树面板");
+        // 胜率色阶图例：与棋盘候选点共用 overlay::winrate_color 同一映射。
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.weak("白优");
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(80.0, 10.0), Sense::hover());
+            let painter = ui.painter_at(rect);
+            const SEGMENTS: usize = 24;
+            let w = rect.width() / SEGMENTS as f32;
+            for i in 0..SEGMENTS {
+                let t = i as f64 / (SEGMENTS - 1) as f64;
+                let x = rect.min.x + i as f32 * w;
+                painter.rect_filled(
+                    Rect::from_min_size(
+                        Pos2::new(x, rect.min.y),
+                        Vec2::new(w + 0.5, rect.height()),
+                    ),
+                    0.0,
+                    overlay::winrate_color(t),
+                );
+            }
+            ui.weak("黑优");
+        });
+        ui.weak("圆圈大小 ∝ √visits，白环为主选点；热度深色 = 黑势、浅色 = 白势");
+    });
+}
+
+/// 「消息」卡片：各类用户可见提示（非法落子 / 载入另存 / 引擎错误等）。
+/// 无任何提示时不渲染（原「无提示。」占位行去除，语义不变）。
+fn card_messages(
+    ui: &mut Ui,
+    notice: Option<IllegalReason>,
+    startup_notice: Option<&str>,
+    load_notice: Option<&LoadNotice>,
+    save_notice: Option<&LoadNotice>,
+    persist_notice: Option<&str>,
+    transient_error: &Option<String>,
+) {
+    let has_any = notice.is_some()
+        || startup_notice.is_some()
+        || load_notice.is_some()
+        || save_notice.is_some()
+        || persist_notice.is_some()
+        || transient_error.is_some();
+    if !has_any {
+        return;
     }
-    if let Some(msg) = load_notice {
-        ui.colored_label(msg.color(), msg.text());
-        hint = true;
-    }
-    if let Some(msg) = save_notice {
-        ui.colored_label(msg.color(), msg.text());
-        hint = true;
-    }
-    if let Some(text) = persist_notice {
-        ui.colored_label(Color32::from_rgb(255, 120, 110), text);
-        hint = true;
-    }
-    if !hint {
-        ui.weak("无提示。");
-    }
-    action
+    card(ui, |ui| {
+        theme::section_title(ui, "消息");
+        if let Some(reason) = notice {
+            ui.colored_label(
+                Color32::from_rgb(255, 152, 82),
+                format!("非法落子：{reason}"),
+            );
+        }
+        if let Some(text) = startup_notice {
+            ui.colored_label(theme::colors::WARN, text);
+        }
+        if let Some(text) = transient_error {
+            ui.colored_label(theme::colors::WARN, text);
+        }
+        if let Some(msg) = load_notice {
+            ui.colored_label(msg.color(), msg.text());
+        }
+        if let Some(msg) = save_notice {
+            ui.colored_label(msg.color(), msg.text());
+        }
+        if let Some(text) = persist_notice {
+            ui.colored_label(theme::colors::ERROR, text);
+        }
+    });
 }
 
 /// 棋手与段位拼成一行显示文本（如 `聂卫平 九段`）；两者都缺返回 `None`。

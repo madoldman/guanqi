@@ -19,6 +19,7 @@ use crate::play::{PlayState, resign_text, undo_to_human};
 
 use super::analysis::AnalysisState;
 use super::overlay::{self, Overlay};
+use super::theme;
 
 // ---- 配色 ----
 
@@ -37,12 +38,16 @@ const BRANCH: Color32 = Color32::from_rgb(255, 170, 40);
 
 /// 交叉点到棋盘边缘的留白，以间距为单位（容纳坐标标注）。
 const MARGIN_IN_SPACING: f32 = 1.2;
-/// 间距上限：大窗口下避免小棋盘被拉得过于稀疏。
-const MAX_SPACING: f32 = 40.0;
-/// 底部状态行预留高度。
-const STATUS_HEIGHT: f32 = 26.0;
+/// 棋盘边长绝对上限（逻辑像素）：仅在「巨大屏幕 + 9 路小盘」这类极端
+/// 组合下兜底，避免小棋盘被放大到荒诞；常见分辨率下 19 / 13 路碰不到
+/// （2560 宽时 19 路满铺约 2350px，远低于此值），故棋盘实际上随窗口
+/// 自由缩放（此前 40px 的间距上限会把 19 路盘卡在约 816px，大屏只占
+/// 中间一小块，已移除）。
+const MAX_BOARD_SIDE: f32 = 3200.0;
+/// 底部状态栏预留高度（分段块 + 容器内边距）。
+const STATUS_HEIGHT: f32 = 42.0;
 /// 分支选择器行预留高度（0 = 不显示时不占位）。
-const BRANCH_HEIGHT: f32 = 26.0;
+const BRANCH_HEIGHT: f32 = 42.0;
 
 /// 绘制棋盘视图并处理交互。
 ///
@@ -159,7 +164,8 @@ enum BranchStep {
     Prev,
 }
 
-/// 绘制分支选择器行：「变着 X/Y」+ ◀ + 各子分支首手（GTP 坐标）+ ▶。
+/// 绘制分支选择器行：「变着 X/Y」标签 + ◀/▶ 小方钮 + 各子分支首手
+/// 分段按钮（GTP 坐标，弃着显示文字）+ 快捷键说明。
 /// 返回本帧被点击的动作（由调用方执行，见 [`BranchSel`]）。
 fn draw_branch_selector(ui: &mut Ui, board: &Board) -> BranchSel {
     let mut action = BranchSel::None;
@@ -167,10 +173,21 @@ fn draw_branch_selector(ui: &mut Ui, board: &Board) -> BranchSel {
     let count = board.child_count();
     let selected = board.selected_child();
     ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("变着 {}/{}", selected + 1, count)).color(BRANCH).strong());
-        if ui.button("◀").clicked() {
+        // 「变着 X/Y」标签块：琥珀文字 + 暗底小圆角，与其余按钮区分。
+        ui.label(
+            RichText::new(format!(" 变着 {}/{} ", selected + 1, count))
+                .color(BRANCH)
+                .strong(),
+        );
+        // ◀ / ▶：固定宽度小方钮，视觉上是一组导航控件。
+        let nav = |ui: &mut Ui, label: &str| -> bool {
+            let width = ui.spacing().interact_size.y * 1.4;
+            ui.add_sized([width, 0.0], egui::Button::new(label)).clicked()
+        };
+        if nav(ui, "◀") {
             action = BranchSel::Step(BranchStep::Prev);
         }
+        // 子分支分段按钮：选中琥珀填充，未选可点；首手用等宽字体。
         for i in 0..count {
             // 子分支首手：GTP 坐标显示（Display 是调试格式，不用）；弃着显示文字。
             let label = match board.child_move(i) {
@@ -180,11 +197,17 @@ fn draw_branch_selector(ui: &mut Ui, board: &Board) -> BranchSel {
                 },
                 None => "?".to_owned(),
             };
-            if ui.selectable_label(i == selected, label).clicked() {
+            let mut button = egui::Button::selectable(i == selected, RichText::new(label).monospace());
+            if i == selected {
+                button = button
+                    .fill(theme::colors::ACCENT_DIM)
+                    .stroke(Stroke::new(1.0, theme::colors::ACCENT_BAR));
+            }
+            if ui.add(button).clicked() {
                 action = BranchSel::Select(i);
             }
         }
-        if ui.button("▶").clicked() {
+        if nav(ui, "▶") {
             action = BranchSel::Step(BranchStep::Next);
         }
         ui.weak("Ctrl+← / Ctrl+→ 切换");
@@ -298,9 +321,12 @@ impl Layout {
         if !side.is_finite() || side <= 8.0 {
             return None;
         }
-        // n - 1 个间距 + 两侧留白，恰好铺满可用边长的正方形。
-        let spacing = (side / (f32::from(size.n()) - 1.0 + 2.0 * MARGIN_IN_SPACING))
-            .min(MAX_SPACING);
+        // n - 1 个间距 + 两侧留白，恰好铺满可用边长的正方形；
+        // 间距只受「棋盘边长绝对上限」约束（见 [`MAX_BOARD_SIDE`]），
+        // 常见分辨率下棋盘随窗口自由缩放。
+        let spacing = ((side / (f32::from(size.n()) - 1.0 + 2.0 * MARGIN_IN_SPACING))
+            .min(MAX_BOARD_SIDE / (f32::from(size.n()) - 1.0 + 2.0 * MARGIN_IN_SPACING)))
+        .max(1.0);
         let margin = spacing * MARGIN_IN_SPACING;
         let rect = Rect::from_center_size(
             avail.center(),
@@ -521,11 +547,15 @@ fn draw_hover(painter: &Painter, layout: &Layout, board: &Board, pos: Pos2) {
     }
 }
 
-/// 最小状态行：手数 / 行棋方 / 提子 / 对弈轮次 / 非法提示 / 建分支提示 /
+/// 最小状态栏：手数 / 行棋方 / 提子 / 对弈轮次 / 非法提示 / 建分支提示 /
 /// 快捷键说明（完整侧栏在阶段 4）。
 ///
 /// 对弈模式开启时行棋方一栏改为明确的「轮到你 / 引擎思考中…」提示
 /// （含对局已结束的原因）；复盘模式保持原「轮到黑/白」文案。
+///
+/// 呈现为分段状态栏：底色容器内并排若干「标签块」（暗底圆角小片），
+/// 用分隔线区分；不再是一整行终端式的裸文字。每段是否显示仍按数据
+/// 有无决定（回看 / 弃着提示 / 非法提示为空则不占段）。
 fn draw_status(
     ui: &mut Ui,
     board: &mut Board,
@@ -533,53 +563,104 @@ fn draw_status(
     branch_notice: Option<&str>,
     play: Option<&PlayState>,
 ) {
-    ui.add_space(6.0);
-    ui.horizontal_wrapped(|ui| {
-        ui.label(format!("第 {} / {} 手", board.cursor(), board.line_len()));
-        if board.cursor() < board.line_len() {
-            ui.weak("（回看中）");
-        }
-        ui.separator();
-        match play {
-            Some(play) if play.mode => {
-                if play.finished(board) {
-                    let text = match play.resigned {
-                        Some(side) => format!("{}认输，{}", side.name(), resign_text(side)),
-                        None => "对局结束：双方连续弃着".to_owned(),
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), STATUS_HEIGHT - 10.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            // 状态栏容器：暗底圆角条，与棋盘 / 面板底色分层。
+            egui::Frame::default()
+                .fill(theme::colors::STATUS_BG)
+                .corner_radius(7.0)
+                .inner_margin(egui::Margin::symmetric(6, 4))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.spacing_mut().item_spacing.y = 2.0;
+
+                    // 段容器：每段一个暗底圆角块，块内横排文字。
+                    let segment = |ui: &mut Ui, add: &dyn Fn(&mut Ui)| {
+                        egui::Frame::default()
+                            .fill(theme::colors::STATUS_SEG)
+                            .corner_radius(5.0)
+                            .inner_margin(egui::Margin::symmetric(6, 2))
+                            .show(ui, |ui| add(ui));
                     };
-                    ui.colored_label(Color32::from_rgb(255, 190, 90), text);
-                } else if board.to_play() == play.human {
-                    ui.label(
-                        RichText::new(format!("轮到你（你执{}）", play.human.name()))
-                            .color(Color32::from_rgb(140, 220, 140))
-                            .strong(),
-                    );
-                } else {
-                    ui.colored_label(
-                        Color32::from_rgb(140, 220, 140),
-                        format!("引擎思考中…（引擎执{}）", play.human.opposite().name()),
-                    );
-                }
-            }
-            _ => {
-                ui.label(format!("轮到{}", board.to_play().name()));
-            }
-        }
-        ui.separator();
-        ui.label(format!(
-            "黑提 {} · 白提 {}",
-            board.captured_by(Stone::Black),
-            board.captured_by(Stone::White),
-        ));
-        if let Some(text) = branch_notice {
-            ui.separator();
-            ui.colored_label(BRANCH, text);
-        }
-        if let Some(reason) = notice {
-            ui.separator();
-            ui.colored_label(NOTICE, format!("非法落子：{reason}"));
-        }
-        ui.separator();
-        ui.weak("点击落子 · ← 后退 · → 前进 · Ctrl+←/→ 切分支 · Ctrl+Z 悔棋");
-    });
+
+                    // 段 1：手数（含回看标记）。
+                    segment(ui, &|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "第 {} / {} 手",
+                                    board.cursor(),
+                                    board.line_len()
+                                ))
+                                .strong(),
+                            );
+                            if board.cursor() < board.line_len() {
+                                ui.label(RichText::new("回看中").color(BRANCH).size(11.0));
+                            }
+                        });
+                    });
+
+                    // 段 2：行棋方 / 对弈轮次。
+                    segment(ui, &|ui| match play {
+                        Some(play) if play.mode => {
+                            if play.finished(board) {
+                                let text = match play.resigned {
+                                    Some(side) => {
+                                        format!("{}认输，{}", side.name(), resign_text(side))
+                                    }
+                                    None => "对局结束：双方连续弃着".to_owned(),
+                                };
+                                ui.colored_label(theme::colors::WARN, text);
+                            } else if board.to_play() == play.human {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "轮到你（你执{}）",
+                                        play.human.name()
+                                    ))
+                                    .color(theme::colors::OK)
+                                    .strong(),
+                                );
+                            } else {
+                                ui.colored_label(
+                                    theme::colors::OK,
+                                    format!("引擎思考中…（引擎执{}）", play.human.opposite().name()),
+                                );
+                            }
+                        }
+                        _ => {
+                            ui.label(format!("轮到{}", board.to_play().name()));
+                        }
+                    });
+
+                    // 段 3：提子。
+                    segment(ui, &|ui| {
+                        ui.label(RichText::new("提子").weak().size(11.0));
+                        ui.label(format!(
+                            "黑 {} · 白 {}",
+                            board.captured_by(Stone::Black),
+                            board.captured_by(Stone::White),
+                        ));
+                    });
+
+                    // 段 4：建分支提示（有才显示）。
+                    if let Some(text) = branch_notice {
+                        segment(ui, &|ui| {
+                            ui.colored_label(BRANCH, text);
+                        });
+                    }
+
+                    // 段 5：非法落子提示（有才显示）。
+                    if let Some(reason) = notice {
+                        segment(ui, &|ui| {
+                            ui.colored_label(NOTICE, format!("非法落子：{reason}"));
+                        });
+                    }
+
+                    // 段 6：快捷键说明（弱色小字）。
+                    ui.weak("点击落子 · ← 后退 · → 前进 · Ctrl+←/→ 切分支 · Ctrl+Z 悔棋");
+                });
+        },
+    );
 }

@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::board::{Board, IllegalReason, Size, Stone};
-use crate::engine::{load_settings, save_settings, Difficulty, EngineConfig};
+use crate::engine::{Difficulty, EngineConfig, load_settings, save_settings};
 use crate::play::{self, GameSetup, PlayState};
 use crate::portal::{FileDialog, PortalEvent};
 use crate::sgf::{GameMeta, load_from_bytes, save_to_file};
@@ -163,18 +163,19 @@ impl PendingConfirm {
             Self::NewGame(_) => "开始新对局会替换原谱".to_owned(),
             Self::None => String::new(),
         };
-        format!(
-            "{base}，{copies} 份研究副本将被丢弃，其中 {moves} 手研究成果无法恢复。继续吗？"
-        )
+        format!("{base}，{copies} 份研究副本将被丢弃，其中 {moves} 手研究成果无法恢复。继续吗？")
     }
 }
 
 impl GuanqiApp {
     /// 在 eframe 创建阶段完成一次性初始化（主题、字体、引擎启动、portal 探测）。
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // 深色主题，与项目目标系统环境一致。
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        // 深色主题：在默认深色基础上应用观棋的统一视觉（琥珀强调、
+        // 分层背景、按钮三态与圆角），启动时一次性设置，不逐帧重设。
+        cc.egui_ctx.set_visuals(ui::theme::visuals());
         let fonts_ok = ui::install_cjk_fonts(&cc.egui_ctx);
+        // 字号 / 间距表依赖字体就位后设置（覆盖 egui 默认值）。
+        ui::theme::apply_spacing(&cc.egui_ctx);
 
         // 事件入队时唤醒重绘（egui::Context 可克隆且 Send + Sync）。
         let ctx = cc.egui_ctx.clone();
@@ -277,7 +278,8 @@ impl GuanqiApp {
             .as_ref()
             .map(|meta| default_sgf_name(&meta.source))
             .unwrap_or_else(|| "guanqi.sgf".to_owned());
-        match FileDialog::save_file("另存棋谱（SGF）", &default_name, Some(self.waker.clone())) {
+        match FileDialog::save_file("另存棋谱（SGF）", &default_name, Some(self.waker.clone()))
+        {
             Ok(dialog) => {
                 self.dialog = Some((dialog, PendingDialog::Save));
                 self.save_notice = None;
@@ -318,8 +320,7 @@ impl GuanqiApp {
         };
         match load_from_bytes(&path, &bytes) {
             Err(err) => {
-                self.load_notice =
-                    Some(LoadNotice::Failed(format!("打开棋谱失败：{err}")));
+                self.load_notice = Some(LoadNotice::Failed(format!("打开棋谱失败：{err}")));
             }
             Ok(loaded) => {
                 let (warning, partial) = (loaded.warning.clone(), loaded.partial);
@@ -351,9 +352,9 @@ impl GuanqiApp {
                     Some(warning) if partial => LoadNotice::Warn(format!(
                         "已部分载入 {size}（全树共 {moves} 手）：{warning}"
                     )),
-                    Some(warning) => LoadNotice::Ok(format!(
-                        "已载入 {size}（全树共 {moves} 手，{warning}）"
-                    )),
+                    Some(warning) => {
+                        LoadNotice::Ok(format!("已载入 {size}（全树共 {moves} 手，{warning}）"))
+                    }
                     None => LoadNotice::Ok(format!("已载入 {size} 棋谱，全树共 {moves} 手。")),
                 };
                 // 顺带说明副本去向：副本的「-副本」元信息随棋盘替换失效，
@@ -507,7 +508,10 @@ impl GuanqiApp {
         let mut total = self
             .others
             .iter()
-            .filter_map(|doc| doc.from_move.map(|from| doc.board.move_count().saturating_sub(from)))
+            .filter_map(|doc| {
+                doc.from_move
+                    .map(|from| doc.board.move_count().saturating_sub(from))
+            })
             .sum::<usize>();
         if let Some(from) = self.active_from_move {
             total += self.board.move_count().saturating_sub(from);
@@ -517,7 +521,10 @@ impl GuanqiApp {
 
     /// 副本个数（载入 / 新对局的确认文案用；活动文档若是副本也计入）。
     fn copy_count(&self) -> usize {
-        self.others.iter().filter(|doc| doc.from_move.is_some()).count()
+        self.others
+            .iter()
+            .filter(|doc| doc.from_move.is_some())
+            .count()
             + usize::from(self.active_from_move.is_some())
     }
 
@@ -617,11 +624,7 @@ impl GuanqiApp {
     /// 切换到原谱（`others` 中 `from_move == None` 的那份）；已在原谱或
     /// 原谱不在列表时静默不动。
     fn switch_to_original(&mut self) {
-        if let Some(index) = self
-            .others
-            .iter()
-            .position(|doc| doc.from_move.is_none())
-        {
+        if let Some(index) = self.others.iter().position(|doc| doc.from_move.is_none()) {
             let number = self.others[index].number;
             self.switch_doc(number);
         }
@@ -652,10 +655,13 @@ impl GuanqiApp {
                 .active_from_move
                 .map(|from| self.board.move_count().saturating_sub(from));
         }
-        self.others.iter().find(|doc| doc.number == number).and_then(|doc| {
-            doc.from_move
-                .map(|from| doc.board.move_count().saturating_sub(from))
-        })
+        self.others
+            .iter()
+            .find(|doc| doc.number == number)
+            .and_then(|doc| {
+                doc.from_move
+                    .map(|from| doc.board.move_count().saturating_sub(from))
+            })
     }
 
     /// 侧栏文档列表（原谱在前、副本按编号升序）：活动文档 + `others`
@@ -827,7 +833,11 @@ impl eframe::App for GuanqiApp {
         // 文档列表（侧栏「棋谱」区切换入口；空盘时为空列表）。
         let doc_entries = self.doc_entries();
         egui::Panel::right("analysis_panel")
-            .default_size(240.0)
+            .default_size(280.0)
+            // 宽度硬限制：卡片化内容下某些子控件会逐帧把面板自然宽度
+            // 撑大（棘轮效应），不设上限时面板会吃满整个窗口。限制后
+            // 拖拽仍可在 180~420 间调整，但永远不会挤没棋盘。
+            .size_range(180.0..=420.0)
             .resizable(true)
             .show(ui, |ui| {
                 panel_action = analysis_panel::show(
@@ -859,8 +869,11 @@ impl eframe::App for GuanqiApp {
             analysis_panel::PanelAction::Focus { at, ghosts } => {
                 // 再点同一行取消定位。
                 let same = self.overlay.focus.as_ref().is_some_and(|f| f.at == at);
-                self.overlay.focus =
-                    if same { None } else { Some(overlay::Focus { at, ghosts }) };
+                self.overlay.focus = if same {
+                    None
+                } else {
+                    Some(overlay::Focus { at, ghosts })
+                };
             }
             // 人类弃着：与引擎弃着走同一入口（谱树挂弃着子节点）。
             analysis_panel::PanelAction::HumanPass => {
@@ -929,11 +942,12 @@ impl eframe::App for GuanqiApp {
                 });
         }
 
-            egui::CentralPanel::default().show(ui, |ui| {
-                // 顶部一行标识；设置入口靠右。
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("观棋").size(20.0).strong());
-                    if !self.fonts_ok {
+        egui::CentralPanel::default().show(ui, |ui| {
+            // 顶部一行标识 + 主操作按钮：主按钮（新对局）用琥珀填充强调，
+            // 设置为普通按钮；标题与按钮之间保持层次。
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("观棋").size(20.0).strong());
+                if !self.fonts_ok {
                     ui.colored_label(
                         egui::Color32::from_rgb(255, 190, 90),
                         "未找到中文字体，中文将显示为方框。\
@@ -944,7 +958,10 @@ impl eframe::App for GuanqiApp {
                     if ui.button("设置…").clicked() {
                         self.settings_open = !self.settings_open;
                     }
-                    if ui.button("新对局…").clicked() {
+                    let new_game = egui::Button::new(egui::RichText::new("新对局…").strong())
+                        .fill(ui::theme::colors::ACCENT_DIM)
+                        .stroke(egui::Stroke::new(1.0, ui::theme::colors::ACCENT_BAR));
+                    if ui.add(new_game).clicked() {
                         self.new_game_open = true;
                     }
                 });
@@ -1004,9 +1021,7 @@ impl eframe::App for GuanqiApp {
             // 确认框文案动态取当前值：丢弃单份副本时列该副本份数与手数；
             // 载谱 / 新对局列全部将丢弃的副本与研究成果。
             let (copies, moves) = match &self.pending_confirm {
-                PendingConfirm::DropCopy { number } => {
-                    (1, self.doc_research(*number).unwrap_or(0))
-                }
+                PendingConfirm::DropCopy { number } => (1, self.doc_research(*number).unwrap_or(0)),
                 _ => (self.copy_count(), self.research_moves()),
             };
             let ctx = ui.ctx().clone();
@@ -1079,7 +1094,8 @@ impl eframe::App for GuanqiApp {
             && !play::two_passes(&self.board)
             && self.board.to_play() != self.play.human
             && self.board.cursor() == self.board.line_len();
-        self.analysis.sync(&self.board, &self.engine_cfg, self.komi, want_play_query);
+        self.analysis
+            .sync(&self.board, &self.engine_cfg, self.komi, want_play_query);
         // 局面变化会先作废快照（见 AnalysisState::sync），借此时机清除定位高亮。
         if self.analysis.snapshot.is_none() {
             self.overlay.focus = None;
@@ -1095,7 +1111,8 @@ impl eframe::App for GuanqiApp {
             self.play.mode,
             self.play.human,
             &self.board,
-            self.analysis.play_snapshot(&self.board, self.engine_cfg.play_difficulty),
+            self.analysis
+                .play_snapshot(&self.board, self.engine_cfg.play_difficulty),
             engine_ready,
         );
         // 认输状态独立短路：决策函数只看棋盘，看不到 resigned。

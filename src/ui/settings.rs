@@ -163,10 +163,15 @@ fn body(ui: &mut Ui, state: &mut SettingsUi, cfg: &mut EngineConfig, action: &mu
 
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        if ui.button("保存").clicked() {
+        // 两按钮等宽（去掉总间距后均分可用宽），主操作「保存并重启引擎」
+        // 用琥珀描边强调。
+        let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+        if ui.add_sized([width, 0.0], egui::Button::new("保存")).clicked() {
             state.save(cfg);
         }
-        if ui.button("保存并重启引擎").clicked()
+        let restart = egui::Button::new("保存并重启引擎")
+            .stroke(egui::Stroke::new(1.0, crate::ui::theme::colors::ACCENT_BAR));
+        if ui.add_sized([width, 0.0], restart).clicked()
             && state.save(cfg)
         {
             *action = SettingsAction::ApplyRestart;

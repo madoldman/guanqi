@@ -134,8 +134,15 @@ fn body(
         ui.weak("让子局：黑棋按星位预摆，白方先行。");
     }
 
+    // 主按钮：琥珀填充全宽（与侧栏「新对局…」同一强调风格）。
+    let start_button = egui::Button::new(
+        egui::RichText::new("开始新对局").strong().color(crate::ui::theme::colors::ACCENT_BAR),
+    )
+    .fill(crate::ui::theme::colors::ACCENT_DIM)
+    .stroke(egui::Stroke::new(1.0, crate::ui::theme::colors::ACCENT_BAR))
+    .min_size(egui::vec2(ui.available_width(), 0.0));
     let start = ui
-        .add_enabled(disabled_reason(engine).is_none(), egui::Button::new("开始新对局"))
+        .add_enabled(disabled_reason(engine).is_none(), start_button)
         .on_disabled_hover_text(
             disabled_reason(engine).map_or_else(|| "".to_owned(), |reason| reason.to_owned()),
         );
