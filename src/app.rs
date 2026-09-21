@@ -232,9 +232,12 @@ impl GuanqiApp {
                 let (warning, partial) = (loaded.warning.clone(), loaded.partial);
                 let (board, meta) = loaded.into_parts();
                 // 新对局：清空分析快照与胜率历史（新对局不混旧曲线）；
-                // 定位高亮所指的局面已不存在，一并清除。
+                // 定位高亮所指的局面已不存在，一并清除；旧棋盘的临时提示
+                //（建分支等）随棋盘替换失效，同样清除。
                 self.analysis.reset();
                 self.overlay.focus = None;
+                self.branch_notice = None;
+                self.notice = None;
                 let size = board.size();
                 let moves = board.move_count();
                 self.board = board;
@@ -320,6 +323,9 @@ impl GuanqiApp {
             .expect("新对局的尺寸与星位坐标均合法，构造必然成功");
         self.analysis.reset();
         self.overlay.focus = None;
+        // 旧棋盘的临时提示随棋盘替换失效。
+        self.branch_notice = None;
+        self.notice = None;
         self.board = board;
         // 棋盘整体替换：树布局指纹换代（与载谱同理）。
         self.tree_epoch = self.tree_epoch.wrapping_add(1);
@@ -542,6 +548,8 @@ impl eframe::App for GuanqiApp {
             let ctx = ui.ctx().clone();
             let action = new_game::show(&ctx, &mut self.new_game_open, &mut self.new_game, &self.analysis.engine);
             if let new_game::NewGameAction::Start(setup) = action {
+                // 面板完成使命即关闭：否则继续浮在棋盘左上角遮挡落子。
+                self.new_game_open = false;
                 self.start_new_game(setup);
             }
         }
@@ -614,6 +622,12 @@ impl eframe::App for GuanqiApp {
         // （事件到达时 waker 已会触发立即重绘）。
         if matches!(self.analysis.engine, EngineStatus::Starting) || self.analysis.analyzing() {
             ctx.request_repaint_after(Duration::from_millis(500));
+        } else {
+            // 空闲兜底：复盘浏览时若没有任何 repaint 源（引擎空闲、无对话框、
+            // 无输入），egui 会进入无限期 idle；此时落子 / 导航等在「输入唤醒的
+            // 帧串」里推进的状态可能停在没有新帧可画的状态（用户可见「假死」，
+            // 改一次窗口大小才刷新）。低频唤醒保证最终状态总能落到屏幕上。
+            ctx.request_repaint_after(Duration::from_millis(700));
         }
     }
 

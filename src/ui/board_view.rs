@@ -245,8 +245,8 @@ fn handle_keyboard(
 /// 点击交叉点落子；非法时记录原因供状态行显示。
 ///
 /// 回看中（非叶节点）落子不再被拒绝，而是**新建变着分支**：
-/// 建了新分支（全树节点增加）时给轻提示；落到已有分支（直接切换过去）
-/// 或叶子上续棋则不打扰。
+/// 当前节点的子分支数增加（确实新建了兄弟分支）时给轻提示；落到已有
+/// 分支（直接切换过去）或叶子上续棋则不打扰。
 fn handle_click(
     board: &mut Board,
     notice: &mut Option<IllegalReason>,
@@ -256,12 +256,16 @@ fn handle_click(
 ) {
     let Some(pos) = pos else { return };
     let Some(at) = layout.hit_test(pos) else { return };
-    let nodes_before = board.move_count();
+    let children_before = board.child_count();
+    let moves_before = board.move_count();
     match board.play(at) {
         Ok(()) => {
             *notice = None;
-            // 全树着法数增加 = 这次落子新建了分支（而非切进已有分支）。
-            if board.move_count() > nodes_before {
+            // 「新建了变着分支」= 当前节点**确实多了一个兄弟分支**：
+            // play 后全树节点数增加（排除「切进已有分支」），且落子前当前
+            // 节点已有别的子（根 / 叶的第一个子是正常续棋，不是变着）。
+            // 注意 play 成功后游标已移到新节点，child_count 只能落子前取。
+            if board.move_count() > moves_before && children_before > 0 {
                 *branch_notice = Some(format!("已在第 {} 手创建变着", board.cursor() - 1));
             } else {
                 *branch_notice = None;

@@ -273,12 +273,26 @@ pub fn show(
             let first = (viewport.min.y / ROW_H).floor().max(0.0) as usize;
             let last = (viewport.max.y / ROW_H).ceil() as usize;
             let last = last.min(rows.len());
-            // 每行一次 allocate + painter_at：仅可见行进入绘制。
-            for ids in rows[first..last].iter().filter(|ids| !ids.is_empty()) {
-                let (line, _) = ui.allocate_exact_size(
+            // 每行一个绝对定位的子 Ui：content_ui 的原点在内容顶部（屏幕位置 =
+            // inner.min − offset，随滚动平移），行必须放在内容坐标 y = row*ROW_H
+            // 对应的屏幕位置——直接顺序 allocate 会全部叠在内容顶部（滚动后
+            // 可见区空白）。
+            let top = ui.min_rect().top();
+            let left = ui.min_rect().left();
+            for (row, ids) in rows[first..last]
+                .iter()
+                .enumerate()
+                .filter(|(_, ids)| !ids.is_empty())
+            {
+                let y = top + (first + row) as f32 * ROW_H;
+                let rect = Rect::from_min_size(
+                    Pos2::new(left, y),
                     Vec2::new(content_w.max(ui.available_width()), ROW_H),
-                    Sense::hover(),
                 );
+                let line = ui
+                    .new_child(egui::UiBuilder::new().max_rect(rect))
+                    .allocate_exact_size(rect.size(), Sense::hover())
+                    .0;
                 jump = jump.or(draw_line(ui, board, &nodes, ids, line, current));
             }
         });
