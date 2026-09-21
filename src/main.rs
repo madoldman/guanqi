@@ -6,7 +6,7 @@
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("观棋 — 围棋 AI 引擎图形前端")
+            .with_title("观棋")
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size([960.0, 640.0]),
         ..Default::default()
