@@ -11,12 +11,15 @@
 //! 另存把当前棋盘（含用户新建的变着）序列化为 SGF 写盘，未载入棋谱时
 //! 允许存出空盘谱。本类型只负责把配置、动作与界面连起来。
 //!
-//! 「研究副本」（[`StudyDoc`]）：从当前手把棋谱复制成一份**独立文档**来
-//! 随便试、随便研究，原谱完全不受影响。副本内容 = 预设局面 + 当前线前缀
-//! 重放（[`Board::linear_prefix`]），与原谱两份文档都驻留内存，切换即互换
-//! 主显示槽位（`board` / `loaded`）；副本的 [`GameMeta`] 克隆自原谱（注释
-//! 按局面签名自动跟随），`source` 换成「-副本」名供另存默认名。副本里
-//! 已有研究着法时，丢弃 / 载入新谱 / 新对局都先经 [`PendingConfirm`] 确认。
+//! 「研究副本」（[`Doc`] / `others` 列表）：从当前手把棋谱复制成一份**
+//! 独立文档**来随便试、随便研究，原谱完全不受影响；支持任意多份，且允许
+//! 「在副本里再开副本」。副本内容 = 预设局面 + 当前线前缀重放
+//! （[`Board::linear_prefix`]）。活动文档始终驻留主槽（`board` / `loaded`），
+//! 其余文档退入 `others`；切换即两份文档整体互换（零拷贝）。每份副本有
+//! 创建时分配的**稳定编号**（`number`，单调递增、丢弃不重编），标签
+//! 「研究副本 2」永远指同一份；`from_move` 固定为创建时前缀手数，研究
+//! 成果 = 树着法数超出它的部分。任何副本已有研究着法时，丢弃该副本 /
+//! 载入新谱 / 新对局都先经 [`PendingConfirm`] 确认。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -93,16 +96,20 @@ pub struct GuanqiApp {
     new_game: new_game::NewGameUi,
     /// 当前生效的贴目（新对局时设置；查询随局面发给引擎）。
     komi: f64,
-    /// 研究副本槽位（`Some` = 副本已创建，驻留内存可切换）。
+    /// 驻留内存的**非活动**文档列表（原谱与各研究副本轮流退入）。
     ///
-    /// 槽内是「另一份文档」：主槽显示原谱时存副本，主槽显示副本时存
-    /// 原谱（整体互换，两份树互不干扰）。`App::on_copy` 标志区分主槽
-    /// 当前是哪份；`from_move` 固定为创建时前缀手数，副本的研究成果
-    /// = 副本树着法数超出它的部分。
-    study: Option<StudyDoc>,
-    /// 主槽当前是否为研究副本（与 `study` 配合区分当前文档身份）。
-    on_copy: bool,
-    /// 待确认的破坏性动作（丢弃副本 / 带副本载谱 / 带副本开新局）。
+    /// 主槽始终显示当前文档；创建副本时当前文档整体推入本列表、新副本
+    /// 进主槽，切换即目标文档与主槽整体互换（零拷贝）。每项携带自己的
+    /// 身份（`from_move` / `number`），互换时身份随文档走，永不混淆。
+    others: Vec<Doc>,
+    /// 当前活动文档的创建前缀手数（`None` = 原谱，`Some(n)` = 自第 n 手
+    /// 起的副本）；与 `others` 里的文档互换时随文档走。
+    active_from_move: Option<usize>,
+    /// 当前活动文档的稳定编号（0 = 原谱；副本编号创建时分配、不复用）。
+    active_number: usize,
+    /// 下一个副本编号（单调递增；丢弃别的副本也不重编，避免用户混淆）。
+    next_number: usize,
+    /// 待确认的破坏性动作（丢弃副本 / 带副本研究载谱 / 带副本研究开新局）。
     pending_confirm: PendingConfirm,
 }
 
@@ -115,17 +122,19 @@ enum PendingDialog {
     Save,
 }
 
-/// 研究副本：与主显示槽位（`board` / `loaded`）互换的驻留文档。
-///
-/// 主槽始终显示当前文档；创建副本时主槽换入副本、本槽退存原谱，
-/// 切换时整体互换。槽里是哪份由 `App::on_copy` 标志区分。
-struct StudyDoc {
-    /// 另一份文档的棋盘（独立谱树，与主槽互换）。
+/// 驻留的非活动文档：与主显示槽位（`board` / `loaded`）互换的一份完整
+/// 文档（原谱或研究副本），身份随文档存储、互换时一起移动。
+struct Doc {
+    /// 该文档的棋盘（独立谱树，与主槽互换）。
     board: Board,
-    /// 另一份文档的元信息（`Option` 仅为与主槽 `loaded` 同型，互换零成本）。
+    /// 该文档的元信息（`Option` 仅为与主槽 `loaded` 同型，互换零成本）。
     meta: Option<GameMeta>,
-    /// 创建时的前缀手数（`cursor()`）；副本超出它的着法即研究成果。
-    from_move: usize,
+    /// 创建前缀手数：`None` = 原谱；`Some(n)` = 自第 n 手起的研究副本，
+    /// 树着法数超出 n 的部分即研究成果。
+    from_move: Option<usize>,
+    /// 创建时分配的稳定编号（原谱恒 0；副本从 1 起单调递增，丢弃其它
+    /// 副本后不重编，保证「研究副本 2」始终指同一份）。
+    number: usize,
 }
 
 /// 待确认的破坏性动作（涉及丢弃副本研究成果时先经用户确认）。
@@ -134,8 +143,8 @@ struct StudyDoc {
 enum PendingConfirm {
     #[default]
     None,
-    /// 丢弃研究副本本身。
-    DropCopy,
+    /// 丢弃指定编号的研究副本（编号在发起确认时锁定，确认时定位）。
+    DropCopy { number: usize },
     /// 确认后重新发起「打开棋谱」对话框（路径在确认后才产生）。
     LoadGame(#[allow(dead_code)] PathBuf),
     /// 确认后开始新对局。
@@ -143,16 +152,17 @@ enum PendingConfirm {
 }
 
 impl PendingConfirm {
-    /// 确认框说明文本（列出将丢失的研究着法数）。
-    fn text(&self, moves: usize) -> String {
+    /// 确认框说明文本：`copies` 为将丢弃的副本份数、`moves` 为其中
+    /// 无法恢复的研究着法总数（丢弃单份副本时 copies = 1）。
+    fn text(&self, copies: usize, moves: usize) -> String {
         let base = match self {
-            Self::DropCopy => "丢弃研究副本后".to_owned(),
+            Self::DropCopy { .. } => "丢弃该研究副本后".to_owned(),
             Self::LoadGame(_) => "载入新棋谱会替换原谱".to_owned(),
             Self::NewGame(_) => "开始新对局会替换原谱".to_owned(),
             Self::None => String::new(),
         };
         format!(
-            "{base}，研究副本将被丢弃，其中 {moves} 手研究成果无法恢复。继续吗？"
+            "{base}，{copies} 份研究副本将被丢弃，其中 {moves} 手研究成果无法恢复。继续吗？"
         )
     }
 }
@@ -207,8 +217,10 @@ impl GuanqiApp {
             new_game_open: false,
             new_game: new_game::NewGameUi::new(),
             komi: 7.5,
-            study: None,
-            on_copy: false,
+            others: Vec::new(),
+            active_from_move: None,
+            active_number: 0,
+            next_number: 1,
             pending_confirm: PendingConfirm::None,
         }
     }
@@ -221,7 +233,7 @@ impl GuanqiApp {
     ///   多个对话框同时压到用户屏幕上（且先弹的那个仍会投递结果），故必须
     ///   等当前选择完成后再发起新的。
     fn open_file_dialog(&mut self) {
-        // 副本有研究成果时先确认：载入会替换原谱、副本连同研究一起丢弃；
+        // 载入会替换原谱：所有副本（含活动若是副本）连同研究一起丢弃，
         // 用户选中的棋谱路径在确认前尚未取得，确认即重新发起对话框。
         if self.research_moves() > 0 {
             self.pending_confirm = PendingConfirm::LoadGame(PathBuf::new());
@@ -320,8 +332,9 @@ impl GuanqiApp {
                 // 用户已在确认框里同意（见 `open_file_dialog`），无成果
                 // 时静默丢弃并在提示里带一句。
                 let dropped = self.research_moves();
-                self.study = None;
-                self.on_copy = false;
+                self.others.clear();
+                self.active_from_move = None;
+                self.active_number = 0;
                 self.pending_confirm = PendingConfirm::None;
                 let size = board.size();
                 let moves = board.move_count();
@@ -424,8 +437,9 @@ impl GuanqiApp {
         self.notice = None;
         // 副本同样随原谱离开（研究成果已在「新对局」入口确认过）。
         let kept_research = self.research_moves();
-        self.study = None;
-        self.on_copy = false;
+        self.others.clear();
+        self.active_from_move = None;
+        self.active_number = 0;
         self.pending_confirm = PendingConfirm::None;
         self.board = board;
         // 棋盘整体替换：树布局指纹换代（与载谱同理）。
@@ -458,26 +472,36 @@ impl GuanqiApp {
 
     // ---- 研究副本 ----
 
-    /// 副本里用户的研究成果（超出创建时前缀的着法数）；无副本为 0。
-    /// 判据只看树规模：从既有节点上「切换分支 / 回看」不算新研究，
-    /// 落子与建分支（含后续整棵试验子树）都会增加全树着法数。
-    /// 副本可能在主槽（正在查看）也可能在副本槽（正在看原谱），按
-    /// `on_copy` 取对应棋盘；`from_move` 恒存于副本槽不随互换变化。
-    fn research_moves(&self) -> usize {
-        let Some(doc) = self.study.as_ref() else {
-            return 0;
-        };
-        let copy_moves = if self.on_copy {
-            self.board.move_count()
-        } else {
-            doc.board.move_count()
-        };
-        copy_moves.saturating_sub(doc.from_move)
+    /// 按编号在 `others` 里定位文档的下标。
+    fn other_index(&self, number: usize) -> Option<usize> {
+        self.others.iter().position(|doc| doc.number == number)
     }
 
-    /// 副本另存的默认文件名：原文件名主干 + 「-副本」（保留原扩展名前
-    /// 的主干，无主干时退回整名）。原始路径仅在主槽为**原谱**时有意义。
-    fn copy_default_name(&self) -> String {
+    /// 所有副本（含活动文档若是副本）各自超出创建前缀的研究着法总数。
+    /// 判据只看树规模：从既有节点上「切换分支 / 回看」不算新研究，
+    /// 落子与建分支（含后续整棵试验子树）都会增加全树着法数。
+    fn research_moves(&self) -> usize {
+        let mut total = self
+            .others
+            .iter()
+            .filter_map(|doc| doc.from_move.map(|from| doc.board.move_count().saturating_sub(from)))
+            .sum::<usize>();
+        if let Some(from) = self.active_from_move {
+            total += self.board.move_count().saturating_sub(from);
+        }
+        total
+    }
+
+    /// 副本个数（载入 / 新对局的确认文案用；活动文档若是副本也计入）。
+    fn copy_count(&self) -> usize {
+        self.others.iter().filter(|doc| doc.from_move.is_some()).count()
+            + usize::from(self.active_from_move.is_some())
+    }
+
+    /// 副本另存的默认文件名：**原谱**文件名主干 + 「-副本编号」（编号使
+    /// 多份副本可区分，如 `xxx-副本1.sgf`）。从原谱主干取（而非活动文档
+    /// 的名字），避免「在副本里再开副本」时嵌套出 `-副本1-副本2`。
+    fn copy_default_name(&self, number: usize) -> String {
         self.loaded
             .as_ref()
             .map(|meta| default_sgf_name(&meta.source))
@@ -485,22 +509,25 @@ impl GuanqiApp {
             .split_once('.')
             .filter(|(stem, _)| !stem.is_empty())
             .map_or_else(
-                || "研究副本.sgf".to_owned(),
-                |(stem, ext)| format!("{stem}-副本.{ext}"),
+                || format!("研究副本{number}.sgf"),
+                |(stem, ext)| format!("{stem}-副本{number}.{ext}"),
             )
     }
 
     /// 从当前手创建研究副本：预设局面 + 当前线前缀重放（独立树），元信息
-    /// 克隆自原谱（注释按局面签名自动跟随），`source` 换成「-副本」名。
-    /// 成功后自动切到副本。对弈模式在此关闭：两份文档不能同时自动应手。
+    /// 克隆自当前活动文档（注释按局面签名自动跟随），`source` 换成带编号
+    /// 的「-副本N」名。当前活动文档（原谱或某份副本皆可）整体推入
+    /// `others`，新副本进主槽并成为活动文档。对弈模式在此关闭：多份
+    /// 文档不能同时自动应手。
     ///
-    /// 前置条件（UI 已守卫，此处 assert 兜底）：已载入棋谱、当前在原谱、
-    /// 尚无副本。
+    /// 前置条件（UI 已守卫，此处 assert 兜底）：已载入棋谱。
     fn create_copy(&mut self) {
         assert!(
-            !self.on_copy && self.loaded.is_some() && self.study.is_none(),
+            self.loaded.is_some(),
             "创建副本的前置条件不满足（UI 入口应已置灰）"
         );
+        let number = self.next_number;
+        self.next_number += 1;
         let from_move = self.board.cursor();
         let board = self.board.linear_prefix(from_move);
         let mut meta = self
@@ -508,58 +535,166 @@ impl GuanqiApp {
             .as_ref()
             .expect("前置条件已检查 loaded 存在")
             .clone();
-        // 「另存为」默认名：xxx.sgf → xxx-副本.sgf（名字只影响默认名，
+        // 「另存为」默认名：xxx.sgf → xxx-副本N.sgf（名字只影响默认名，
         // 用户在另存对话框里可任意改名）。
-        meta.source = PathBuf::from(self.copy_default_name());
+        meta.source = PathBuf::from(self.copy_default_name(number));
         self.play = PlayState::review();
-        // 一次性完成「原谱退到副本槽、副本进主槽」：不经过
-        // `switch_to_copy`（那会再翻一次 `on_copy`）。
-        self.study = Some(StudyDoc { board: std::mem::replace(&mut self.board, board), meta: self.loaded.take(), from_move });
+        // 当前文档退入 others（带上身份），新副本进主槽。
+        self.others.push(Doc {
+            board: std::mem::replace(&mut self.board, board),
+            meta: self.loaded.take(),
+            from_move: self.active_from_move,
+            number: self.active_number,
+        });
         self.loaded = Some(meta);
-        self.on_copy = true;
+        self.active_from_move = Some(from_move);
+        self.active_number = number;
         self.tree_epoch = self.tree_epoch.wrapping_add(1);
         self.overlay.focus = None;
         self.branch_notice = None;
         self.notice = None;
         let notice = LoadNotice::Ok(format!(
-            "已创建研究副本（自第 {from_move} 手起），原谱保持不变；\
-             当前在研究副本中。"
+            "已创建研究副本 {number}（自第 {from_move} 手起），原谱保持不变；\
+             当前在研究副本 {number} 中。"
         ));
         self.load_notice = Some(notice);
     }
 
-    /// 切换到另一份文档（原谱 ↔ 研究副本）：主显示槽位与副本槽整体互换。
+    /// 切换到指定编号的文档：主显示槽位与 `others` 中该项**整体互换**
+    /// （棋盘、元信息、身份四字段一起走，零拷贝）。
     ///
-    /// **不 `analysis.reset()`**：胜率历史按局面签名索引，副本与原谱同一
-    /// 局面共享同一曲线；切换后由既有 `sync()` 检测局面签名变化并自动
-    /// 发起新查询。棋盘整体替换 → `tree_epoch` 换代（树布局不复用）；
-    /// 旧文档的临时提示与定位高亮一并清除。
-    fn switch_to_copy(&mut self) {
-        let Some(doc) = self.study.take() else {
+    /// **不 `analysis.reset()`**：胜率历史按局面签名索引，同一局面跨文档
+    /// 共享同一曲线；切换后由既有 `sync()` 检测局面签名变化并自动发起新
+    /// 查询。棋盘整体替换 → `tree_epoch` 换代（树布局不复用）；旧文档的
+    /// 临时提示与定位高亮一并清除。
+    ///
+    /// `swap_remove` 会让 `others` 内部顺序变化，但侧栏列表按编号排序
+    /// 显示（见 `doc_entries`），内部顺序不影响任何可见行为。
+    fn switch_doc(&mut self, number: usize) {
+        let Some(index) = self.other_index(number) else {
             return;
         };
-        let StudyDoc { board, meta, from_move } = doc;
-        self.study = Some(StudyDoc {
-            board: std::mem::replace(&mut self.board, board),
+        let incoming = self.others.swap_remove(index);
+        // 当前活动文档退回列表（带上身份），目标文档换进主槽。
+        self.others.push(Doc {
+            board: std::mem::replace(&mut self.board, incoming.board),
             meta: self.loaded.take(),
-            from_move,
+            from_move: self.active_from_move,
+            number: self.active_number,
         });
-        self.loaded = meta;
-        self.on_copy = !self.on_copy;
+        self.loaded = incoming.meta;
+        self.active_from_move = incoming.from_move;
+        self.active_number = incoming.number;
         self.tree_epoch = self.tree_epoch.wrapping_add(1);
         self.overlay.focus = None;
         self.branch_notice = None;
         self.notice = None;
     }
 
-    /// 丢弃研究副本（研究成果由 UI 层先经确认框守卫）：当前在副本时
-    /// 先切回原谱再丢弃，保证主槽最终显示原谱。
-    fn drop_copy(&mut self) {
-        if self.on_copy {
-            self.switch_to_copy();
+    /// 切换到原谱（`others` 中 `from_move == None` 的那份）；已在原谱或
+    /// 原谱不在列表时静默不动。
+    fn switch_to_original(&mut self) {
+        if let Some(index) = self
+            .others
+            .iter()
+            .position(|doc| doc.from_move.is_none())
+        {
+            let number = self.others[index].number;
+            self.switch_doc(number);
         }
-        self.study = None;
-        self.load_notice = Some(LoadNotice::Ok("研究副本已丢弃。".to_owned()));
+    }
+
+    /// 丢弃指定编号的研究副本（研究成果由 UI 层先经确认框守卫）。
+    /// 丢的是当前活动的副本时先切回原谱再移除，保证主槽最终显示有效文档。
+    fn drop_copy(&mut self, number: usize) {
+        if self.active_number == number && self.active_from_move.is_some() {
+            // 已载入棋谱时原谱必在 others（活动是副本的充要条件），
+            // 切换后目标副本随互换退入列表，统一按编号移除。
+            self.switch_to_original();
+        }
+        self.others.retain(|doc| doc.number != number);
+        let count = self.copy_count();
+        let notice = if count > 0 {
+            format!("研究副本 {number} 已丢弃，其余 {count} 份副本保持不变。")
+        } else {
+            format!("研究副本 {number} 已丢弃。")
+        };
+        self.load_notice = Some(LoadNotice::Ok(notice));
+    }
+
+    /// 指定编号文档的研究成果手数；编号不存在或为原谱时 `None`。
+    fn doc_research(&self, number: usize) -> Option<usize> {
+        if number == self.active_number {
+            return self
+                .active_from_move
+                .map(|from| self.board.move_count().saturating_sub(from));
+        }
+        self.others.iter().find(|doc| doc.number == number).and_then(|doc| {
+            doc.from_move
+                .map(|from| doc.board.move_count().saturating_sub(from))
+        })
+    }
+
+    /// 侧栏文档列表（原谱在前、副本按编号升序）：活动文档 + `others`
+    /// 合并而成，每项携带编号、显示名、创建前缀与研究成果。
+    /// `number` 即切换 / 丢弃动作的定位键；`active` 驱动列表高亮。
+    fn doc_entries(&self) -> Vec<analysis_panel::DocEntry> {
+        let mut entries = Vec::with_capacity(self.others.len() + 1);
+        // 活动文档：原谱显示文件名，副本显示「研究副本 N（自第 M 手起）」。
+        entries.push(analysis_panel::DocEntry {
+            number: self.active_number,
+            name: self.active_name(),
+            from_move: self.active_from_move,
+            research: self
+                .active_from_move
+                .map_or(0, |from| self.board.move_count().saturating_sub(from)),
+            active: true,
+        });
+        for doc in &self.others {
+            entries.push(analysis_panel::DocEntry {
+                number: doc.number,
+                name: match doc.from_move {
+                    None => self.original_name(),
+                    Some(from) => {
+                        let research = doc.board.move_count().saturating_sub(from);
+                        format!("研究副本 {}（自第 {from} 手起）", doc.number)
+                            + &if research > 0 {
+                                format!("，含 {research} 手研究成果")
+                            } else {
+                                String::new()
+                            }
+                    }
+                },
+                from_move: doc.from_move,
+                research: doc
+                    .from_move
+                    .map_or(0, |from| doc.board.move_count().saturating_sub(from)),
+                active: false,
+            });
+        }
+        // 原谱（number 0）置顶，副本按编号升序；编号创建时单调递增，
+        // 排序稳定即创建顺序。
+        entries.sort_by_key(|entry| entry.number);
+        entries
+    }
+
+    /// 活动文档的显示名（原谱 = 文件名；副本 = 「研究副本 N」）。
+    fn active_name(&self) -> String {
+        if self.active_from_move.is_none() {
+            return self.original_name();
+        }
+        format!("研究副本 {}", self.active_number)
+    }
+
+    /// 原谱的显示名（文件名，无文件名时给占位；未载入棋谱时不显示列表）。
+    fn original_name(&self) -> String {
+        self.loaded
+            .as_ref()
+            .and_then(|meta| meta.source.file_name())
+            .map_or_else(
+                || "（无文件名）".to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            )
     }
 }
 
@@ -605,17 +740,11 @@ impl eframe::App for GuanqiApp {
                         ui.close();
                     }
                     ui.separator();
-                    // 研究副本：仅原谱侧可用（空盘 / 已在副本 / 副本已存在
-                    // 时置灰，悬停说明原因）。
-                    let copy_disabled = match (&self.study, self.loaded.is_some()) {
-                        // 未载入棋谱：空盘无谱可复制。
-                        (_, false) => Some("未载入棋谱，无谱可复制"),
-                        (Some(_), _) => Some("研究副本已存在，可用「切换」来回查看"),
-                        // 已在副本中：副本里落子即建分支，无需再复制。
-                        (None, true) if self.on_copy => {
-                            Some("已在研究副本中，落子即创建试验分支")
-                        }
-                        (None, true) => None,
+                    // 研究副本：仅空盘置灰（原谱 / 任意副本里都可再开副本）。
+                    let copy_disabled = if self.loaded.is_none() {
+                        Some("未载入棋谱，无谱可复制")
+                    } else {
+                        None
                     };
                     let mut entry = ui.add_enabled(
                         copy_disabled.is_none(),
@@ -628,21 +757,11 @@ impl eframe::App for GuanqiApp {
                         self.create_copy();
                         ui.close();
                     }
-                    if let Some(_doc) = self.study.as_ref() {
-                        let target = if self.on_copy { "切换到原谱" } else { "切换到研究副本" };
-                        if ui.button(target).clicked() {
-                            self.switch_to_copy();
-                            ui.close();
-                        }
-                        if ui.button("丢弃研究副本").clicked() {
-                            // 有研究成果时经确认框（菜单收起后弹出）。
-                            if self.research_moves() > 0 {
-                                self.pending_confirm = PendingConfirm::DropCopy;
-                            } else {
-                                self.drop_copy();
-                            }
-                            ui.close();
-                        }
+                    // 副本存在时提供「切换到原谱」快捷入口；丢弃入口唯一
+                    // 化在侧栏文档列表（多副本下菜单项无法指向具体某份）。
+                    if self.active_from_move.is_some() && ui.button("切换到原谱").clicked() {
+                        self.switch_to_original();
+                        ui.close();
                     }
                 });
                 ui.menu_button("对局", |ui| {
@@ -682,16 +801,8 @@ impl eframe::App for GuanqiApp {
             play::mark_hopeless_shown(&mut self.play);
         }
         let mut panel_action = analysis_panel::PanelAction::None;
-        // 研究副本上下文（侧栏「棋谱」区标签与按钮；空盘时为 None）。
-        let copy_state = self.loaded.as_ref().map(|_| analysis_panel::CopyState {
-            exists: self.study.is_some(),
-            on_copy: self.on_copy,
-            from_move: self
-                .study
-                .as_ref()
-                .map_or(0, |doc| doc.from_move),
-            research_moves: self.research_moves(),
-        });
+        // 文档列表（侧栏「棋谱」区切换入口；空盘时为空列表）。
+        let doc_entries = self.doc_entries();
         egui::Panel::right("analysis_panel")
             .default_size(240.0)
             .resizable(true)
@@ -714,7 +825,7 @@ impl eframe::App for GuanqiApp {
                     &mut self.play,
                     &mut self.new_game_open,
                     hopeless_text.as_deref(),
-                    copy_state.as_ref(),
+                    &doc_entries,
                 );
             });
         match panel_action {
@@ -744,14 +855,17 @@ impl eframe::App for GuanqiApp {
             analysis_panel::PanelAction::OpenNewGame => {}
             // 从当前手创建研究副本（前置条件由入口置灰与 assert 双重守卫）。
             analysis_panel::PanelAction::CreateCopy => self.create_copy(),
-            // 原谱 ↔ 研究副本互换。
-            analysis_panel::PanelAction::SwitchDoc => self.switch_to_copy(),
-            // 有研究成果时先弹确认框（无成果直接丢弃）。
-            analysis_panel::PanelAction::DropCopy => {
-                if self.research_moves() > 0 {
-                    self.pending_confirm = PendingConfirm::DropCopy;
+            // 点侧栏列表项：切换到该文档（整体互换，零拷贝）。
+            analysis_panel::PanelAction::SwitchDoc(number) => self.switch_doc(number),
+            // 丢弃指定副本；有研究成果时先弹确认框（无成果直接丢弃）。
+            analysis_panel::PanelAction::DropCopy(number) => {
+                // 编号即身份：发起确认时锁定该副本的研究手数（确认期间
+                // 用户可能继续改动，但文案取确认框弹出时刻的值即可）。
+                let research = self.doc_research(number).unwrap_or(0);
+                if research > 0 {
+                    self.pending_confirm = PendingConfirm::DropCopy { number };
                 } else {
-                    self.drop_copy();
+                    self.drop_copy(number);
                 }
             }
             analysis_panel::PanelAction::None => {}
@@ -853,9 +967,16 @@ impl eframe::App for GuanqiApp {
         // 破坏性动作确认框（丢弃副本 / 带副本研究载谱 / 开新局）：
         // 模态小窗，确认才执行原动作；取消即清除，保持现状。
         if !matches!(self.pending_confirm, PendingConfirm::None) {
-            let moves = self.research_moves();
+            // 确认框文案动态取当前值：丢弃单份副本时列该副本份数与手数；
+            // 载谱 / 新对局列全部将丢弃的副本与研究成果。
+            let (copies, moves) = match &self.pending_confirm {
+                PendingConfirm::DropCopy { number } => {
+                    (1, self.doc_research(*number).unwrap_or(0))
+                }
+                _ => (self.copy_count(), self.research_moves()),
+            };
             let ctx = ui.ctx().clone();
-            let text = self.pending_confirm.text(moves);
+            let text = self.pending_confirm.text(copies, moves);
             let mut verdict: Option<bool> = None;
             let mut confirm_open = true;
             egui::Window::new("丢弃研究副本？")
@@ -879,7 +1000,7 @@ impl eframe::App for GuanqiApp {
                 Some(true) => {
                     let action = std::mem::take(&mut self.pending_confirm);
                     match action {
-                        PendingConfirm::DropCopy => self.drop_copy(),
+                        PendingConfirm::DropCopy { number } => self.drop_copy(number),
                         // 载入的路径在确认后才由用户选择，此处重新发起对话框。
                         PendingConfirm::LoadGame(_) => self.open_file_dialog_after_confirm(),
                         PendingConfirm::NewGame(setup) => self.start_new_game(setup),

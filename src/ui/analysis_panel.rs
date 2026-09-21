@@ -42,10 +42,10 @@ pub enum PanelAction {
     HumanResign,
     /// 从当前手创建研究副本（App 完成实际创建与切换）。
     CreateCopy,
-    /// 切换到另一份文档（原谱 ↔ 研究副本）。
-    SwitchDoc,
-    /// 丢弃研究副本（有研究成果时由 App 先弹确认框）。
-    DropCopy,
+    /// 点击文档列表项：切换到该编号的文档（App 完成整体互换）。
+    SwitchDoc(usize),
+    /// 丢弃该编号的研究副本（有研究成果时由 App 先弹确认框）。
+    DropCopy(usize),
     /// 确认「引擎无望」提示（不再重复提示；是否判引擎认输由用户另行决定）。
     AckHopeless,
     /// 打开「新对局」设置窗口。
@@ -81,16 +81,20 @@ impl LoadNotice {
     }
 }
 
-/// 侧栏「棋谱」区的研究副本上下文（由 App 现场派生传入）。
-pub struct CopyState {
-    /// 副本是否存在（存在时显示切换 / 丢弃按钮）。
-    pub exists: bool,
-    /// 当前主槽是否为研究副本（标签与按钮文案随之变化）。
-    pub on_copy: bool,
-    /// 创建副本时的前缀手数（标签「自第 N 手起」用）。
-    pub from_move: usize,
-    /// 副本里用户的研究成果（超出前缀的着法数）。
-    pub research_moves: usize,
+/// 侧栏「棋谱」区的文档列表项（由 App 从活动文档 + 驻留副本现场派生）。
+pub struct DocEntry {
+    /// 文档的稳定编号（原谱 0，副本创建时单调分配；切换 / 丢弃动作
+    /// 以此定位，丢弃其它副本后编号不变）。
+    pub number: usize,
+    /// 列表显示名：原谱 = 文件名；副本 = 「研究副本 N（自第 M 手起）
+    /// ，含 K 手研究成果」（有成果时）。
+    pub name: String,
+    /// 创建前缀手数（`None` = 原谱；副本为 `Some(n)`）。
+    pub from_move: Option<usize>,
+    /// 该副本的研究成果手数（原谱恒 0）。
+    pub research: usize,
+    /// 是否当前活动文档（列表高亮）。
+    pub active: bool,
 }
 
 /// 状态文本与配色。
@@ -136,7 +140,7 @@ fn eval_lines(root: &RootInfo) -> (String, String) {
 /// 操作的提示（无则对应段落不显示）。
 /// `play` 为人机对弈状态；`new_game_open` 为新对局窗口开关（共享）；
 /// `hopeless` 为引擎无望提示文本（`Some` = 显示提示与确认按钮）。
-/// `copy_state` 为研究副本上下文（空盘时为 `None`，入口禁用）。
+/// `docs` 为文档列表（原谱 + 各研究副本，活动项高亮；空盘时为空）。
 /// 注释可能很长，整体包一层垂直滚动，避免侧栏内容被裁剪。
 #[allow(clippy::too_many_arguments)]
 pub fn show(
@@ -157,7 +161,7 @@ pub fn show(
     play: &mut PlayState,
     new_game_open: &mut bool,
     hopeless: Option<&str>,
-    copy_state: Option<&CopyState>,
+    docs: &[DocEntry],
 ) -> PanelAction {
     egui::ScrollArea::vertical().show(ui, |ui| {
         panel_body(
@@ -178,7 +182,7 @@ pub fn show(
             play,
             new_game_open,
             hopeless,
-            copy_state,
+            docs,
         )
     })
     .inner
@@ -204,7 +208,7 @@ fn panel_body(
     play: &mut PlayState,
     new_game_open: &mut bool,
     hopeless: Option<&str>,
-    copy_state: Option<&CopyState>,
+    docs: &[DocEntry],
 ) -> PanelAction {
     let mut action = PanelAction::None;
     ui.heading("对局");
@@ -301,14 +305,17 @@ fn panel_body(
         ui.separator();
         ui.heading("棋谱");
 
-        // 当前文档标签（原谱 / 研究副本）与研究副本操作按钮：
-        // 让「现在看的是哪份」一眼可见，入口就近放置便于发现。
-        let (tag, tag_color) = match copy_state {
-            Some(state) if state.on_copy => (
-                format!("研究副本（自第 {} 手起）", state.from_move),
-                Color32::from_rgb(140, 220, 140),
-            ),
-            _ => ("原谱".to_owned(), Color32::from_rgb(120, 200, 255)),
+        // 当前文档标签（原谱 / 研究副本 N）：让「现在看的是哪份」一眼可见。
+        let tag = match docs.iter().find(|entry| entry.active) {
+            Some(entry) if entry.from_move.is_some() => {
+                format!("研究副本 {}（自第 {} 手起）", entry.number, entry.from_move.unwrap_or(0))
+            }
+            _ => "原谱".to_owned(),
+        };
+        let tag_color = if tag == "原谱" {
+            Color32::from_rgb(120, 200, 255)
+        } else {
+            Color32::from_rgb(140, 220, 140)
         };
         ui.label(RichText::new(tag).color(tag_color).strong());
 
@@ -349,40 +356,52 @@ fn panel_body(
             ui.label(text);
         }
 
-        // ---- 研究副本操作（空盘无谱可复制时给出可读提示）----
+        // ---- 文档列表（原谱 + 各研究副本；点击切换，副本可丢弃）----
+        // 列表放在侧栏滚动区内，副本多时随侧栏一起滚动。
         ui.add_space(4.0);
-        match copy_state {
-            None => {
+        match docs {
+            [] => {
                 ui.weak("打开棋谱后可从当前手复制研究副本。");
             }
-            Some(state) => {
-                ui.horizontal_wrapped(|ui| {
-                    if !state.exists {
-                        // 创建入口：仅原谱侧可用（副本已存在时切换即可回去）。
-                        if ui.button("复制为研究副本").clicked() {
-                            action = PanelAction::CreateCopy;
+            entries => {
+                ui.weak("点击切换文档：");
+                for entry in entries {
+                    ui.horizontal(|ui| {
+                        let (text, color) = if entry.active {
+                            (RichText::new(&entry.name).strong(), Color32::from_rgb(140, 220, 140))
+                        } else if entry.from_move.is_some() {
+                            (RichText::new(&entry.name), Color32::from_rgb(200, 200, 200))
+                        } else {
+                            // 非活动的原谱用淡蓝色与副本区分。
+                            (
+                                RichText::new(&entry.name),
+                                Color32::from_rgb(120, 200, 255),
+                            )
+                        };
+                        // 列表项即切换入口；当前活动项高亮且仍可点
+                        // （点了无副作用，切换到自己是空操作）。
+                        let label = ui.selectable_label(entry.active, text.color(color));
+                        if label.clicked() {
+                            action = PanelAction::SwitchDoc(entry.number);
                         }
-                    } else {
-                        // 标签显示另一份的身份：在副本 → 「切换到原谱」。
-                        let target =
-                            if state.on_copy { "切换到原谱" } else { "切换到研究副本" };
-                        if ui.button(target).clicked() {
-                            action = PanelAction::SwitchDoc;
+                        // 丢弃入口：仅副本有（原谱不可丢弃）；悬停说明成果。
+                        if entry.from_move.is_some() {
+                            let mut drop = ui.small_button("×");
+                            drop = drop.on_hover_text(if entry.research > 0 {
+                                format!("丢弃研究副本 {}（含 {} 手研究成果，将确认）", entry.number, entry.research)
+                            } else {
+                                format!("丢弃研究副本 {}", entry.number)
+                            });
+                            if drop.clicked() {
+                                action = PanelAction::DropCopy(entry.number);
+                            }
                         }
-                        let mut drop = ui.button("丢弃研究副本");
-                        if state.on_copy && state.research_moves > 0 {
-                            drop = drop.on_hover_text(format!(
-                                "副本含 {} 手研究成果，丢弃前将确认",
-                                state.research_moves
-                            ));
-                        }
-                        if drop.clicked() {
-                            action = PanelAction::DropCopy;
-                        }
-                    }
-                });
-                if state.on_copy && state.research_moves > 0 {
-                    ui.weak(format!("副本含 {} 手研究成果", state.research_moves));
+                    });
+                }
+                ui.add_space(2.0);
+                // 创建入口：任何已载入文档（原谱或副本）的当前手皆可再开副本。
+                if ui.button("复制为研究副本").clicked() {
+                    action = PanelAction::CreateCopy;
                 }
             }
         }
