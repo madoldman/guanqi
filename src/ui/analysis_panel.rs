@@ -18,7 +18,9 @@ use crate::engine::{Difficulty, EngineConfig, RootInfo};
 use crate::play::{PlayState, resign_text};
 use crate::sgf::GameMeta;
 
-use super::analysis::{AnalysisState, EngineStatus, Severity};
+use super::analysis::{
+    AnalysisState, EngineStatus, GameSummary, Severity, WORST_LIMIT,
+};
 use super::explain;
 use super::overlay::{self, Overlay};
 use super::theme;
@@ -97,6 +99,9 @@ pub enum PanelAction {
     StartBatch,
     /// 点了「取消快扫」：terminate 在飞批量查询并结束任务。
     CancelBatch,
+    /// 点了「局后统计」排行榜某行：跳转到该手（App 调
+    /// [`crate::board::Board::go_to`]，曲线 / 棋盘定位随局面联动）。
+    GotoTurn(usize),
 }
 
 /// 「打开棋谱」流程的用户可见提示（App 写入，随侧栏提示行显示）。
@@ -363,6 +368,10 @@ fn panel_body(
 
     // ---- 失误统计（TASKS 4.4）----
     card_mistakes(ui, analysis, board);
+
+    // ---- 局后统计（吻合度 + 最差 N 手，与失误卡片信息互补不重复：
+    // 失误卡片 = 目差损失分级计数；本卡片 = visits 口径吻合度 + 排行跳转）----
+    card_summary(ui, analysis, board, &mut action);
 
     // ---- 整谱快扫（批量分析当前线，曲线自动填满）----
     card_batch(ui, analysis, board, &mut action);
@@ -1140,6 +1149,168 @@ fn card_mistakes(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
             ui.weak("棋盘标注：目差损失 ≥1 目疑问手 / ≥3 目失误 / ≥6 目恶手");
         }
     });
+}
+
+/// 「局后统计」卡片：黑白吻合度 + 最差 N 手排行榜（可点击跳转）。
+///
+/// 与「失误」卡片互补不重复：失误卡片按**目差损失**分级计数（走子前后
+/// 局面差），本卡片按 **visits 占比**（吻合度，LizzieYzy `percentsMatch`）
+/// 汇总整局。排行榜排序键 = **胜率损失降序**（LizzieYzy 差异手
+/// `diffWinrate` 口径），损失与失误卡片同源（走子前后历史点差），
+/// 行内附带显示吻合度；行色用与失误卡片 / 棋盘标注同一套严重程度配色。
+/// 数据来源取决于分析深度——快扫 40 visits 的候选表比交互深度
+/// （如 300 visits）短，吻合度系统性偏低，tooltip 明示。
+fn card_summary(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &mut PanelAction) {
+    card(ui, |ui| {
+        theme::section_title(ui, "局后统计");
+        let summary = analysis.game_summary(board);
+        let GameSummary {
+            total,
+            analyzed_black,
+            analyzed_white,
+            match_black,
+            match_white,
+            enough_black,
+            enough_white,
+            worst,
+        } = summary;
+        if total == 0 {
+            ui.weak("—");
+            return;
+        }
+        // 吻合度行：黑 / 白并列；样本不足（已分析 < 10 手）不给数字，
+        // 显示「样本不足」（LizzieYzy 同门槛，避免少数手的均值冒充整盘）。
+        let black_cell = match_cell(match_black, analyzed_black, enough_black);
+        let white_cell = match_cell(match_white, analyzed_white, enough_white);
+        ui.horizontal(|ui| {
+            let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+            let tip = match_tip();
+            ui.allocate_ui(Vec2::new(width, 0.0), |ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("黑吻合度").weak());
+                    ui.label(RichText::new(black_cell).strong());
+                });
+            })
+            .response.on_hover_text(format!("黑方 {tip}"));
+            ui.allocate_ui(Vec2::new(width, 0.0), |ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("白吻合度").weak());
+                    ui.label(RichText::new(white_cell).strong());
+                });
+            })
+            .response.on_hover_text(format!("白方 {tip}"));
+        });
+        // 计数口径如实展示（沿用失误卡片「已分析 N / M 手」写法）：
+        // 未分析的手不进吻合度分母，样本门槛 10 手。
+        ui.weak(format!(
+            "黑 {analyzed_black} 手 / 白 {analyzed_white} 手已分析（共 {total} 手，\
+             未分析的不计入）"
+        ));
+        ui.weak("不足 10 手不给平均值（样本不足）。");
+
+        // 最差 N 手排行榜：胜率损失降序（LizzieYzy 差异手 diffWinrate
+        // 口径），行内附吻合度；行点击跳转。
+        ui.add_space(2.0);
+        if worst.is_empty() {
+            ui.weak("最差手：暂无已分析的手。");
+        } else {
+            ui.weak(format!(
+                "最差 {} 手（按胜率损失，点击跳转）：",
+                worst.len().min(WORST_LIMIT)
+            ));
+            for entry in &worst {
+                worst_row(ui, *entry, action);
+            }
+        }
+        ui.weak(
+            "吻合度 ∝ 分析深度：快扫（40 visits）候选表短，数值偏低；\
+             不同深度的数字不可互比。",
+        );
+    });
+}
+
+/// 吻合度单元格文本：样本不足时如实写「样本不足」，否则给百分比。
+/// 数字与「未分析」严格区分（未分析的手不进分母，见 `game_summary`）。
+fn match_cell(ratio: f64, analyzed: usize, enough: bool) -> String {
+    if analyzed == 0 {
+        "未分析".to_owned()
+    } else if !enough {
+        "样本不足".to_owned()
+    } else {
+        format!("{:.1}%", ratio * 100.0)
+    }
+}
+
+/// 吻合度的口径说明（hover 文案，LizzieYzy 原文 + 数据来源警示）。
+fn match_tip() -> String {
+    "吻合度：以计算量为标准，衡量实际棋局与 AI 的差别（实际落子在候选表中的 \
+     visits 占比，整局平均）。数据来源取决于分析深度——整谱快扫（40 visits）\
+     的候选表比深度分析（如 300 visits）短，吻合度系统性偏低，不同深度的数字\
+     不要互比。"
+        .to_owned()
+}
+
+/// 排行榜一行：手数 / 行棋方 / 胜率损失 + 吻合度，自绘全宽按钮行
+/// （点击跳转该手）。文字用 [`overlay::severity_color`] 上色——与
+/// 「失误」卡片计数、棋盘失误标注同一套严重程度配色，两张卡片与棋盘
+/// 三处一眼对上；三种档位色（黄 / 橙 / 红）在深色底上均已可读，无需提亮。
+/// Good / Fine 兜底色偏灰暗，这里统一提亮为中性灰（见行内说明）。
+fn worst_row(ui: &mut Ui, entry: crate::ui::analysis::WorstMove, action: &mut PanelAction) {
+    // 胜率损失为行棋方视角、正 = 亏损：负值意味着该手实际不亏（排序垫底
+    // 的噪声手），带符号如实显示。
+    let loss_text = if entry.winrate_loss >= 0.0 {
+        format!("+{:.1}%", entry.winrate_loss * 100.0)
+    } else {
+        format!("{:.1}%", entry.winrate_loss * 100.0)
+    };
+    let text = format!(
+        "第 {} 手 {}　胜率 {}　吻合度 {:.1}%",
+        entry.turn,
+        entry.player.name(),
+        loss_text,
+        entry.match_ratio * 100.0
+    );
+    let height = 22.0;
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
+    let painter = ui.painter_at(rect);
+    let hover = response.hovered() || response.is_pointer_button_down_on();
+    painter.rect_filled(rect, 5.0, if hover {
+        Color32::from_rgb(52, 57, 70)
+    } else {
+        Color32::from_rgb(39, 43, 53)
+    });
+    // Good / Fine 的 severity_color 兜底灰（140,140,148）在行底色上偏暗、
+    // 与 hover 亮字冲突，提亮为中性灰；疑问手及以上用原档位色不动。
+    let text_color = match entry.severity {
+        Severity::Good | Severity::Fine => Color32::from_rgb(214, 218, 226),
+        _ => overlay::severity_color(entry.severity),
+    };
+    painter.text(
+        rect.min + Vec2::new(10.0, height / 2.0),
+        Align2::LEFT_CENTER,
+        &text,
+        FontId::monospace(12.0),
+        if hover {
+            Color32::from_rgb(255, 214, 140)
+        } else {
+            text_color
+        },
+    );
+    let response = response.on_hover_text(format!(
+        "第 {} 手（{}）：胜率损失 {:.1}%、目差损失 {:.1} 目，{}（{}）。\
+         排序口径 = LizzieYzy 差异手 diffWinrate：胜率损失最大的手排最前，\
+         正 = 行棋方亏损；吻合度只是附带显示，不是排序键。点击跳转到该手",
+        entry.turn,
+        entry.player.name(),
+        entry.winrate_loss * 100.0,
+        entry.score_loss,
+        entry.severity.name(),
+        if entry.severity.is_marked() { "棋盘有标注" } else { "棋盘不标注" },
+    ));
+    if response.clicked() {
+        *action = PanelAction::GotoTurn(entry.turn);
+    }
 }
 
 /// 「叠加层」卡片：各层开关（复选框）与胜率色阶图例。

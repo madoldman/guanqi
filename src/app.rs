@@ -984,6 +984,12 @@ impl eframe::App for GuanqiApp {
             analysis_panel::PanelAction::CancelBatch => {
                 self.analysis.cancel_batch();
             }
+            // 局后统计排行榜点击：跳转到该手（1 起手数 → go_to 的 0..=len
+            // 口径直接对应：go_to(n) = 第 n 手之后的盘面）。跳转后局面变化
+            // 由既有 sync 检测并自动发起新查询，曲线 / 棋盘定位随游标联动。
+            analysis_panel::PanelAction::GotoTurn(turn) => {
+                self.board.go_to(turn);
+            }
         }
 
         // 胜率曲线底部面板（TASKS 4.3）：隐藏时不创建，零额外计算；

@@ -89,6 +89,12 @@ const SEVERITY_BLUNDER_MIN: f64 = 6.0;
 
 /// 逐手历史的一个数据点：第 `turn` 手之后局面的终态分析结果。
 /// 胜率 / 目差为**黑方视角**（与 [`Snapshot`] 同一口径，不翻转）。
+///
+/// 每手的**候选表快照**不放在这里：本类型是 `Copy`，在 [`Self::line_points`]
+/// （曲线 / 失误标注 / 讲解每帧各调一次）里整段复制流转，塞进 `Vec`
+/// 会让每个调用点付出搬运整张表的代价。候选表放独立的
+/// [`AnalysisState::candidates`]（同签名键控、同生命周期、同一次覆盖
+/// 判定写入，见该字段文档）。
 #[derive(Clone, Copy, Debug)]
 pub struct HistoryPoint {
     /// 手数（0 = 初始空盘）。
@@ -99,6 +105,78 @@ pub struct HistoryPoint {
     pub score_lead: f64,
     /// 产出该结果的搜索量（覆盖判定依据：visits 更多的后到覆盖先到的）。
     pub visits: u64,
+}
+
+/// 一个局面的**候选表快照**（局后统计的吻合度数据源）：与
+/// [`HistoryPoint`] 同签名键控、由同一次终态报告同步写入。
+///
+/// 只存「实际落子是否被引擎想到 / 想到了多少」所需的最小集——存整张
+/// (落点, visits) 列表而非只存单点的 visits，是为了与行棋方解耦：
+/// 行棋方要重放棋谱才知道，而这里按局面签名直接取用。
+#[derive(Clone, Debug)]
+pub struct CandidateSnap {
+    /// 候选落点及其 visits（按引擎 `order` 排序；弃着不在棋盘上、对
+    /// 「实际落子是否被想到」无贡献，不存）。
+    pub moves: Vec<(Coord, u64)>,
+    /// 候选表 visits 总和（吻合度分母，LizzieYzy `percentsMatch` 口径）。
+    pub total_visits: u64,
+}
+
+/// LizzieYzy 吻合度的样本门槛（已分析手数，黑白各自独立计数）：
+/// 低于此值不给平均数，显示「样本不足」（照搬 LizzieYzy，避免用三四手
+/// 的均值冒充整盘水平）。
+pub const MATCH_MIN_MOVES: usize = 10;
+
+/// 最差手排行榜长度：LizzieYzy 取 Top10，侧栏空间小取 Top5。
+pub const WORST_LIMIT: usize = 5;
+
+/// 局后统计（黑白吻合度 + 最差 N 手，[`AnalysisState::game_summary`]）。
+/// 「未知」与「0」严格区分：`analyzed` 只计有候选表快照的手，
+/// 未分析的手不进吻合度分母；在候选表里的手才有 visits 占比。
+#[derive(Clone, Debug, Default)]
+pub struct GameSummary {
+    /// 当前线总手数。
+    pub total: usize,
+    /// 黑方已分析手数（有候选表快照；未分析的不计）。
+    pub analyzed_black: usize,
+    /// 白方已分析手数。
+    pub analyzed_white: usize,
+    /// 黑方吻合度 [0,1]（实际落子 visits / 候选表总 visits 的平均；
+    /// `analyzed_black == 0` 时无意义）。
+    pub match_black: f64,
+    /// 白方吻合度 [0,1]。
+    pub match_white: f64,
+    /// 黑白各自已分析手数是否达到样本门槛（[`MATCH_MIN_MOVES`]）。
+    pub enough_black: bool,
+    pub enough_white: bool,
+    /// 最差 N 手（**按胜率损失降序**，并列按手数升序；LizzieYzy 差异手
+    /// `diffWinrate` 口径，见 [`WorstMove`]）。只收走子前后历史点齐全、
+    /// 能算出损失的手——未知的不进、不臆造 0。不足 [`WORST_LIMIT`] 条时
+    /// 有多少给多少。
+    pub worst: Vec<WorstMove>,
+}
+
+/// 最差手排行榜的一项。**排序键 = 胜率损失降序**（LizzieYzy 差异手
+/// `diffWinrate` 口径：对局与 AI 分歧最大、行棋方胜率损失最大的手），
+/// 并列按手数升序。吻合度（`percentsMatch`）在 LizzieYzy 里是与差异手
+/// 并列的另一个独立数字，这里只作行内附带显示，**不是排序键**——
+/// 40 visits 快扫下吻合度大量并列 0，拿它排序会退化成「最早的几个 0% 手」。
+#[derive(Clone, Copy, Debug)]
+pub struct WorstMove {
+    /// 手数（1 起，跳转直接 [`crate::board::Board::go_to`]）。
+    pub turn: usize,
+    /// 行棋方。
+    pub player: Stone,
+    /// 胜率损失（行棋方视角，正 = 亏损；黑方视角差值 × 行棋方符号）。
+    /// 排序键。
+    pub winrate_loss: f64,
+    /// 目差损失（目，正 = 行棋方亏损），严重程度分级的依据。
+    pub score_loss: f64,
+    /// 严重程度分级（按目差损失定档，与「失误」卡片 / 棋盘标注同档）。
+    pub severity: Severity,
+    /// 该手吻合度 [0,1]（实际落子 visits / 候选表总 visits；落子不在
+    /// 候选表 = 0，真实低吻合，与「未分析」不同）。附带显示，非排序键。
+    pub match_ratio: f64,
 }
 
 /// 第 `turn` 手（1 起）的行棋方视角损失：由第 `turn − 1` 与第 `turn` 手后
@@ -504,6 +582,13 @@ pub struct AnalysisState {
     /// 曲线 / 失误统计（`ui::curve` / `ui::overlay`）经 [`Self::line_points`]
     /// 只取当前线上的点，缺口留空。
     history: HashMap<u64, HistoryPoint>,
+    /// 每个局面的**候选表快照**（局后统计吻合度用），键与 [`Self::history`]
+    /// 相同 = 局面签名。不并入 `HistoryPoint` 的理由：后者是 `Copy` 且在
+    /// `line_points()`（曲线 / 失误标注 / 讲解每帧各调一次）里整段复制，
+    /// 塞进 `Vec` 会让每帧白搬候选表（见类型文档）。
+    /// 生命周期与 `history` 严格一致：写入在同一个覆盖判定里同进退
+    /// （见 `record_history`），`reset()` 一并清空。
+    candidates: HashMap<u64, CandidateSnap>,
     handle: Option<Engine>,
     inflight: Option<Inflight>,
     /// 上次发起查询时的局面签名（手数记录前缀）；`None` 表示尚未分析过。
@@ -544,6 +629,7 @@ impl AnalysisState {
             transient_error: None,
             last_log: None,
             history: HashMap::new(),
+            candidates: HashMap::new(),
             handle: None,
             inflight: None,
             analyzed_sig: None,
@@ -709,6 +795,106 @@ impl AnalysisState {
                 Severity::Good | Severity::Fine => {}
             }
         }
+        summary
+    }
+
+    /// 局后统计：黑白吻合度与最差 N 手。吻合度为 LizzieYzy
+    /// `percentsMatch` 口径（见 [`CandidateSnap`] 与模块内常量文档）；
+    /// 排行榜为 LizzieYzy 差异手 `diffWinrate` 口径（按胜率损失降序），
+    /// 损失与「失误」卡片同源（[`loss_from_points`]，走子前后历史点）。
+    ///
+    /// 匹配方向（/tmp/game-summary-notes.md §1 引擎实测钉死）：第 i 手
+    /// （0 基）用 **turn = i** 的候选表匹配——`turnNumber=t` 报告的
+    /// `moveInfos` 是「走了 t 手之后」局面（行棋方 = 第 t+1 手）的候选。
+    ///
+    /// 「未知」与「0」严格区分（项目铁律）：
+    /// - 吻合度：`turn = i` 无候选表快照 ⇒ 该手**未分析**，不进分母；
+    ///   有快照而实际落子不在表内 ⇒ 吻合度按 0 计（真实低吻合）。弃着
+    ///   手的落点为 `None`，无法匹配落点：有快照时按 0 计（引擎候选表
+    ///   本就不含弃着排序前列，实际弃着多半不合拍；诚实计 0，不臆造）。
+    ///   有快照但算不出损失的手仍计入吻合度分母（两种口径的数据源独立）。
+    /// - 排行榜：只收**走子前后历史点齐全、能算出损失**的手
+    ///   （[`loss_from_points`] 返回 `None` 的不进榜、不臆造 0）。
+    pub fn game_summary(&self, board: &Board) -> GameSummary {
+        let records = board.line_records();
+        let mut summary = GameSummary {
+            total: records.len(),
+            ..GameSummary::default()
+        };
+        // 吻合度按方累加；worst 只收「有快照且损失可算」的手再排序截断。
+        let mut sum = (0.0f64, 0.0f64);
+        let mut worst: Vec<WorstMove> = Vec::new();
+        // 与 line_points 同款滚动签名：points[i] = 走 i 手前、points[i+1] =
+        // 走 i 手后的历史点（None = 缺），损失取相邻两点差（同 loss_summary）。
+        let points = self.line_points(board);
+        let mut sig = 0xcbf2_9ce4_8422_2325;
+        for (i, record) in records.iter().enumerate() {
+            // 第 i 手的行棋方 = 该记录的 player；其候选表 = turn=i 局面
+            // （走了 i 手之后）的签名，滚动推进（初始 = 空盘签名）。
+            let snap = self.candidates.get(&sig);
+            if let Some(snap) = snap {
+                // 吻合度 = 实际落子在候选表里的 visits 占比；不在表内 = 0。
+                let ratio = if snap.total_visits > 0 {
+                    match record.action {
+                        Action::Place(at) => snap
+                            .moves
+                            .iter()
+                            .find(|(c, _)| *c == at)
+                            .map_or(0.0, |(_, v)| *v as f64 / snap.total_visits as f64),
+                        // 弃着无法匹配（见函数文档）：按 0 计。
+                        Action::Pass => 0.0,
+                    }
+                } else {
+                    0.0
+                };
+                match record.player {
+                    Stone::Black => {
+                        summary.analyzed_black += 1;
+                        sum.0 += ratio;
+                    }
+                    Stone::White => {
+                        summary.analyzed_white += 1;
+                        sum.1 += ratio;
+                    }
+                }
+                // 排行榜候选：损失可算才进（任一端历史点缺失 = 未知，不臆造 0）。
+                if let (Some(before), Some(after)) = (points[i], points[i + 1])
+                    && let Some(loss) = loss_from_points(i + 1, record.player, before, after)
+                {
+                    worst.push(WorstMove {
+                        turn: loss.turn,
+                        player: record.player,
+                        winrate_loss: loss.winrate_loss,
+                        score_loss: loss.score_loss,
+                        severity: loss.severity,
+                        match_ratio: ratio,
+                    });
+                }
+            }
+            hash_record(&mut sig, record);
+        }
+        summary.match_black = if summary.analyzed_black > 0 {
+            sum.0 / summary.analyzed_black as f64
+        } else {
+            0.0
+        };
+        summary.match_white = if summary.analyzed_white > 0 {
+            sum.1 / summary.analyzed_white as f64
+        } else {
+            0.0
+        };
+        summary.enough_black = summary.analyzed_black >= MATCH_MIN_MOVES;
+        summary.enough_white = summary.analyzed_white >= MATCH_MIN_MOVES;
+        // 最差 N 手：胜率损失降序（LizzieYzy diffWinrate 口径），并列按
+        // 手数升序（稳定可复现）；截断至 WORST_LIMIT。
+        worst.sort_by(|a, b| {
+            b.winrate_loss
+                .partial_cmp(&a.winrate_loss)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.turn.cmp(&b.turn))
+        });
+        worst.truncate(WORST_LIMIT);
+        summary.worst = worst;
         summary
     }
 
@@ -918,7 +1104,9 @@ impl AnalysisState {
             // 按报告 turnNumber 重算该局面的签名（到达顺序不可信，笔记 §2）。
             let line = job.line.clone();
             let sig = position_sig(&line[..report.turn_number.min(line.len())]);
-            self.record_history(report.turn_number, root, sig);
+            // 候选表随 root 同一次写入（口径一致，见 record_history 文档）。
+            let (moves, total) = Self::candidates_from(&report.move_infos);
+            self.record_history(report.turn_number, root, sig, &moves, total);
             job.done += 1;
         }
         // 空报告（noResults，terminate 后未完成 turn 的补发）无数据，只计数。
@@ -945,6 +1133,7 @@ impl AnalysisState {
         self.snapshot = None;
         self.transient_error = None;
         self.history.clear();
+        self.candidates.clear();
         self.play_snapshot = None;
         self.play_sig = None;
     }
@@ -1035,6 +1224,9 @@ impl AnalysisState {
         let (stage, turn, started) = (inflight.stage, inflight.turn, inflight.started);
         let mut moves = report.move_infos;
         moves.sort_by_key(|info| info.order);
+        // 候选表快照在 moves 被 move 进快照前提取（终态才用得到，
+        // 但提前提取成本可忽略：表长 ≤ 候选数）。
+        let (candidates, candidates_total) = Self::candidates_from(&moves);
         let root = report.root_info;
         let snapshot = Snapshot {
             turn,
@@ -1069,7 +1261,9 @@ impl AnalysisState {
         {
             // 在飞报告的 turn 恒等于发起查询时的游标，局面未变即当前线的全部着法。
             let sig = position_sig(board.records());
-            self.record_history(turn, root, sig);
+            // 候选表随 root 同一次写入（口径一致，见 record_history 文档）；
+            // moves 已按 order 排序，快照顺序即引擎序。
+            self.record_history(turn, root, sig, &candidates, candidates_total);
         }
         if !report.no_results {
             self.transient_error = None;
@@ -1108,7 +1302,20 @@ impl AnalysisState {
     /// 同一局面（同签名）visits 不低于旧条目才覆盖（深阶段后到、覆盖快阶段）；
     /// 不同局面各占一个键，同手数的分支互不覆盖。无根节点数据或
     /// 容量已满时跳过。
-    fn record_history(&mut self, turn: usize, root: &RootInfo, sig: u64) {
+    ///
+    /// **候选表与 root 数据同一次报告写入**（同一覆盖判定、同进退）：
+    /// 历史点的 visits 与候选表的 visits 必须是同一次搜索的产物，否则会
+    /// 出现「root 是 300 visits 的、候选表是 40 visits 的」混合口径，
+    /// 吻合度分母随之失真。`moves` 为该报告的候选点（丢弃弃着后取
+    /// 落点与 visits），`total` 为候选表 visits 总和（分母）。
+    fn record_history(
+        &mut self,
+        turn: usize,
+        root: &RootInfo,
+        sig: u64,
+        moves: &[(Coord, u64)],
+        total_visits: u64,
+    ) {
         if turn > HISTORY_CAP || self.history.len() >= HISTORY_CAP && !self.history.contains_key(&sig)
         {
             return;
@@ -1125,7 +1332,28 @@ impl AnalysisState {
         };
         if overwrite {
             self.history.insert(sig, point);
+            // 候选表为空（引擎对满盘等局面可返回空表）也照写：空表让
+            // 「该局面分析过、但无候选信息」可区分于「没分析过」。
+            self.candidates.insert(
+                sig,
+                CandidateSnap {
+                    moves: moves.to_vec(),
+                    total_visits,
+                },
+            );
         }
+    }
+
+    /// 由一份终态报告提取候选表快照所需的 (落点, visits) 列表与总 visits。
+    /// 弃着（`mv == None`）不进表：它不占棋盘交叉点，永远不可能是
+    /// 「实际落子」的匹配对象。
+    fn candidates_from(infos: &[MoveInfo]) -> (Vec<(Coord, u64)>, u64) {
+        let moves: Vec<(Coord, u64)> = infos
+            .iter()
+            .filter_map(|info| info.mv.map(|at| (at, info.visits)))
+            .collect();
+        let total = moves.iter().map(|(_, v)| *v).sum();
+        (moves, total)
     }
 
     /// 对当前局面发起查询（就绪且无在飞时才生效）。`komi` 随查询发给引擎。
