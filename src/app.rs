@@ -2,7 +2,7 @@
 //! 布局（TASKS 3.3 / 4.2 / 5.3 / 6.x）。
 //!
 //! 引擎生命周期由 [`AnalysisState`] 管理：启动即加载配置并拉起引擎，
-//! [`eframe::App::logic`] 每帧轮询引擎事件并按局面推进「分段加深」分析。
+//! [`eframe::App::logic`] 每帧轮询引擎事件并推进流式分析（边搜边显示）。
 //!
 //! 「打开棋谱」与「另存为」经 portal [`FileDialog`] 门面接线：发起立即
 //! 返回、对话框在专职线程等待，`logic` 每帧 `try_recv` 非阻塞取结果；
@@ -808,7 +808,7 @@ impl eframe::App for GuanqiApp {
             .loaded
             .as_ref()
             .and_then(|meta| meta.comment_at(&self.board));
-        // 引擎无望提示文本（深阶段终态报告里引擎方胜率过低时给出，
+        // 引擎无望提示文本（走子口径终态报告里引擎方胜率过低时给出，
         // 本帧检出后立即标记已提示，避免重复；确认按钮只清当前提示）。
         let hopeless = play::should_show_hopeless(&self.play, self.analysis.snapshot.as_ref());
         let hopeless_text = hopeless.then(|| {

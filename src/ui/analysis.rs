@@ -1,23 +1,27 @@
-//! 引擎接线与分析状态：生命周期状态机 + 「分段加深」查询调度（TASKS 3.3 / 4.2 接线层）。
+//! 引擎接线与分析状态：生命周期状态机 + 流式查询调度（TASKS 3.3 / 4.2 接线层）。
 //!
 //! 职责与协议事实的对应关系（均见 `engine` 模块文档）：
 //!
 //! - [`EngineEvent::Ready`] 之前不能发查询；启动（含模型加载 / OpenCL 调优）
 //!   实测可达数十秒，期间 UI 停留在 [`EngineStatus::Starting`]；
-//! - `katago analysis` 对每个 turn 只回一份**终态**报告，渐进体验靠
-//!   「同局面先发低 visits 快查询、出结果后自动加深到配置值」实现
-//!   （引擎搜索树跨查询复用，实测加深几乎免费）；
-//! - **人机对弈的走子查询（[`Stage::Play`]）单独成口径**：按难度档位的
-//!   visits 完整搜索，报告落 [`AnalysisState::play_snapshot`]，决策取自
-//!   它而非展示快照。轮到引擎时应手局面**先发 Play 再加深展示**——
-//!   反过来展示的树缓存会让低难度查询立刻返回高 visits 结果；
+//! - `katago analysis` 支持查询级 `reportDuringSearchEvery`：常规分析查询
+//!   开启后，搜索期间约每 0.5s 推送一条 `isDuringSearch: true` 的中间报告，
+//!   最后一条为 `false` 的终态（v1.18.2 实测）。局面变化 → 发**一次**查询
+//!   （visits = 配置值），边搜边把最新报告落 [`AnalysisState::snapshot`]
+//!   供界面实时刷新，无需再「先快后深」分段；
+//! - **人机对弈的走子查询（`request` 的 `play` 口径）单独成口径**：按难度
+//!   档位的 visits 完整搜索，报告落 [`AnalysisState::play_snapshot`]，决策
+//!   取自它而非展示快照。轮到引擎时应手局面先发 Play（保证树缓存不会让
+//!   低难度查询被更早的深搜索污染），展示分析随后补发；
 //! - 局面变化时 [`Engine::terminate`] 旧查询，并按 id 丢弃过期补发报告；
 //! - 进程退出（[`EngineEvent::Exited`]）进入可重试的 [`EngineStatus::Failed`]。
 //!
 //! [`AnalysisState::snapshot`] 是展示分析结果的唯一存放点：侧栏读它显示，
-//! 棋盘候选点叠加层 / 热度图也直接取用，避免二次搬运。
-//! 逐手胜率历史（[`AnalysisState::history`]，TASKS 4.3 曲线用）只是
-//! 终态快照的转存：键为**局面签名**（根到该局面着法前缀的 FNV-1a），
+//! 棋盘候选点叠加层 / 热度图也直接取用，避免二次搬运。它现在存放**最新**
+//! 报告（含流式中间报告）：胜率 / 目差 / 候选点随搜索推进实时刷新；
+//! [`Snapshot::is_final`] 区分中间与终态。
+//! 逐手胜率历史（[`AnalysisState::history`]，TASKS 4.3 曲线用）与失误分析
+//! **只在终态报告**写入：键为**局面签名**（根到该局面着法前缀的 FNV-1a），
 //! 谱树中不同分支的同一手数是不同局面，各存各的，切换分支不互相覆盖；
 //! 同局面后到且 visits 更多的终态覆盖先到的。
 //! 每手损失（[`loss_from_points`]，TASKS 4.4）不另存状态：读取时由当前线
@@ -37,8 +41,10 @@ use crate::engine::{
 /// 此处按相同定义书写，透明等价）。
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
-/// 快速阶段的 visits 上限：局面刚变化时先小预算出结果，再自动加深。
-const FAST_VISITS: u32 = 100;
+/// 流式中间报告的输出间隔（秒）：协议实测 0.5s 键下 300 visits 产出约
+/// 11 条中间报告（visits 27→51→…→303 递增），实时感与序列化压力平衡；
+/// 更密的间隔只会放大 JSON 解析与重绘频次，实时感提升有限。
+const REPORT_EVERY_SECS: f32 = 0.5;
 
 /// 逐手历史容量上限（条目数，各分支分开计数）。19 路盘的实用对局
 /// 远小于此，超出部分不再写入，避免无界增长。
@@ -171,8 +177,11 @@ pub enum EngineStatus {
     Failed(String),
 }
 
-/// 当前局面的一份分析快照（终态报告）。
+/// 当前局面的最新一份分析快照（流式中间报告或终态报告）。
 ///
+/// 界面实时数值（胜率 / 目差 / 候选点 / 热度图）取**最新**报告——含
+/// 中间报告，随搜索推进实时刷新；逐手胜率历史与失误分析只由终态写入
+/// （见 [`AnalysisState::on_report`]），曲线不被中间值反复改写。
 /// 阶段 4 的叠加层直接读取 `moves`（候选点圆圈）与 `ownership`（热度图）。
 #[derive(Clone, Debug)]
 pub struct Snapshot {
@@ -181,10 +190,11 @@ pub struct Snapshot {
     pub turn: usize,
     /// 查询时的棋盘尺寸（坐标 GTP 显示与阶段 4 叠加层换算用）。
     pub size: Size,
-    /// 本快照的 visits 上限（快阶段为 [`FAST_VISITS`]，深阶段为配置值）。
+    /// 该查询的 visits 上限（常规分析为配置值，走子口径为难度值）。
     pub visits_cap: u32,
-    /// 是否为深阶段报告（visits 达配置值）。人机对弈的自动应手只认
-    /// 深阶段终态快照——快阶段结果只用于渐进显示，不能拿去走子。
+    /// 是否按该查询的 visits 上限**搜完的终态**（流式改造后的语义：
+    /// 不再有快 / 深两段，`deep == is_final`）。人机对弈的自动应手只认
+    /// 走子口径的终态快照——中间报告只用于渐进显示，不能拿去走子。
     pub deep: bool,
     /// 是否为终态报告（`false` = 引擎的渐进中间报告，后续还会更新）。
     pub is_final: bool,
@@ -263,31 +273,40 @@ pub fn loss_from_points(
         severity: Severity::from_score_loss(score_loss),
     })
 }
-/// 查询阶段：先快后深，另有对局走子的独立口径。
+/// 查询口径：常规展示分析（配置值 visits + 流式中间报告），另有对局走子
+/// 的独立口径。原「快 / 深两段式」已由流式中间报告取代（查询级
+/// `reportDuringSearchEvery`，v1.18.2 实测），不再需要低 visits 预热。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Stage {
-    Fast,
-    Deep,
-    /// 人机对弈的走子查询：按**难度档位**的 visits 完整搜索。
-    /// 与展示口径分开的理由：
-    /// - 若难度低于展示值，直接按难度值发起（**不能**先发 Fast 再发 Play：
-    ///   引擎的搜索树跨查询存活，Fast 阶段已把树加深到 100，随后按 30 的
-    ///   查询会立刻用满缓存返回，难度形同虚设——实测 protocol.rs 注明
-    ///   「同局面再次查询即使更小 maxVisits 也立刻返回」）；
-    /// - 走子报告不进展示快照（`Snapshot`），避免侧栏/叠加层随难度值变浅。
+    /// 常规展示分析：visits = 配置值，开启流式中间报告。
+    Analysis,
+    /// 人机对弈的走子查询：按**难度档位**的 visits 完整搜索，不开启流式
+    /// （走子只认终态，中间报告无意义）。与展示口径分开的理由：
+    /// - 走子报告不进展示快照（`Snapshot`），避免侧栏/叠加层随难度值变浅；
+    /// - 轮到引擎时**先发 Play 再补展示查询**：若展示查询先按配置值搜过，
+    ///   引擎的搜索树跨查询存活，随后按更低难度值的查询会立刻用满缓存
+    ///   返回，难度形同虚设（实测 protocol.rs 注明「同局面再次查询即使更小
+    ///   maxVisits 也立刻返回」）。
     Play,
 }
 
 impl Stage {
-    /// 该阶段的 visits 上限。配置值为 0 时夹到 1，避免无效查询。
+    /// 该口径的 visits 上限。配置值为 0 时夹到 1，避免无效查询。
     fn cap(self, cfg: &EngineConfig) -> u32 {
         let visits = cfg.visits.max(1);
         match self {
-            Self::Fast => FAST_VISITS.min(visits),
-            Self::Deep => visits,
+            Self::Analysis => visits,
             // 走子口径永远按**难度值**（任务口径：难度低于展示值时按难度
-            // 搜完走子再加深展示；高于展示值时同样以难度为准）。
+            // 搜完走子再补展示；高于展示值时同样以难度为准）。
             Self::Play => cfg.play_difficulty.visits().max(1),
+        }
+    }
+
+    /// 展示口径开启流式中间报告；走子口径只认终态，不开。
+    fn streaming(self) -> bool {
+        match self {
+            Self::Analysis => true,
+            Self::Play => false,
         }
     }
 }
@@ -425,9 +444,10 @@ impl AnalysisState {
     /// （对弈模式开启、未结束、轮到引擎且在活子位置时为 `true`，
     /// 由 `app` 判定——本层不感知对弈状态，避免复盘时白烧走子预算）。
     ///
-    /// 查询顺序：轮到引擎应手的局面**先发 Play（难度值）再加深展示**——
-    /// 引擎的搜索树跨查询存活，若先跑展示的 Fast(100)/Deep，随后按更低
-    /// 难度值的查询会立刻用满缓存返回，难度形同虚设（见任务实测）。
+    /// 查询顺序：轮到引擎应手的局面**先发 Play（难度值）再补展示查询**——
+    /// 引擎的搜索树跨查询存活，若展示查询先按配置值跑过，随后按更低难度值
+    /// 的查询会立刻用满缓存返回，难度形同虚设（见任务实测）。展示查询开启
+    /// 流式中间报告，边搜边刷新界面。
     pub fn sync(&mut self, board: &Board, cfg: &EngineConfig, komi: f64, want_play_query: bool) {
         // 局面签名 = 根到当前节点的着法序列：落子 / 导航 / 悔棋 / 改着都会使其变化。
         let sig = board.records();
@@ -440,7 +460,7 @@ impl AnalysisState {
                 handle.terminate(inflight.id);
             }
             if matches!(self.engine, EngineStatus::Ready) {
-                let stage = if want_play_query { Stage::Play } else { Stage::Fast };
+                let stage = if want_play_query { Stage::Play } else { Stage::Analysis };
                 self.request(board, cfg, stage, komi);
             }
         }
@@ -448,7 +468,7 @@ impl AnalysisState {
             self.on_event(event, board, cfg, komi);
         }
         // 走子口径补发（同一局面、引擎空闲时）：难度刚改 / 对弈模式后开
-        // / 上一份走子报告被丢弃。展示已加深过的局面受树缓存影响，
+        // / 上一份走子报告被丢弃。展示已按配置值搜过的局面受树缓存影响，
         // 本次查询的 visits 可能高于难度值（至多一手，见模块文档）。
         let play_stale = self
             .play_sig
@@ -494,10 +514,10 @@ impl AnalysisState {
             EngineEvent::Ready => {
                 self.engine = EngineStatus::Ready;
                 self.transient_error = None;
-                self.request(board, cfg, Stage::Fast, komi);
+                self.request(board, cfg, Stage::Analysis, komi);
             }
             EngineEvent::Report { id, report, is_final } => {
-                self.on_report(id, report, is_final, board, cfg, komi);
+                self.on_report(id, report, is_final, board, cfg);
             }
             EngineEvent::Log(line) => self.last_log = Some(line),
             EngineEvent::Failed(err) => self.on_failed(err),
@@ -519,7 +539,8 @@ impl AnalysisState {
         }
     }
 
-    /// 接收报告：按 id 丢弃过期补发，落快照；快查询终态后自动加深。
+    /// 接收报告：按 id 丢弃过期补发，落快照；流式中间报告实时刷新展示，
+    /// 终态关闭在飞并转存逐手历史。
     fn on_report(
         &mut self,
         id: QueryId,
@@ -527,7 +548,6 @@ impl AnalysisState {
         is_final: bool,
         board: &Board,
         cfg: &EngineConfig,
-        komi: f64,
     ) {
         let Some(inflight) = self.inflight.as_ref() else {
             return;
@@ -543,21 +563,29 @@ impl AnalysisState {
             turn,
             size: board.size(),
             visits_cap: stage.cap(cfg),
-            deep: stage == Stage::Deep || stage == Stage::Play,
+            // 语义（流式改造后）：是否按该查询的 visits 上限搜完的终态。
+            // 展示快照可以比终态浅（中间报告），走子决策另见 play_snapshot。
+            deep: is_final,
             is_final,
             elapsed: started.elapsed(),
             root: root.clone(),
             moves,
             ownership: report.ownership,
         };
-        // 走子口径落位：只认终态（中间报告对决策无意义）。局面签名随查询
+        // 走子口径落位：只认终态（中间报告对决策无意义，守卫见
+        // `play::engine_move_decision` 的 is_final 判断）。局面签名随查询
         // 记录，难度变更由 `sync` 的 want_play 比对触发重新查询。
         if stage == Stage::Play && is_final {
             self.play_snapshot = Some(snapshot.clone());
             self.play_sig = Some((inflight.sig.clone(), cfg.play_difficulty));
         }
-        self.snapshot = Some(snapshot);
-        // 终态转存进逐手历史：局面未变时 visits 更高者胜（深阶段覆盖快阶段）。
+        // 展示快照实时更新（含流式中间报告）：胜率 / 目差 / 候选点 / 热度图
+        // 随搜索推进刷新。走子口径的查询不覆盖展示快照，侧栏不随难度值变浅。
+        if stage == Stage::Analysis {
+            self.snapshot = Some(snapshot);
+        }
+        // 仅终态转存进逐手历史：局面未变时 visits 不降者胜。
+        // 曲线与失误分析不被流式中间值反复改写。
         if is_final
             && let Some(root) = &root
         {
@@ -570,11 +598,6 @@ impl AnalysisState {
         }
         if is_final {
             self.inflight = None;
-            // 分段加深：快查询与深查询预算相同（配置值很小）时无需重复；
-            // 对局中快查询也要加深展示（走子口径已单独发起，互不妨碍）。
-            if stage == Stage::Fast && stage.cap(cfg) < cfg.visits.max(1) {
-                self.request(board, cfg, Stage::Deep, komi);
-            }
         }
     }
 
@@ -582,8 +605,9 @@ impl AnalysisState {
     ///
     /// 返回「该局面按当前难度完整搜索」的终态报告；`None` = 尚未就绪
     /// （查询在飞 / 未发起 / 难度刚变 / 局面已变）。**决策必须取自这里
-    /// 而非展示快照**：展示口径可以是浅查询（快阶段 100 visits），拿来
-    /// 走子会让难度设置形同虚设。
+    /// 而非展示快照**：展示口径可以是流式中间报告，拿来走子会让难度设置
+    /// 形同虚设（且中间结果远未收敛）。走子口径查询不开流式，
+    /// `Snapshot.is_final` 恒为真，终态守卫仍由决策函数保留兜底。
     pub fn play_snapshot(&self, board: &Board, difficulty: Difficulty) -> Option<&Snapshot> {
         let (sig, d) = self.play_sig.as_ref()?;
         if *d != difficulty || !sig.eq(board.records()) {
@@ -642,9 +666,14 @@ impl AnalysisState {
         let mut query = AnalysisQuery::new(board.size(), moves);
         query.komi = komi;
         query.max_visits = Some(stage.cap(cfg));
-        // 热度图需要 ownership（opt-in，引擎缺省不返回该字段）：
-        // 此处为单点改动处，快 / 深两阶段都会带回。
+        // 热度图需要 ownership（opt-in，引擎缺省不返回该字段）：协议实测
+        // 中间报告同样携带（每条约 7–9 KB，0.5s 键下 300 visits 共约 11 条，
+        // 见 /tmp/stream-notes.md），开销可忽略，热度图因此也能边搜边显示。
         query.include_ownership = true;
+        // 展示口径开启流式中间报告（边搜边刷新界面）；走子口径只认终态。
+        if stage.streaming() {
+            query.report_during_search_every = Some(REPORT_EVERY_SECS);
+        }
         let id = handle.analyze(query);
         self.analyzed_sig = Some(board.records().to_vec());
         self.inflight = Some(Inflight {

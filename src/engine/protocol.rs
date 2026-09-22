@@ -8,11 +8,14 @@
 //!   上层**不要**按行棋方翻转符号。
 //! - 响应字段不封闭（含 `isSymmetryOf` / `edgeVisits` / `edgeWeight` 等）：
 //!   反序列化一律宽容——未知字段忽略，可缺字段用 `Option`。
-//! - v1.18.2 实测 `isDuringSearch` 恒为 `false`（渐进报告只在 GTP `kata-analyze`
-//!   存在；analysis 引擎按 turn 逐个搜索、逐个输出终态）。解析层仍保留该字段，
-//!   若未来版本输出 `true`，[`AnalysisReport::is_final`] 语义自动成立。
+//! - `reportDuringSearchEvery` 为**查询级 JSON 字段**（v1.18.2 实测：作为
+//!   cfg 配置键无效，作为查询字段有效）：查询里带上后，搜索期间约每 N 秒
+//!   输出一条 `isDuringSearch: true` 的中间报告，**最后一条恒为
+//!   `isDuringSearch: false` 的终态**（不带该字段则只有终态一条）。
+//!   中间报告的 `rootInfo` / `moveInfos` 同样有效（visits 单调递增），
+//!   `ownership` 等全部字段与终态同构。
 //! - 引擎的搜索树缓存跨查询存活：同一局面再次查询（即使更小 `maxVisits`）
-//!   会立刻返回（实测 <0.1s），上层可用「同局面分段加深」实现渐进显示。
+//!   会立刻返回（实测 <0.1s），上层据此避免重复查询。
 //! - `ownership` 为 opt-in；排列与 [`crate::board::Coord::index`] 一致
 //!   （`y*size + x`，`y=0` 为顶行），正值 = 黑势。
 
@@ -64,6 +67,10 @@ pub struct AnalysisQuery {
     pub max_visits: Option<u32>,
     /// 是否返回 ownership（opt-in，缺省引擎不返回该字段）。
     pub include_ownership: bool,
+    /// 流式中间报告的输出间隔（秒）；`None` = 不开启，只回终态。
+    /// 开启后搜索期间约每 N 秒一条 `isDuringSearch: true` 的中间报告，
+    /// 最后仍有一条 `false` 终态（v1.18.2 实测，见模块文档）。
+    pub report_during_search_every: Option<f32>,
     /// 显式指定要分析的 turn 列表（`None` = 只分析 `moves` 结束后的最终局面）。
     /// 实测引擎对每个 turn 独立搜索并逐个输出终态报告。
     pub analyze_turns: Option<Vec<usize>>,
@@ -79,6 +86,7 @@ impl AnalysisQuery {
             moves,
             max_visits: None,
             include_ownership: false,
+            report_during_search_every: None,
             analyze_turns: None,
         }
     }
@@ -105,6 +113,8 @@ struct WireQuery<'a> {
     max_visits: Option<u32>,
     #[serde(skip_serializing_if = "is_false")]
     include_ownership: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    report_during_search_every: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     analyze_turns: Option<&'a [usize]>,
 }
@@ -148,6 +158,7 @@ impl AnalysisQuery {
             board_y_size: self.board_size.n(),
             max_visits: self.max_visits,
             include_ownership: self.include_ownership,
+            report_during_search_every: self.report_during_search_every,
             analyze_turns: self.analyze_turns.as_deref(),
         };
         serde_json::to_string(&wire).unwrap_or_else(|_| {
@@ -277,7 +288,8 @@ pub struct MoveInfo {
 pub struct AnalysisReport {
     /// 被分析的 turn 序号（0 = 初始盘面；缺省视为 `moves` 末尾）。
     pub turn_number: usize,
-    /// 搜索是否仍在进行（v1.18.2 analysis 引擎实测恒为 `false`，见模块文档）。
+    /// 搜索是否仍在进行：查询开启 `reportDuringSearchEvery` 时中间报告为
+    /// `true`，最后一条终态为 `false`（v1.18.2 实测，见模块文档）。
     pub is_during_search: bool,
     /// 空报告标记（无任何数据）。
     pub no_results: bool,

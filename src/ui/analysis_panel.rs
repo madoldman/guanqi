@@ -103,13 +103,26 @@ pub struct DocEntry {
     pub active: bool,
 }
 
-/// 状态文本与配色。
-fn status_label(status: &EngineStatus, analyzing: bool) -> (String, Color32) {
-    match status {
+/// 状态文本与配色。流式分析时显示实时 visits 进度（随中间报告刷新），
+/// 比单纯「分析中…」更能反映引擎正在推进。
+fn status_label(analysis: &AnalysisState) -> (String, Color32) {
+    match &analysis.engine {
         EngineStatus::Unconfigured => ("未配置权重".to_owned(), theme::colors::WARN),
         EngineStatus::Starting => ("引擎启动中…".to_owned(), theme::colors::WARN),
         EngineStatus::Ready => {
-            if analyzing {
+            if let Some(snapshot) = analysis
+                .snapshot
+                .as_ref()
+                .filter(|snapshot| !snapshot.is_final)
+                .or(analysis.analyzing().then_some(analysis.snapshot.as_ref()).flatten())
+            {
+                // 在飞查询的中间报告实时可达（root.visits 随搜索推进递增）。
+                let visits = snapshot.root.as_ref().map_or(0, |root| root.visits);
+                (
+                    format!("分析中 {} visits（上限 {}）", visits, snapshot.visits_cap),
+                    theme::colors::OK,
+                )
+            } else if analysis.analyzing() {
                 ("分析中…".to_owned(), theme::colors::OK)
             } else {
                 ("就绪".to_owned(), theme::colors::OK)
@@ -448,7 +461,7 @@ fn card_engine(
 ) {
     card(ui, |ui| {
         theme::section_title(ui, "引擎");
-        let (status_text, status_color) = status_label(&analysis.engine, analysis.analyzing());
+        let (status_text, status_color) = status_label(analysis);
         ui.horizontal(|ui| {
             // 状态点：圆形色标，一眼可辨引擎健康状态。
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
