@@ -329,6 +329,7 @@ impl GuanqiApp {
                 // 定位高亮所指的局面已不存在，一并清除；旧棋盘的临时提示
                 //（建分支等）随棋盘替换失效，同样清除。
                 self.analysis.reset();
+                self.analysis.clear_limits();
                 self.overlay.focus = None;
                 self.branch_notice = None;
                 self.notice = None;
@@ -435,6 +436,7 @@ impl GuanqiApp {
         let board = Board::from_setup(setup.size, &black, &white, &[], to_play)
             .expect("新对局的尺寸与星位坐标均合法，构造必然成功");
         self.analysis.reset();
+        self.analysis.clear_limits();
         self.overlay.focus = None;
         // 旧棋盘的临时提示随棋盘替换失效。
         self.branch_notice = None;
@@ -911,6 +913,28 @@ impl eframe::App for GuanqiApp {
                 }
             }
             analysis_panel::PanelAction::None => {}
+            // 限定选点：区域开关 / 排除增删 / 一键清除，全部转交 AnalysisState
+            // （限制变更会递增版本号，sync 检测后自动重发查询）。
+            analysis_panel::PanelAction::SetRegion(on) => {
+                if on.is_some() {
+                    // 开启只切模式；区域矩形等用户在棋盘上拖出。
+                    self.analysis.enable_region_mode();
+                } else {
+                    self.analysis.set_region(None);
+                }
+            }
+            analysis_panel::PanelAction::ToggleAvoid { player, at } => {
+                self.analysis.toggle_avoid(player, at);
+            }
+            analysis_panel::PanelAction::RemoveAvoid(index) => {
+                self.analysis.remove_avoid(index);
+            }
+            analysis_panel::PanelAction::ClearAvoid => {
+                self.analysis.clear_avoid();
+            }
+            analysis_panel::PanelAction::ClearLimits => {
+                self.analysis.clear_limits();
+            }
         }
 
         // 胜率曲线底部面板（TASKS 4.3）：隐藏时不创建，零额外计算；
@@ -971,7 +995,7 @@ impl eframe::App for GuanqiApp {
                 &mut self.board,
                 &mut self.notice,
                 &mut self.branch_notice,
-                &self.analysis,
+                &mut self.analysis,
                 &self.overlay,
                 Some(&self.play),
             );
@@ -1073,6 +1097,7 @@ impl eframe::App for GuanqiApp {
 
     // 每帧 UI 之前轮询引擎事件（不阻塞）；窗口隐藏时同样被调用。
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+
         // 每帧轮询 portal 对话框结果（结果入队时 waker 已请求立即重绘，
         // 这里的 200ms 兜底刷新覆盖 waker 之外的边界情况）。
         let event = match &mut self.dialog {

@@ -12,12 +12,14 @@
 //! - 非法落子原因写入 `notice`、建分支提示写入 `branch_notice`
 //!   （均由调用方持有），跨帧显示直到下一次成功操作。
 
-use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
+use egui::{
+    Align2, Color32, FontId, Painter, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2,
+};
 
 use crate::board::{Action, Board, Coord, IllegalReason, Size, Stone};
 use crate::play::{PlayState, resign_text, undo_to_human};
 
-use super::analysis::AnalysisState;
+use super::analysis::{AnalysisState, Region};
 use super::overlay::{self, Overlay};
 use super::theme;
 
@@ -35,6 +37,11 @@ const LABEL: Color32 = Color32::from_rgb(52, 36, 17);
 const NOTICE: Color32 = Color32::from_rgb(255, 152, 82);
 /// 分支选择器文字与「已创建变着」提示（同一琥珀色系）。
 const BRANCH: Color32 = Color32::from_rgb(255, 170, 40);
+/// 限定区域的填充与边框（青色系，与琥珀系交互色区分）。
+const REGION_FILL: Color32 = Color32::from_rgba_premultiplied(80, 200, 220, 42);
+const REGION_EDGE: Color32 = Color32::from_rgba_premultiplied(80, 200, 220, 200);
+/// 被排除选点的标记色（红色系，示意「不走这里」）。
+const AVOID_MARK: Color32 = Color32::from_rgba_premultiplied(235, 77, 61, 210);
 
 /// 交叉点到棋盘边缘的留白，以间距为单位（容纳坐标标注）。
 const MARGIN_IN_SPACING: f32 = 1.2;
@@ -62,11 +69,14 @@ pub fn show(
     board: &mut Board,
     notice: &mut Option<IllegalReason>,
     branch_notice: &mut Option<String>,
-    analysis: &AnalysisState,
+    analysis: &mut AnalysisState,
     overlay: &Overlay,
     play: Option<&PlayState>,
 ) {
     handle_keyboard(ui, board, notice, branch_notice, play);
+
+    // 限制状态整帧共用一份快照（状态栏标识与棋盘绘制同源）。
+    let limits = analysis.limits().clone();
 
     // 分支点时在棋盘上方给一行选择器（按钮动作在落子处理前执行，
     // 因为选择器只读棋盘、落子要可变借用，二者借用不冲突）；
@@ -85,7 +95,10 @@ pub fn show(
     // 状态行固定在底部，其余空间全部给棋盘。
     let avail = ui.available_rect_before_wrap();
     let board_area = Rect::from_min_max(avail.min, avail.max - Vec2::new(0.0, STATUS_HEIGHT));
-    let response = ui.allocate_rect(board_area, Sense::click());
+    // 限定区域开启时需要拖拽框选，因此升级为 click_and_drag 感知。
+    let region_mode = analysis.limits().has_region();
+    let sense = if region_mode { Sense::click_and_drag() } else { Sense::click() };
+    let response = ui.allocate_rect(board_area, sense);
 
     let size = board.size();
     if let Some(layout) = Layout::fit(response.rect, size) {
@@ -116,11 +129,41 @@ pub fn show(
         if let Some(focus) = &overlay.focus {
             overlay::draw_focus(&painter, &layout, board, focus);
         }
+        // 选点限制的可视化：区域遮罩 + 排除点标记（画在候选点之上更醒目）。
+        if let Some(region) = limits.region {
+            draw_region(&painter, &layout, region);
+        }
+        if !limits.avoid.is_empty() {
+            draw_avoid_marks(&painter, &layout, &limits.avoid, board.to_play());
+        }
+        // 区域模式下拖拽框选进行中：以按下点为对角实时预览框。
+        if region_mode
+            && response.is_pointer_button_down_on()
+        {
+            let press = ui.input(|i| i.pointer.press_origin());
+            if let (Some(start), Some(cur)) = (press, response.hover_pos())
+                && let (Some(a), Some(b)) = (layout.hit_test(start), layout.hit_test(cur))
+            {
+                draw_region(&painter, &layout, Region::from_corners(size, a, b));
+            }
+        }
         if let Some(pos) = response.hover_pos() {
             draw_hover(&painter, &layout, board, pos);
         }
-        if response.clicked() {
-            handle_click(board, notice, branch_notice, &layout, response.interact_pointer_pos());
+        // 交互分发：区域模式 = 框选（拖拽或点击），右键清区域；
+        // 普通模式 = 左键落子，右键空点 = 排除 / 恢复该手（支路探查）。
+        if region_mode {
+            handle_region_input(ui, &response, &layout, size, analysis);
+        } else {
+            if response.secondary_clicked()
+                && let Some(at) = response.interact_pointer_pos().and_then(|pos| layout.hit_test(pos))
+                && board.get(at).is_none()
+            {
+                analysis.toggle_avoid(board.to_play(), at);
+            }
+            if response.clicked() {
+                handle_click(board, notice, branch_notice, &layout, response.interact_pointer_pos());
+            }
         }
     }
 
@@ -143,7 +186,7 @@ pub fn show(
         BranchSel::None => {}
     }
 
-    draw_status(ui, board, *notice, branch_notice.as_deref(), play);
+    draw_status(ui, board, *notice, branch_notice.as_deref(), play, &limits);
 }
 
 /// 分支选择器的一帧交互结果（绘制期间收集，绘制后统一执行）。
@@ -298,9 +341,82 @@ fn handle_click(
     }
 }
 
-// ---- 几何 ----
+/// 限定区域的框选交互：拖拽松开成框（单点拖拽 = 单点区域），
+/// 纯点击也成单点区域（点两下对角即可框矩形）。右键清除区域。
+fn handle_region_input(
+    ui: &Ui,
+    response: &egui::Response,
+    layout: &Layout,
+    size: Size,
+    analysis: &mut AnalysisState,
+) {
+    // 右键：清除当前区域（再点开关也可整体关闭）。
+    if response.secondary_clicked() {
+        analysis.set_region(None);
+        return;
+    }
+    // 拖拽松开：以按下点与松开点为对角成框。press_origin 在 Release 事件
+    // 处理完才清空，因此本帧仍能读到拖拽起点。
+    if response.drag_stopped()
+        && let Some(start) = ui.input(|i| i.pointer.press_origin())
+        && let (Some(a), Some(b)) = (
+            layout.hit_test(start),
+            response.interact_pointer_pos().and_then(|pos| layout.hit_test(pos)),
+        )
+    {
+        analysis.set_region(Some(Region::from_corners(size, a, b)));
+        return;
+    }
+    // 纯点击（egui 已排除「明显拖拽」的释放）：单点区域，点两下对角即可框出矩形。
+    if response.clicked()
+        && let Some(at) = response.interact_pointer_pos().and_then(|pos| layout.hit_test(pos))
+    {
+        analysis.set_region(Some(Region::from_corners(size, at, at)));
+    }
+}
 
-/// 棋盘几何：屏幕坐标与交叉点的唯一换算点。
+/// 限定区域可视化：整块半透明遮罩 + 青色描边 + 四角短杠。
+fn draw_region(painter: &Painter, layout: &Layout, region: Region) {
+    let a = layout.point(region.min);
+    let b = layout.point(region.max);
+    let rect = Rect::from_min_max(a, b).expand(layout.spacing * 0.5);
+    painter.rect_filled(rect, 4.0, REGION_FILL);
+    painter.rect_stroke(rect, 4.0, Stroke::new(2.0, REGION_EDGE), StrokeKind::Outside);
+    // 四角短杠加强「这是一块被框定的区域」的观感。
+    let arm = layout.spacing * 0.7;
+    for (cx, cy, dx, dy) in [
+        (rect.left(), rect.top(), 1.0, 1.0),
+        (rect.right(), rect.top(), -1.0, 1.0),
+        (rect.left(), rect.bottom(), 1.0, -1.0),
+        (rect.right(), rect.bottom(), -1.0, -1.0),
+    ] {
+        painter.line_segment(
+            [
+                Pos2::new(cx + dx * arm, cy),
+                Pos2::new(cx, cy + dy * arm),
+            ],
+            Stroke::new(2.5, REGION_EDGE),
+        );
+    }
+}
+
+/// 被排除选点标记：红圈 + 斜杠（「不走这里」），画在棋子之上。
+/// 只标记**当前行棋方**名下的排除项（对手的排除项对当前候选无影响）。
+fn draw_avoid_marks(painter: &Painter, layout: &Layout, avoid: &[(Stone, Coord)], to_play: Stone) {
+    let radius = layout.spacing * 0.40;
+    let stroke = Stroke::new((layout.spacing * 0.07).max(2.0), AVOID_MARK);
+    for (_, c) in avoid.iter().filter(|(p, _)| *p == to_play) {
+        let center = layout.point(*c);
+        painter.circle_stroke(center, radius, stroke);
+        let d = radius * std::f32::consts::FRAC_1_SQRT_2; // 45° 斜杠端点到圆心距离
+        painter.line_segment(
+            [center - Vec2::new(d, d), center + Vec2::new(d, d)],
+            stroke,
+        );
+    }
+}
+
+// ---- 几何 ----/// 棋盘几何：屏幕坐标与交叉点的唯一换算点。
 /// `point` / `spacing` 供叠加层（`overlay` 模块）复用，其余仅供本模块。
 pub(crate) struct Layout {
     size: Size,
@@ -562,6 +678,7 @@ fn draw_status(
     notice: Option<IllegalReason>,
     branch_notice: Option<&str>,
     play: Option<&PlayState>,
+    limits: &super::analysis::AnalysisLimits,
 ) {
     ui.allocate_ui_with_layout(
         Vec2::new(ui.available_width(), STATUS_HEIGHT - 10.0),
@@ -651,14 +768,23 @@ fn draw_status(
                         });
                     }
 
-                    // 段 5：非法落子提示（有才显示）。
+                    // 段 5：选点限制标识（区域 / 排除，有任一才显示）。
+                    // 用户必须随时知道引擎的候选是被约束过的，避免把
+                    // 「限定下的首选」误读为全局最优。
+                    if limits.region.is_some() || !limits.avoid.is_empty() {
+                        segment(ui, &|ui| {
+                            ui.colored_label(REGION_EDGE, "限定选点中");
+                        });
+                    }
+
+                    // 段 6：非法落子提示（有才显示）。
                     if let Some(reason) = notice {
                         segment(ui, &|ui| {
                             ui.colored_label(NOTICE, format!("非法落子：{reason}"));
                         });
                     }
 
-                    // 段 6：快捷键说明（弱色小字）。
+                    // 段 7：快捷键说明（弱色小字）。
                     ui.weak("点击落子 · ← 后退 · → 前进 · Ctrl+←/→ 切分支 · Ctrl+Z 悔棋");
                 });
         },

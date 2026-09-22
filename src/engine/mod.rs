@@ -28,7 +28,7 @@ pub use config::{
     ensure_analysis_cfg, find_katago_in_path, load_settings, save_settings, scan_weights,
     settings_path, Difficulty, EngineBackend, EngineConfig, LoadedSettings,
 };
-pub use protocol::{AnalysisQuery, AnalysisReport, MoveInfo, QueryId, RootInfo};
+pub use protocol::{AnalysisQuery, AnalysisReport, MoveInfo, MoveRule, MoveRules, QueryId, RootInfo};
 
 use crate::board::Size;
 use process::{PipeEvent, Process, Waker};

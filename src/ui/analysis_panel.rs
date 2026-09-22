@@ -18,8 +18,7 @@ use crate::engine::{Difficulty, EngineConfig, RootInfo};
 use crate::play::{PlayState, resign_text};
 use crate::sgf::GameMeta;
 
-use super::analysis::{AnalysisState, EngineStatus, Severity};
-use super::overlay::{self, Overlay};
+use super::analysis::{AnalysisState, EngineStatus, Severity};use super::overlay::{self, Overlay};
 use super::theme;
 
 /// 侧栏展示的候选点条数（空盘时引擎可回上百条，只取前几条；
@@ -57,6 +56,23 @@ pub enum PanelAction {
     SetDifficulty(Difficulty),
     /// 打开「新对局」设置窗口。
     OpenNewGame,
+    /// 候选点行点了「排除」：把该手加入 / 移出 avoidMoves（App 转交
+    /// [`AnalysisState::toggle_avoid`]，区域模式下不生效）。
+    ToggleAvoid {
+        /// 行棋方（记录时取当前行棋方）。
+        player: Stone,
+        /// 被排除的落点。
+        at: Coord,
+    },
+    /// 点了排除列表某行的「移除」按钮（下标 = 列表行号）。
+    RemoveAvoid(usize),
+    /// 「清空排除」按钮：清空全部 avoidMoves。
+    ClearAvoid,
+    /// 「清除全部限制」按钮：区域与排除一并清除。
+    ClearLimits,
+    /// 区域开关切换（`Some(())` = 请求开启，`None` = 请求关闭并清除区域）。
+    /// 开启只需改模式（区域等用户在棋盘上拖出）。
+    SetRegion(Option<()>),
 }
 
 /// 「打开棋谱」流程的用户可见提示（App 写入，随侧栏提示行显示）。
@@ -293,6 +309,9 @@ fn panel_body(
 
     // ---- 胜率 / 目差 ----
     card_winrate(ui, analysis);
+
+    // ---- 限定选点（限定区域 / 排除选点）----
+    card_limits(ui, analysis, board, &mut action);
 
     // ---- 候选点 ----
     card_candidates(ui, analysis, overlay, &mut action);
@@ -729,6 +748,61 @@ fn doc_row(ui: &mut Ui, entry: &DocEntry, action: &mut PanelAction) {
     });
 }
 
+/// 「限定选点」卡片：限定区域开关（开启后在棋盘上拖框）、被排除的手
+/// 列表（逐项移除 + 清空）与一键清除。区域与排除互斥（引擎实测
+/// allowMoves 与 avoidMoves 不能同时给出），区域优先、排除暂不生效。
+fn card_limits(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &mut PanelAction) {
+    let limits = analysis.limits();
+    card(ui, |ui| {
+        theme::section_title(ui, "限定选点");
+        // 区域开关：开启后棋盘进入框选模式（拖框 / 点两下对角 / 右键清除），
+        // 关闭即清除区域。开启时忽略落子，候选点随新查询实时刷新。
+        let mut region_on = limits.has_region();
+        if ui.checkbox(&mut region_on, "限定区域（在棋盘上拖框）").changed() {
+            *action = PanelAction::SetRegion(region_on.then_some(()).and(None));
+        }
+        ui.weak("拖框选定区域后，引擎只考虑区域内的空点。");
+        if let Some(region) = limits.region {
+            let size = board.size();
+            ui.label(format!(
+                "区域 {}–{}（{}×{}）",
+                region.min.to_gtp(size),
+                region.max.to_gtp(size),
+                region.max.x() - region.min.x() + 1,
+                region.max.y() - region.min.y() + 1,
+            ));
+        }
+        ui.separator();
+        ui.weak("排除选点：棋盘右键空点，或候选点行「排除」按钮。");
+        if limits.avoid.is_empty() {
+            ui.weak("（无）");
+        } else {
+            let size = board.size();
+            for (i, (player, at)) in limits.avoid.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{} {}", player.name(), at.to_gtp(size)))
+                            .monospace(),
+                    );
+                    if ui.small_button("移除").clicked() {
+                        *action = PanelAction::RemoveAvoid(i);
+                    }
+                });
+            }
+            if ui.button("清空排除").clicked() {
+                *action = PanelAction::ClearAvoid;
+            }
+        }
+        if limits.has_region() && !limits.avoid.is_empty() {
+            ui.colored_label(theme::colors::WARN, "区域模式下排除列表暂不生效。");
+        }
+        ui.add_space(2.0);
+        if wide_button(ui, "清除全部限制").clicked() {
+            *action = PanelAction::ClearLimits;
+        }
+    });
+}
+
 /// 「胜率」卡片：大字号黑方胜率与目差。
 fn card_winrate(ui: &mut Ui, analysis: &AnalysisState) {
     card(ui, |ui| {
@@ -784,7 +858,8 @@ fn card_candidates(
 }
 
 /// 候选点行：自绘全宽按钮（左坐标 / 中胜率 / 右 visits），选中态与
-/// 棋盘定位高亮呼应（琥珀填充）；弃着行不可点。
+/// 棋盘定位高亮呼应（琥珀填充）；弃着行不可点。行尾「排除」小钮把
+/// 该手加入 avoidMoves（再次点击同点行间互斥由 `AnalysisState` 去重）。
 #[allow(clippy::too_many_arguments)]
 fn candidate_row(
     ui: &mut Ui,
@@ -807,8 +882,10 @@ fn candidate_row(
     let interactive = info.mv.is_some();
 
     let height = 24.0;
+    // 行尾「排除」按钮占宽（弃着行没有，行体占满整行）。
+    let tail = if interactive { 46.0 } else { 0.0 };
     let (rect, mut response) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), height),
+        Vec2::new(ui.available_width() - tail, height),
         if interactive {
             Sense::click()
         } else {
@@ -870,6 +947,40 @@ fn candidate_row(
             overlay::ghosts_from_pv(&info.pv, to_play)
         });
         *action = PanelAction::Focus { at, ghosts };
+    }
+
+    // 行尾「排除」按钮：独立交互区（右键棋盘空点是等效入口）。
+    if let Some(at) = info.mv
+        && let Some(player) = to_play
+    {
+        let (brect, btn) =
+            ui.allocate_exact_size(Vec2::new(tail - 4.0, height - 4.0), Sense::click());
+        let painter = ui.painter_at(brect);
+        let hover = btn.hovered() || btn.is_pointer_button_down_on();
+        painter.rect_filled(
+            brect,
+            4.0,
+            if hover {
+                Color32::from_rgb(72, 44, 46)
+            } else {
+                Color32::from_rgb(48, 42, 46)
+            },
+        );
+        painter.text(
+            brect.center(),
+            Align2::CENTER_CENTER,
+            "排除",
+            FontId::proportional(10.5),
+            if hover {
+                Color32::from_rgb(255, 150, 140)
+            } else {
+                Color32::from_rgb(196, 168, 168)
+            },
+        );
+        let btn = btn.on_hover_text(format!("把 {} 加入排除（avoidMoves）", at.to_gtp(size)));
+        if btn.clicked() {
+            *action = PanelAction::ToggleAvoid { player, at };
+        }
     }
 }
 

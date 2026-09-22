@@ -74,6 +74,57 @@ pub struct AnalysisQuery {
     /// 显式指定要分析的 turn 列表（`None` = 只分析 `moves` 结束后的最终局面）。
     /// 实测引擎对每个 turn 独立搜索并逐个输出终态报告。
     pub analyze_turns: Option<Vec<usize>>,
+    /// 选点限制（限定区域 = allowMoves / 排除选点 = avoidMoves）。
+    /// 实测二者同时给出会被引擎拒绝（`Cannot specify both allowMoves and
+    /// avoidMoves`），上层必须互斥。
+    pub move_rules: Option<MoveRules>,
+}
+
+/// 一组选点限制。`allow` 与 `avoid` 不可同时非空（引擎实测显式报错）。
+///
+/// 语义（v1.18.2 实测）：
+/// - `allow`：**只允许**这些点作为行棋方 [`Stone`] 的下一手；限制只作用于
+///   「当前局面的下一手」时 `until_depth` 发 1。
+/// - `avoid`：把这些点从该行棋方的候选中剔除（visits 全部分给其余点）。
+/// - `moves` 为空时：allow 得到**空 moveInfos 的终态**（等于不允许任何点，
+///   上层必须拦下），avoid 等于不限制；二者都不报错。
+/// - 含已有棋子 / 自杀点：静默剔除，不报错。
+#[derive(Clone, Debug, PartialEq)]
+pub struct MoveRules {
+    /// 限定区域（allowMoves）：`Some` 时 `avoid` 必须为空。
+    pub allow: Option<MoveRule>,
+    /// 排除选点（avoidMoves）：`Some` 时 `allow` 必须为空。
+    pub avoid: Option<MoveRule>,
+}
+
+impl MoveRules {
+    /// 「限定区域」规则（只允许 `moves` 中的点）。
+    pub fn allow(player: Stone, moves: Vec<String>) -> Self {
+        Self { allow: Some(MoveRule::new(player, moves)), avoid: None }
+    }
+
+    /// 「排除选点」规则（把 `moves` 从该行棋方的候选剔除）。
+    pub fn avoid(player: Stone, moves: Vec<String>) -> Self {
+        Self { allow: None, avoid: Some(MoveRule::new(player, moves)) }
+    }
+}
+
+/// 单条 allowMoves / avoidMoves 规则的线上形态。
+#[derive(Clone, Debug, PartialEq)]
+pub struct MoveRule {
+    /// 受限（或被排除）的行棋方。
+    pub player: Stone,
+    /// GTP 坐标串（[`Coord::to_gtp`] 口径；空数组语义见 [`MoveRules`]）。
+    pub moves: Vec<String>,
+    /// 限制持续的手数（ply，双方合计）：`untilDepth: 1` = 仅当前局面的
+    /// 下一手。实测按全局 ply 计数而非该 player 自己的手数。
+    pub until_depth: u32,
+}
+
+impl MoveRule {
+    fn new(player: Stone, moves: Vec<String>) -> Self {
+        Self { player, moves, until_depth: 1 }
+    }
 }
 
 impl AnalysisQuery {
@@ -88,6 +139,7 @@ impl AnalysisQuery {
             include_ownership: false,
             report_during_search_every: None,
             analyze_turns: None,
+            move_rules: None,
         }
     }
 }
@@ -117,6 +169,43 @@ struct WireQuery<'a> {
     report_during_search_every: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     analyze_turns: Option<&'a [usize]>,
+    /// allowMoves 与 avoidMoves 引擎实测互斥，至多出现其一。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allow_moves: Option<Vec<WireMoveRule<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avoid_moves: Option<Vec<WireMoveRule<'a>>>,
+}
+
+/// 线上规则条目：坐标串借自 [`AnalysisQuery::move_rules`] 的字符串。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireMoveRule<'a> {
+    player: &'a str,
+    moves: &'a [String],
+    until_depth: u32,
+}
+
+/// 组装 allowMoves / avoidMoves（规则组实测互斥，输出至多一个字段）。
+fn wire_move_rules(
+    rules: Option<&MoveRules>,
+) -> (Option<Vec<WireMoveRule<'_>>>, Option<Vec<WireMoveRule<'_>>>) {
+    match rules {
+        Some(MoveRules { allow: Some(rule), .. }) => {
+            (Some(vec![wire_move_rule(rule)]), None)
+        }
+        Some(MoveRules { avoid: Some(rule), .. }) => {
+            (None, Some(vec![wire_move_rule(rule)]))
+        }
+        _ => (None, None),
+    }
+}
+
+fn wire_move_rule(rule: &MoveRule) -> WireMoveRule<'_> {
+    WireMoveRule {
+        player: stone_tag(rule.player),
+        moves: &rule.moves,
+        until_depth: rule.until_depth,
+    }
 }
 
 fn stone_tag(stone: Stone) -> &'static str {
@@ -135,6 +224,11 @@ fn action_gtp(action: Action, size: Size) -> String {
 }
 
 impl AnalysisQuery {
+    /// 临时验证入口（examples/tmp_encode_check.rs 用，验证后随示例一并删除）。
+    pub fn debug_encode(&self) -> String {
+        self.encode(QueryId::new(0))
+    }
+
     pub(crate) fn encode(&self, id: QueryId) -> String {
         // 先落所有 GTP 串，再组元组，避免借用临时值。
         let coord_strs: Vec<String> = self
@@ -148,6 +242,7 @@ impl AnalysisQuery {
             .zip(&coord_strs)
             .map(|((stone, _), gtp)| (stone_tag(*stone), gtp.as_str()))
             .collect();
+        let (allow_moves, avoid_moves) = wire_move_rules(self.move_rules.as_ref());
         let wire = WireQuery {
             id: id.raw().to_string(),
             initial_stones: Vec::new(),
@@ -160,6 +255,8 @@ impl AnalysisQuery {
             include_ownership: self.include_ownership,
             report_during_search_every: self.report_during_search_every,
             analyze_turns: self.analyze_turns.as_deref(),
+            allow_moves,
+            avoid_moves,
         };
         serde_json::to_string(&wire).unwrap_or_else(|_| {
             // 全部字段均为可序列化类型，理论上不可达；兜底避免 panic。

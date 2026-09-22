@@ -31,10 +31,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::board::{Board, MoveRecord, Size, Stone, Action};
+use crate::board::{Action, Board, Coord, MoveRecord, Size, Stone};
 use crate::engine::{
     AnalysisQuery, AnalysisReport, Difficulty, Engine, EngineConfig, EngineError, EngineEvent,
-    QueryId, RootInfo, MoveInfo,
+    MoveRules, QueryId, RootInfo, MoveInfo,
 };
 
 /// 引擎事件唤醒回调：与 `engine::process::Waker` 同构（类型别名未公开，
@@ -273,6 +273,107 @@ pub fn loss_from_points(
         severity: Severity::from_score_loss(score_loss),
     })
 }
+// ---- 选点限制（限定区域 / 排除选点）----
+
+/// 一块限定区域：矩形对角交叉点（含两端，`min`/`max` 已归一化）。
+/// `Coord` 不绑定尺寸，区域随局面使用时以所在棋盘为准。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Region {
+    /// 左上角交叉点（x、y 较小者）。
+    pub min: Coord,
+    /// 右下角交叉点（x、y 较大者）。
+    pub max: Coord,
+}
+
+impl Region {
+    /// 由任意两个对角构造（自动归一化 min/max）；两角必须在同一尺寸的盘内。
+    pub fn from_corners(size: Size, a: Coord, b: Coord) -> Self {
+        Self {
+            min: Coord::new(size, a.x().min(b.x()), a.y().min(b.y()))
+                .expect("两个盘内交叉点的 min 分量仍在盘内"),
+            max: Coord::new(size, a.x().max(b.x()), a.y().max(b.y()))
+                .expect("两个盘内交叉点的 max 分量仍在盘内"),
+        }
+    }
+
+    /// 是否包含该交叉点。
+    pub fn contains(&self, c: Coord) -> bool {
+        c.x() >= self.min.x()
+            && c.x() <= self.max.x()
+            && c.y() >= self.min.y()
+            && c.y() <= self.max.y()
+    }
+
+    /// 区域内的全部交叉点（行优先）。需要棋盘尺寸参数（`Coord` 不绑定尺寸）。
+    pub fn points(&self, size: Size) -> impl Iterator<Item = Coord> {
+        let (min, max) = (self.min, self.max);
+        (min.y()..=max.y())
+            .flat_map(move |y| (min.x()..=max.x()).map(move |x| (x, y)))
+            .filter_map(move |(x, y)| Coord::new(size, x, y))
+    }
+
+    /// 区域是否为单点（点击而非拖拽形成的「框」）。
+    pub fn is_single(&self) -> bool {
+        self.min == self.max
+    }
+}
+
+/// 当前的选点限制。**allowMoves 与 avoidMoves 引擎实测互斥**（同时给出
+/// 会被拒绝），因此区域与排除列表也互斥：区域开启时排除列表保留但不生效。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AnalysisLimits {
+    /// 限定区域（`Some` = 区域模式，只允许区域内的空点）。
+    pub region: Option<Region>,
+    /// 被排除的手（GTP 坐标，按记录时的行棋方分组）。
+    pub avoid: Vec<(Stone, Coord)>,
+}
+
+impl AnalysisLimits {
+    /// 区域模式是否生效。
+    pub fn has_region(&self) -> bool {
+        self.region.is_some()
+    }
+}
+
+/// 限制版本号：任何修改都会递增，`sync` 据此重发查询（局面未变时也重发）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct LimitsEpoch(u32);
+
+/// 由棋盘与限制构造查询级 move_rules（协议层 [`MoveRules`]）。
+///
+/// 规则只发给**当前行棋方**：区域 / 排除是「当前局面怎么选点」的约束，
+/// 对手应手不受限（KaTrain 同款口径）。坐标用 `Coord::to_gtp` 组装。
+fn move_rules_of(limits: &AnalysisLimits, board: &Board) -> Option<MoveRules> {
+    let player = board.to_play();
+    if let Some(region) = limits.region {
+        // 只收区域内的空点；过滤后为空则不发限制（引擎对空 allowMoves
+        // 返回空 moveInfos，见第 0 步实测，不把这种查询发出去）。
+        let moves: Vec<String> = region
+            .points(board.size())
+            .filter(|c| board.get(*c).is_none())
+            .map(|c| c.to_gtp(board.size()))
+            .collect();
+        if moves.is_empty() {
+            return None;
+        }
+        return Some(MoveRules::allow(player, moves));
+    }
+    if limits.avoid.is_empty() {
+        return None;
+    }
+    let moves: Vec<String> = limits
+        .avoid
+        .iter()
+        .filter(|(p, _)| *p == player)
+        .map(|(_, c)| c.to_gtp(board.size()))
+        .collect();
+    // 当前行棋方名下没有排除项（例如排除的全是对手的点）时等同无限制。
+    if moves.is_empty() {
+        return None;
+    }
+    Some(MoveRules::avoid(player, moves))
+}
+
 /// 查询口径：常规展示分析（配置值 visits + 流式中间报告），另有对局走子
 /// 的独立口径。原「快 / 深两段式」已由流式中间报告取代（查询级
 /// `reportDuringSearchEvery`，v1.18.2 实测），不再需要低 visits 预热。
@@ -350,6 +451,13 @@ pub struct AnalysisState {
     /// 走子口径报告对应的局面签名与查询难度：签名不符（局面已变）或
     /// 难度不符（对弈中改了难度）即作废并重新发起走子查询。
     play_sig: Option<(Vec<MoveRecord>, Difficulty)>,
+    /// 当前生效的选点限制（限定区域 / 排除选点）。由侧栏与棋盘交互写入；
+    /// 每次变更递增 [`Self::limits_epoch`] 触发查询重发。
+    limits: AnalysisLimits,
+    /// 限制版本号：与「上次发起查询时的版本」比对，不一致即重发。
+    limits_epoch: LimitsEpoch,
+    /// 上次发起查询时的限制版本号。
+    sent_epoch: LimitsEpoch,
 }
 
 impl AnalysisState {
@@ -365,7 +473,82 @@ impl AnalysisState {
             analyzed_sig: None,
             play_snapshot: None,
             play_sig: None,
+            limits: AnalysisLimits::default(),
+            limits_epoch: LimitsEpoch(0),
+            sent_epoch: LimitsEpoch(0),
         }
+    }
+
+    // ---- 选点限制（限定区域 / 排除选点）----
+
+    /// 当前生效的选点限制（侧栏显示与状态标识读取）。
+    pub fn limits(&self) -> &AnalysisLimits {
+        &self.limits
+    }
+
+    /// 设置限定区域（`None` = 清除区域）。区域与排除互斥：设置区域后
+    /// 排除列表保留但暂不生效（见 [`AnalysisLimits`] 文档）。
+    pub fn set_region(&mut self, region: Option<Region>) {
+        if self.limits.region == region {
+            return;
+        }
+        self.limits.region = region;
+        self.bump_limits();
+    }
+
+    /// 切换一手棋的排除状态（棋盘右键 / 候选行排除按钮共用）。
+    /// 区域模式开启时排除不生效（保持互斥），直接忽略。
+    pub fn toggle_avoid(&mut self, player: Stone, at: Coord) {
+        if self.limits.has_region() {
+            return;
+        }
+        if let Some(pos) = self
+            .limits
+            .avoid
+            .iter()
+            .position(|(p, c)| *p == player && *c == at)
+        {
+            self.limits.avoid.remove(pos);
+        } else {
+            self.limits.avoid.push((player, at));
+        }
+        self.bump_limits();
+    }
+
+    /// 移除一条排除项（下标 = 侧栏排除列表的行号）。
+    pub fn remove_avoid(&mut self, index: usize) {
+        if index < self.limits.avoid.len() {
+            self.limits.avoid.remove(index);
+            self.bump_limits();
+        }
+    }
+
+    /// 清空全部限制（区域 + 排除；「一键清除」入口共用）。
+    pub fn clear_limits(&mut self) {
+        if self.limits.region.is_none() && self.limits.avoid.is_empty() {
+            return;
+        }
+        self.limits = AnalysisLimits::default();
+        self.bump_limits();
+    }
+
+    /// 开启区域模式（不设区域，等用户在棋盘上拖出）。
+    /// 恒递增版本号：模式切换本身要触发重发（棋盘交互随之改变）。
+    pub fn enable_region_mode(&mut self) {
+        self.bump_limits();
+    }
+
+    /// 仅清空排除列表（区域与排除互斥，区域开启时不会走到这里）。
+    pub fn clear_avoid(&mut self) {
+        if self.limits.avoid.is_empty() {
+            return;
+        }
+        self.limits.avoid.clear();
+        self.bump_limits();
+    }
+
+    fn bump_limits(&mut self) {
+        self.limits_epoch.0 += 1;
     }
 
     /// 用当前配置（重）启动引擎；设置面板「应用并重启」与错误重试共用。
@@ -451,7 +634,10 @@ impl AnalysisState {
     pub fn sync(&mut self, board: &Board, cfg: &EngineConfig, komi: f64, want_play_query: bool) {
         // 局面签名 = 根到当前节点的着法序列：落子 / 导航 / 悔棋 / 改着都会使其变化。
         let sig = board.records();
-        if Some(sig) != self.analyzed_sig.as_deref() {
+        // 限制版本变化（设置区域 / 排除 / 清除）即使局面未变也要重发查询：
+        // 限制是查询级字段，引擎不感知「用户改了限制」这一事件。
+        let limits_changed = self.limits_epoch != self.sent_epoch;
+        if Some(sig) != self.analyzed_sig.as_deref() || limits_changed {
             self.snapshot = None;
             self.transient_error = None;
             if let Some(inflight) = self.inflight.take()
@@ -674,8 +860,12 @@ impl AnalysisState {
         if stage.streaming() {
             query.report_during_search_every = Some(REPORT_EVERY_SECS);
         }
+        // 选点限制（限定区域 / 排除选点）随查询发给引擎，展示与走子口径
+        // 都受限（区域模式研究局部时，引擎应手也应在局部走才自然）。
+        query.move_rules = move_rules_of(&self.limits, board);
         let id = handle.analyze(query);
         self.analyzed_sig = Some(board.records().to_vec());
+        self.sent_epoch = self.limits_epoch;
         self.inflight = Some(Inflight {
             id,
             turn: board.cursor(),
