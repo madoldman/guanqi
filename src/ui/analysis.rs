@@ -61,7 +61,8 @@ const HISTORY_CAP: usize = 999;
 // - 6 目：约半手棋（中盘一手价值 10–15 目），多为漏看或死活误判。
 
 /// 好棋与尚可的分界（目）：低于此值视为搜索噪声。
-const SEVERITY_GOOD_MAX: f64 = 0.3;
+/// （解说模块 [`super::explain`] 复用同一分界，避免两处阈值漂移。）
+pub(crate) const SEVERITY_GOOD_MAX: f64 = 0.3;
 /// 疑问手下限（目）。
 const SEVERITY_QUESTIONABLE_MIN: f64 = 1.0;
 /// 失误下限（目）。

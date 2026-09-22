@@ -4,6 +4,7 @@ pub mod analysis;
 pub mod analysis_panel;
 pub mod board_view;
 pub mod curve;
+pub mod explain;
 pub mod new_game;
 pub mod overlay;
 pub mod settings;

@@ -18,7 +18,9 @@ use crate::engine::{Difficulty, EngineConfig, RootInfo};
 use crate::play::{PlayState, resign_text};
 use crate::sgf::GameMeta;
 
-use super::analysis::{AnalysisState, EngineStatus, Severity};use super::overlay::{self, Overlay};
+use super::analysis::{AnalysisState, EngineStatus, Severity};
+use super::explain;
+use super::overlay::{self, Overlay};
 use super::theme;
 
 /// 侧栏展示的候选点条数（空盘时引擎可回上百条，只取前几条；
@@ -219,7 +221,7 @@ fn info_line(ui: &mut Ui, label: &str, value: &str) {
 /// 主变（PV）文本：`D4 → Q16 → …`，截断到 [`PV_LIMIT`] 手。
 /// 坐标用 GTP 格式（跳 I）；`None`（弃着）显示「弃着」；
 /// 被截断时以「 …」结尾提示还有后续。空 PV 返回 `None`（不显示该行）。
-fn pv_text(pv: &[Option<Coord>], size: Size) -> Option<String> {
+pub(crate) fn pv_text(pv: &[Option<Coord>], size: Size) -> Option<String> {
     if pv.is_empty() {
         return None;
     }
@@ -341,6 +343,9 @@ fn panel_body(
 
     // ---- 胜率 / 目差 ----
     card_winrate(ui, analysis);
+
+    // ---- 讲解（中文自动解说；终态数据驱动，流式期间只占位）----
+    card_explain(ui, analysis, board);
 
     // ---- 限定选点（限定区域 / 排除选点）----
     card_limits(ui, analysis, board, &mut action);
@@ -776,6 +781,24 @@ fn doc_row(ui: &mut Ui, entry: &DocEntry, action: &mut PanelAction) {
             if drop.clicked() {
                 *action = PanelAction::DropCopy(entry.number);
             }
+        }
+    });
+}
+
+/// 「讲解」卡片：中文自动解说（`ui::explain` 逐行渲染，按档位着色）。
+/// 数据全部来自引擎终态报告与逐手历史；流式中间报告期间只显示占位。
+fn card_explain(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
+    card(ui, |ui| {
+        theme::section_title(ui, "讲解");
+        for line in explain::explain(analysis, board) {
+            let color = match line.tone {
+                explain::Tone::Normal => Color32::from_rgb(214, 218, 226),
+                explain::Tone::Good => theme::colors::OK,
+                explain::Tone::Warn => theme::colors::WARN,
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(line.text).size(12.5).color(color));
+            });
         }
     });
 }
