@@ -106,6 +106,17 @@ pub enum EngineEvent {
     /// 一份分析报告（含渐进中间报告与终态报告；被 terminate 的查询
     /// 会补发终态，上层按 id 丢弃过期项）。
     Report { id: QueryId, report: AnalysisReport, is_final: bool },
+    /// 引擎对顶层未知字段的警告（「字段名可能拼错了」）。**非破坏性**：
+    /// 实测引擎发完警告后照常分析该查询（全部报告正常到达），因此
+    /// 该事件绝不映射为 [`EngineEvent::Failed`]，只做用户可见提示。
+    Warning {
+        /// 被警告的查询（警告报文自带 id；实测总是回带）。
+        id: Option<QueryId>,
+        /// 引擎不认识的顶层字段名（提示里点名用）。
+        field: Option<String>,
+        /// 引擎原文（含 `warnUnusedFields=false` 关闭提示）。
+        message: String,
+    },
     /// 引擎 stderr 日志行或内部说明。
     Log(String),
     /// 结构化失败（启动超时 / 查询超时 / 查询被拒等）。
@@ -312,6 +323,18 @@ impl Engine {
                     self.pending.remove(&id);
                 }
                 Some(EngineEvent::Failed(EngineError::QueryRejected { id, message }))
+            }
+            Incoming::Warning { id, field, message } => {
+                // 非破坏性提示：**绝不能**走 `Incoming::Error` 那条路径——
+                // Error 会 `pending.remove(&id)`（随后的查询超时判定失效），
+                // 上层 `on_failed` 还会清 `inflight`，等于把引擎仍在正常
+                // 分析的查询打死（实测警告后 10 条报告照常到达）。
+                // 这里只转述为日志事件，不动 pending / inflight 任何状态。
+                Some(EngineEvent::Warning {
+                    id,
+                    field,
+                    message,
+                })
             }
             Incoming::TerminateEcho { terminate_id, .. } => Some(EngineEvent::Log(match terminate_id {
                 Some(target) => format!("引擎已确认终止查询 {target}"),

@@ -24,6 +24,23 @@
 //!   首选交叉验证 + 镜像组，`y*19+x` 映射唯一同时解释全部证据），
 //!   **末位推定为弃着**（未确证，渲染层忽略）。概率全盘求和约 1，
 //!   单点常在 1e-4～1e-1，渲染必须做相对刻度归一化才可见。
+//! - `moveInfos[].ownership` 为 opt-in（`includeMovesOwnership`，复数
+//!   Moves；字段名拼错时引擎会发**顶层未知字段警告**并照常分析该查询，
+//!   只是字段不生效、没有数据，见下方 warning 条目）：
+//!   v1.18.2 实测开启后每条报告（**含流式中间报告**）的每个候选点各带
+//!   一份 361 float（19 路）数组 = 「走这一手之后」的领地图（正值黑势，
+//!   与根 `ownership` 同一下标口径），搜索早期即可显示、无需等终态。
+//!   代价：单条报告 3.6 KB → 34.2 KB（约 +3.4 KB/候选），300 visits
+//!   流式一次约 340 KB（基线 9.4 倍）⇒ 必须只在该图层开启时 opt-in。
+//! - 顶层未知字段的警告：引擎会发一条
+//!   `{"field":"<名>","id":"<id>","warning":"Unexpected or unused field, …"}`
+//!   并**随后照常分析该查询**（实测 warning 后仍收到全部正常报告）。
+//!   宽容解析必须把它单独分流（[`Incoming::Warning`]），不能落入报告
+//!   形态——否则缺省 `turn_number` / `is_during_search` 会被判成终态
+//!   空报告，把仍在正常分析的查询静默打死。
+//!   **两级行为要分清**（v1.18.2 实测）：顶层拼错 ⇒ 有 warning 可检测；
+//!   **嵌套**拼错（如 move rule 里的 `until_depth`）⇒ **完全静默**，
+//!   既不报错也不提示，只能靠「效果是否符合预期」发现（本项目踩过）。
 
 use crate::board::{Action, Coord, Size, Stone};
 use serde::{Deserialize, Serialize};
@@ -77,6 +94,12 @@ pub struct AnalysisQuery {
     /// 中间报告）增约 5 KB（362 个浮点的 JSON 文本，实测见模块文档），
     /// 必须只在策略热度图层开启时才请求。
     pub include_policy: bool,
+    /// 是否返回**候选点级** ownership（opt-in，字段名 `includeMovesOwnership`
+    /// 复数 Moves，实测见模块文档）。开启后每个候选点各带一份
+    /// 「走这一手之后」的领地图（`MoveInfo::ownership`），供聚焦候选点时
+    /// 显示后续领地。体积是 ownership/policy 之最（约 +3.4 KB/候选/报告），
+    /// 必须只在对应图层开启时才请求；关闭时不得发送该字段（零开销）。
+    pub include_moves_ownership: bool,
     /// 流式中间报告的输出间隔（秒）；`None` = 不开启，只回终态。
     /// 开启后搜索期间约每 N 秒一条 `isDuringSearch: true` 的中间报告，
     /// 最后仍有一条 `false` 终态（v1.18.2 实测，见模块文档）。
@@ -153,6 +176,7 @@ impl AnalysisQuery {
             max_visits: None,
             include_ownership: false,
             include_policy: false,
+            include_moves_ownership: false,
             report_during_search_every: None,
             analyze_turns: None,
             priority: 0,
@@ -188,6 +212,12 @@ struct WireQuery<'a> {
     include_ownership: bool,
     #[serde(skip_serializing_if = "is_false")]
     include_policy: bool,
+    /// 候选点级 ownership（opt-in）：字段名复数 Moves（实测，见模块文档）；
+    /// 拼错会被引擎当作**顶层未知字段** ⇒ 发 warning 且照常分析该查询，
+    /// 字段不生效、候选不带 ownership（该警告已由 [`Incoming::Warning`]
+    /// 分流到界面提示，不会再静默）。
+    #[serde(skip_serializing_if = "is_false")]
+    include_moves_ownership: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     report_during_search_every: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -280,6 +310,7 @@ impl AnalysisQuery {
             max_visits: self.max_visits,
             include_ownership: self.include_ownership,
             include_policy: self.include_policy,
+            include_moves_ownership: self.include_moves_ownership,
             report_during_search_every: self.report_during_search_every,
             analyze_turns: self.analyze_turns.as_deref(),
             priority: self.priority,
@@ -331,6 +362,10 @@ impl ControlRequest {
 struct WireMessage {
     id: Option<String>,
     error: Option<String>,
+    /// 顶层未知字段的警告报文正文（`"Unexpected or unused field, …"`），
+    /// 与 `field`（被警告的字段名）成对出现；实测**警告后引擎照常分析**，
+    /// 必须分流为非破坏性提示（见 [`Incoming::Warning`]）。
+    warning: Option<String>,
     field: Option<String>,
     action: Option<String>,
     terminate_id: Option<String>,
@@ -355,6 +390,10 @@ struct WireMoveInfo {
     prior: Option<f32>,
     order: Option<u32>,
     lcb: Option<f32>,
+    /// 「走这一手之后」的领地图（opt-in `includeMovesOwnership` 才有；
+    /// 长度 = size²，下标与根 `ownership` 同口径）。缺省 `None` =
+    /// 查询未开启该字段或引擎版本过旧，上层按无数据回落处理。
+    ownership: Option<Vec<f32>>,
 }
 
 #[derive(Default, Deserialize)]
@@ -404,6 +443,11 @@ pub struct MoveInfo {
     pub order: u32,
     /// 置信下界。
     pub lcb: f32,
+    /// 「走这一手之后」的领地图（opt-in [`AnalysisQuery::include_moves_ownership`]
+    /// 才有）：长度 = size²，下标与 [`AnalysisReport::ownership`] 一致，
+    /// 正值 = 黑势。`None` = 查询未开启该字段（宽容解析缺省），上层必须
+    /// 回落根局面数据而非报错。
+    pub ownership: Option<Vec<f32>>,
 }
 
 /// 一次分析报告。
@@ -477,6 +521,7 @@ impl RawReport {
                     prior: info.prior,
                     order: info.order,
                     lcb: info.lcb,
+                    ownership: info.ownership,
                 })
                 .collect(),
             ownership: self.ownership,
@@ -496,6 +541,8 @@ pub(crate) struct RawMoveInfo {
     pub prior: f32,
     pub order: u32,
     pub lcb: f32,
+    /// 候选点级领地图原文（opt-in 才有，[`RawReport::decode`] 原样透传）。
+    pub ownership: Option<Vec<f32>>,
 }
 
 /// 一行 stdout 解码结果（坐标保持 GTP 原文，尺寸后补，见 [`RawReport::decode`]）。
@@ -505,6 +552,11 @@ pub(crate) enum Incoming {
     Report { id: Option<QueryId>, report: RawReport },
     /// 引擎报告的错误（含请求格式错误；实测此时 `id` 可能为空）。
     Error { id: Option<QueryId>, message: String, field: Option<String> },
+    /// 顶层未知字段的警告（实测警告后引擎**照常分析该查询**）：必须与
+    /// [`Incoming::Error`] 严格分流——Error 会移除 pending 并打断在飞查询，
+    /// 而警告只是「字段名可能拼错了，检查一下」，查询本身还在正常出报告，
+    /// 按 Error 处理等于把仍在工作的查询静默打死。
+    Warning { id: Option<QueryId>, field: Option<String>, message: String },
     /// terminate / terminate_all 的回显。
     TerminateEcho { id: Option<QueryId>, terminate_id: Option<String> },
     /// query_version 的应答。
@@ -539,6 +591,14 @@ impl WireMessage {
                 _ => Incoming::TerminateEcho { id, terminate_id: self.terminate_id },
             };
         }
+        // warning 判定必须在构造报告**之前**：warning 报文缺省
+        // `turn_number` / `is_during_search`，若落入报告形态会被
+        // `RawReport::is_final` 判成终态空报告（is_during_search 缺省
+        // false），把引擎仍在正常分析的查询当终态提前收掉（实测：
+        // 警告后 10 条正常报告全部到达，一条都不能丢）。
+        if let Some(message) = self.warning {
+            return Incoming::Warning { id, field: self.field, message };
+        }
         let report = RawReport {
             turn_number: self
                 .turn_number
@@ -567,6 +627,7 @@ impl WireMessage {
                     prior: info.prior.unwrap_or(0.0),
                     order: info.order.unwrap_or(u32::MAX),
                     lcb: info.lcb.unwrap_or(0.0),
+                    ownership: info.ownership,
                 })
                 .collect(),
             ownership: self.ownership,

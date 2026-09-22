@@ -308,6 +308,11 @@ pub struct Snapshot {
     /// 策略头一次前向即完整，第一条流式中间报告里就有，是「搜索早期
     /// 即可显示」的独特数据。
     pub policy: Option<Vec<f32>>,
+    /// 每个候选点的「走这一手之后」领地图（opt-in
+    /// `include_moves_ownership` 才有；随报告整表落位，缺省 `None` =
+    /// 未开启或引擎过旧，上层回落根局面 `ownership`）。
+    /// 与 `moves` 同下标对齐（按 `order` 排序后的候选列表）。
+    pub moves_have_ownership: bool,
 }
 
 /// 局面签名：对手数记录前缀逐字节做 FNV-1a（行棋方 / 着法 / 提子）。
@@ -530,12 +535,22 @@ struct BatchChunk {
     id: QueryId,
     /// 尚待收到的报告数（每 turn 一条，含 noResults 空报告）。
     expect: usize,
-    /// 派发时刻（卡死兜底：超过 [`BATCH_CHUNK_STALL`] 未收齐即放弃该块）。
-    since: Instant,
+    /// **心跳**：最近一次收到该块报告的时刻。卡死判定只看它——
+    /// 「距上次收到报告超过 [`BATCH_CHUNK_STALL`]」才算僵死。
+    ///
+    /// 理由（不能从派发时刻起算）：快扫期间用户连续浏览会发交互查询
+    /// （`priority=10`），引擎逐个让路，20 手一块被拖过 90s 是**正常慢**，
+    /// 从派发时刻计时会把慢误判成死、整批误收尾。改为心跳后：只要还在
+    /// 断续出报告（哪怕 10 秒一条）就不放弃；真正僵死（查询被拒不补发、
+    /// 引擎半死）才是连续 90s 零报告。块收齐时的等待上限自然放宽为
+    /// 「90s × 20 手」量级，可接受——兜底的意义是永不悬挂，不是限时完成。
+    last_report: Instant,
 }
 
-/// 在飞块的最长等待：20 手 @0.94s ≈ 19s，留交互插队（实测 3–6s）与
-/// 引擎波动的余量后取 90s；超时放弃该块继续推进，批量永不悬挂。
+/// 在飞块的**心跳**判定线：距最近一次收到该块报告超过 90s 才算僵死。
+/// （非「派发后 90s 未收齐」——快扫期间交互查询插队会把单块拖慢数倍，
+/// 慢不是死；判定口径见 [`BatchChunk::last_report]。）数值取法：20 手
+/// @0.94s ≈ 19s，留交互插队（实测 3–6s）与引擎波动余量后取 90s。
 const BATCH_CHUNK_STALL: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// 整谱快扫任务状态：对当前线（根 → 叶子）逐手低 visits 分析，报告按
@@ -566,6 +581,16 @@ struct BatchJob {
     done: usize,
 }
 
+/// 引擎「顶层未知字段」警告的一条用户可见记录（按字段名去重，见
+/// [`AnalysisState::engine_warnings`]）。
+#[derive(Clone, Debug)]
+pub struct EngineWarning {
+    /// 引擎不认识的顶层字段名（`None` = 报文未带，按原文整体去重）。
+    pub field: Option<String>,
+    /// 展示文本（已拼入引擎原文与处置说明）。
+    pub text: String,
+}
+
 /// 引擎接线与分析状态。
 pub struct AnalysisState {
     /// 引擎状态机（侧栏直接显示）。
@@ -576,6 +601,11 @@ pub struct AnalysisState {
     pub transient_error: Option<String>,
     /// 最近一条引擎日志（诊断用）。
     pub last_log: Option<String>,
+    /// 引擎「顶层未知字段」警告（会话内保留、按字段名去重）：同一字段
+    /// 只提示一条，避免流式查询每 0.5s 一条报告前都警告一次刷屏。
+    /// 侧栏「消息」卡片直接读取（WARN 色）——不能只落 `last_log`：
+    /// 它没有任何界面展示，用户看不见，等于没修。
+    engine_warnings: Vec<EngineWarning>,
     /// 逐手胜率历史：键 = 局面签名（根到该局面着法前缀的 FNV-1a，
     /// 见 [`position_sig`]）。谱树中不同分支的同一手数是不同局面，
     /// 各存各的：切换分支不互相覆盖，切回来数据仍在。
@@ -614,6 +644,12 @@ pub struct AnalysisState {
     want_policy: bool,
     /// 上次发起查询时的 policy 开关值（比对不一致即重发）。
     sent_policy: bool,
+    /// 候选点级 ownership 的请求开关（由 `App` 随 Overlay 复选框写入）。
+    /// 与 [`Self::want_policy`] 同一套 opt-in 两值比对 + 重发机制：
+    /// 引擎不会主动补发/撤回 per-move ownership，开关切换必须重发查询。
+    want_moves_ownership: bool,
+    /// 上次发起查询时的候选点级 ownership 开关值。
+    sent_moves_ownership: bool,
     /// 整谱快扫任务（`Some` = 进行中）。与常规在飞查询（`inflight`）完全
     /// 独立：批量报告只回填历史，不落展示快照（`on_report` 按 stage 隔离）。
     batch: Option<BatchJob>,
@@ -628,6 +664,7 @@ impl AnalysisState {
             snapshot: None,
             transient_error: None,
             last_log: None,
+            engine_warnings: Vec::new(),
             history: HashMap::new(),
             candidates: HashMap::new(),
             handle: None,
@@ -640,6 +677,8 @@ impl AnalysisState {
             sent_epoch: LimitsEpoch(0),
             want_policy: false,
             sent_policy: false,
+            want_moves_ownership: false,
+            sent_moves_ownership: false,
             batch: None,
             batch_notice: None,
         }
@@ -727,6 +766,25 @@ impl AnalysisState {
         self.want_policy = want;
         // 开关切换后旧快照的 policy 有无与新开关矛盾，直接作废重查。
         self.snapshot = None;
+    }
+
+    /// 设置候选点级 ownership 的请求开关（`App` 随 Overlay 复选框写入）。
+    /// 复刻 [`Self::set_want_policy`] 的机制：值变化即作废快照，`sync`
+    /// 检测 `want/sent` 不一致后自动重发查询（局面未变也重发——opt-in
+    /// 字段是查询级的，引擎不感知「用户改了开关」这一事件）。
+    pub fn set_want_moves_ownership(&mut self, want: bool) {
+        if self.want_moves_ownership == want {
+            return;
+        }
+        self.want_moves_ownership = want;
+        // 旧快照候选点的 ownership 有无与新开关矛盾，作废重查。
+        self.snapshot = None;
+    }
+
+    /// 引擎「顶层未知字段」警告（按字段名去重，会话内保留）。
+    /// 「消息」卡片读取；无警告返回空切片。
+    pub fn engine_warnings(&self) -> &[EngineWarning] {
+        &self.engine_warnings
     }
 
     /// 用当前配置（重）启动引擎；设置面板「应用并重启」与错误重试共用。
@@ -921,12 +979,14 @@ impl AnalysisState {
             self.cancel_batch();
             self.batch_notice = Some("局面已变化，整谱快扫已自动取消。".to_owned());
         }
-        // 批量驱动：派发下一块 / 卡死兜底。在飞块超过 [`BATCH_CHUNK_STALL`]
-        // 未收齐（查询被拒后引擎不再补发等异常路径）即放弃剩余部分收尾，
-        // 批量永不悬挂、UI 永远可操作。
+        // 批量驱动：派发下一块 / 卡死兜底。卡死判定看**心跳**（最近一次
+        // 收到该块报告的时刻）：距上次收到报告超过 [`BATCH_CHUNK_STALL`]
+        // 才判定僵死收尾（查询被拒后引擎不再补发等异常路径）。不能从
+        // 派发时刻计时——快扫期间交互查询插队会把单块拖过 90s，那是
+        // 正常的慢，不是死；慢但仍在出报告就绝不放弃，批量永不悬挂。
         if let Some(job) = self.batch.as_ref()
             && let Some(chunk) = job.active.as_ref()
-            && chunk.since.elapsed() >= BATCH_CHUNK_STALL
+            && chunk.last_report.elapsed() >= BATCH_CHUNK_STALL
         {
             self.finish_batch(false);
         }
@@ -941,10 +1001,16 @@ impl AnalysisState {
         }
         // 限制版本变化（设置区域 / 排除 / 清除）即使局面未变也要重发查询：
         // 限制是查询级字段，引擎不感知「用户改了限制」这一事件。
-        // policy 开关同理：查询级 opt-in 字段，开关切换必须重发才生效。
+        // policy 与候选点级 ownership 开关同理：查询级 opt-in 字段，
+        // 开关切换必须重发才生效。
         let limits_changed = self.limits_epoch != self.sent_epoch;
         let policy_changed = self.want_policy != self.sent_policy;
-        if Some(sig) != self.analyzed_sig.as_deref() || limits_changed || policy_changed {
+        let moves_ownership_changed = self.want_moves_ownership != self.sent_moves_ownership;
+        if Some(sig) != self.analyzed_sig.as_deref()
+            || limits_changed
+            || policy_changed
+            || moves_ownership_changed
+        {
             self.snapshot = None;
             self.transient_error = None;
             if let Some(inflight) = self.inflight.take()
@@ -1065,15 +1131,27 @@ impl AnalysisState {
         job.active = Some(BatchChunk {
             id,
             expect: end - start,
-            since: Instant::now(),
+            // 心跳起点 = 派发时刻：第一份报告到达前「零报告时长」从 0 起算。
+            last_report: Instant::now(),
         });
         job.pending.start = end;
     }
 
     /// 批量终态收尾：完成数报满则生成完成提示；未满（卡死兜底被调用）
     /// 则按实际完成数生成部分完成提示。两种情况都结束任务。
+    /// 在飞块必须 terminate：卡死收尾时引擎多半还在算（或不算了，二者
+    /// 都该停）；正常收尾时块报告恰好收齐、引擎本就空闲，多发一条
+    /// terminate 无害（引擎对已完成的查询回 `noResults` 补发，被上层
+    /// 按「id 不符」丢弃）。不 terminate 的话异常路径会白烧 GPU 算完
+    /// 整块（≤20 手 ≈ 19s），结果却没人收。
     fn finish_batch(&mut self, complete: bool) {
         let Some(job) = self.batch.take() else { return };
+        // terminate 在飞块（若有）：cancel_batch 同款处理，缺省时 no-op。
+        if let Some(chunk) = job.active
+            && let Some(handle) = self.handle.as_mut()
+        {
+            handle.terminate(chunk.id);
+        }
         let total = job.total.end - job.total.start;
         let elapsed = job.started.elapsed();
         self.batch_notice = Some(if complete {
@@ -1112,6 +1190,9 @@ impl AnalysisState {
         // 空报告（noResults，terminate 后未完成 turn 的补发）无数据，只计数。
         if let Some(chunk) = job.active.as_mut() {
             chunk.expect = chunk.expect.saturating_sub(1);
+            // 心跳：每收到一条报告（含空报告）都刷新。卡死判定看的是
+            // 「多久没收到任何报告」，所以空报告同样是活着的证据。
+            chunk.last_report = Instant::now();
         }
         job.active.as_ref().is_none_or(|chunk| chunk.expect == 0)
     }
@@ -1125,9 +1206,15 @@ impl AnalysisState {
         {
             handle.terminate(inflight.id);
         }
-        // 载谱 / 新对局：批量静默丢弃（历史即将清空，任务已无意义），
-        // 在飞块随局面替换 terminate，残余报告因历史清空自然失效。
-        self.batch = None;
+        // 载谱 / 新对局：批量静默丢弃（历史即将清空，任务已无意义）。
+        // 在飞块同样 terminate：不终止的话引擎会把 ≤20 手（约 19s）算完
+        // 才歇，白烧 GPU；残余报告因历史清空自然失效。
+        if let Some(job) = self.batch.take()
+            && let Some(chunk) = job.active
+            && let Some(handle) = self.handle.as_mut()
+        {
+            handle.terminate(chunk.id);
+        }
         self.batch_notice = None;
         self.analyzed_sig = None;
         self.snapshot = None;
@@ -1184,6 +1271,9 @@ impl AnalysisState {
                 self.on_report(id, report, is_final, board, cfg);
             }
             EngineEvent::Log(line) => self.last_log = Some(line),
+            EngineEvent::Warning { id, field, message } => {
+                self.on_warning(id, field, message);
+            }
             EngineEvent::Failed(err) => self.on_failed(err),
             EngineEvent::Exited(status) => {
                 self.inflight = None;
@@ -1205,6 +1295,26 @@ impl AnalysisState {
         }
     }
 
+    /// 引擎「顶层未知字段」警告：**非破坏性**——实测引擎发完警告后照常
+    /// 分析该查询（全部报告正常到达），这里只落用户可见提示，绝不能走
+    /// [`Self::on_failed`]（那会清 `inflight`，把仍在工作的查询打死）。
+    /// 按字段名去重：流式查询每个中间报告都可能触发一次警告，
+    /// 同一字段只保留首条，避免消息卡片刷屏；会话内保留不自动清除。
+    fn on_warning(&mut self, id: Option<QueryId>, field: Option<String>, message: String) {
+        let _ = id; // 警告不改变任何查询状态，id 仅用于展示定位
+        if self.engine_warnings.iter().any(|w| w.field == field) {
+            return;
+        }
+        let name = field.as_deref().unwrap_or("（未知字段）");
+        self.engine_warnings.push(EngineWarning {
+            field: field.clone(),
+            text: format!(
+                "引擎不认识查询里的字段「{name}」（可能拼错了）。\
+                 本次分析仍会照常进行，但该字段不会生效。引擎原文：{message}"
+            ),
+        });
+    }
+
     /// 接收报告：按 id 丢弃过期补发，落快照；流式中间报告实时刷新展示，
     /// 终态关闭在飞并转存逐手历史。
     fn on_report(
@@ -1223,6 +1333,9 @@ impl AnalysisState {
         }
         let (stage, turn, started) = (inflight.stage, inflight.turn, inflight.started);
         let mut moves = report.move_infos;
+        // 「候选点是否带候选级领地图」要在 moves 被 move 进快照前判定
+        //（流式中间报告与终态同构，实测都带；判定一次 O(候选数)）。
+        let moves_have_ownership = moves.iter().any(|info| info.ownership.is_some());
         moves.sort_by_key(|info| info.order);
         // 候选表快照在 moves 被 move 进快照前提取（终态才用得到，
         // 但提前提取成本可忽略：表长 ≤ 候选数）。
@@ -1241,6 +1354,9 @@ impl AnalysisState {
             moves,
             ownership: report.ownership,
             policy: report.policy,
+            // 候选点级 ownership 随 moves 整表落位（MoveInfo.ownership），
+            // 这里只记「有没有」供来源标注与回落判定。
+            moves_have_ownership,
         };
         // 走子口径落位：只认终态（中间报告对决策无意义，守卫见
         // `play::engine_move_decision` 的 is_final 判断）。局面签名随查询
@@ -1381,6 +1497,10 @@ impl AnalysisState {
         // /tmp/policy-notes.md），关闭时必须零开销。开关切换由 `sync` 的
         // want/sent 比对触发重发（局面未变也重发）。
         query.include_policy = self.want_policy;
+        // 候选点级 ownership 同理（opt-in 之最重）：每个候选点 × 361 float
+        // 使单条报告 3.6 KB → 34.2 KB（约 +3.4 KB/候选，实测见模块文档），
+        // 只在「候选点领地」图层开启时才请求；关闭时零开销。
+        query.include_moves_ownership = self.want_moves_ownership;
         // 展示口径开启流式中间报告（边搜边刷新界面）；走子口径只认终态。
         if stage.streaming() {
             query.report_during_search_every = Some(REPORT_EVERY_SECS);
@@ -1396,6 +1516,7 @@ impl AnalysisState {
         self.analyzed_sig = Some(board.records().to_vec());
         self.sent_epoch = self.limits_epoch;
         self.sent_policy = self.want_policy;
+        self.sent_moves_ownership = self.want_moves_ownership;
         self.inflight = Some(Inflight {
             id,
             turn: board.cursor(),

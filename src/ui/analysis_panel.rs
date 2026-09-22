@@ -85,6 +85,9 @@ pub enum PanelAction {
     /// 策略热度图层开关切换：opt-in 数据，需转入 [`AnalysisState`]
     /// 重发查询（`sync` 比对开关状态后重查，局面未变也重发）。
     SetWantPolicy(bool),
+    /// 「候选点领地」开关切换（opt-in `includeMovesOwnership`）：转入
+    /// [`AnalysisState::set_want_moves_ownership`]，机制与策略层相同。
+    SetWantMovesHeat(bool),
     /// 点了候选行的「沿主变前进」：沿该候选的 PV 逐手**预览前进**——
     /// 只在已存在的着法上导航（每手要求当前节点已有匹配的子分支，
     /// 否则停住），**不新建分支、不改棋谱树**。App 完成实际导航。
@@ -376,13 +379,16 @@ fn panel_body(
     // ---- 整谱快扫（批量分析当前线，曲线自动填满）----
     card_batch(ui, analysis, board, &mut action);
 
-    // ---- 叠加层（返回策略层开关是否变化，交由 App 转发重查）----
-    let policy_toggled = card_overlay(ui, overlay, curve_open, tree_open);
-    if policy_toggled {
+    // ---- 叠加层（返回策略层 / 候选点领地层开关是否变化，交由 App 转发重查）----
+    let overlay_toggles = card_overlay(ui, overlay, analysis, curve_open, tree_open);
+    if overlay_toggles.policy_toggled {
         action = PanelAction::SetWantPolicy(overlay.show_policy);
     }
+    if overlay_toggles.moves_heat_toggled {
+        action = PanelAction::SetWantMovesHeat(overlay.show_moves_heat);
+    }
 
-    // ---- 消息（非法落子 / 载入另存 / 引擎错误等提示；无则不占位）----
+    // ---- 消息（非法落子 / 载入另存 / 引擎错误 / 引擎字段警告等；无则不占位）----
     card_messages(
         ui,
         notice,
@@ -391,6 +397,7 @@ fn panel_body(
         save_notice,
         persist_notice,
         &analysis.transient_error,
+        analysis.engine_warnings(),
     );
 
     action
@@ -1314,9 +1321,64 @@ fn worst_row(ui: &mut Ui, entry: crate::ui::analysis::WorstMove, action: &mut Pa
 }
 
 /// 「叠加层」卡片：各层开关（复选框）与胜率色阶图例。
-/// 返回值：策略热度图开关是否被本帧改动（opt-in 重查由 App 转发）。
-fn card_overlay(ui: &mut Ui, overlay: &mut Overlay, curve_open: &mut bool, tree_open: &mut bool) -> bool {
-    let mut policy_toggled = false;
+/// 返回值：opt-in 层（策略 / 候选点领地）开关是否被本帧改动
+/// （重查由 App 转发 [`crate::ui::analysis::AnalysisState`]）。
+struct OverlayToggles {
+    policy_toggled: bool,
+    moves_heat_toggled: bool,
+}
+
+/// 热度图来源行：显示当前热度图画的是哪路数据（候选 X 走后 / 当前局面）。
+/// 「候选点领地」层激活时加紫色「走后假想」标注；回落当前局面时如实体明。
+///
+/// 判定**直接复用棋盘绘制所调的 [`overlay::heat_source`]**（唯一真相），
+/// 不另写一套条件：否则「热度图关闭 / 候选无 ownership / 向量长度不符」
+/// 这些组合下标注会与棋盘不一致（标注说有层、棋盘上什么也没画）。
+fn heat_source_line(ui: &mut Ui, overlay: &Overlay, analysis: &AnalysisState) {
+    let Some(snapshot) = &analysis.snapshot else { return };
+    if !overlay.show_heat {
+        return; // 热度图本身关闭：没有层需要标注
+    }
+    // 与 board_view 同款：只有「候选点领地」开关开启时才把聚焦点交给
+    // heat_source（否则聚焦只是定位高亮，不该被当成热度图数据源）。
+    let focus = overlay
+        .show_moves_heat
+        .then_some(overlay.focus.as_ref())
+        .flatten();
+    let Some((source, _)) = overlay::heat_source(snapshot, focus) else { return };
+    match source {
+        overlay::HeatSource::Candidate(at) => {
+            ui.label(
+                RichText::new(format!("热度图：候选 {} 走后", at.to_gtp(snapshot.size)))
+                    .color(Color32::from_rgb(196, 168, 240))
+                    .size(12.0),
+            )
+            .on_hover_text(
+                "紫色层 = 「走这一手之后」的假想领地（候选点级 ownership），\
+                 与当前局面的暖黑/暖白层色相不同",
+            );
+        }
+        overlay::HeatSource::Position => {
+            ui.label(
+                RichText::new("热度图：当前局面")
+                    .color(Color32::from_rgb(150, 156, 166))
+                    .size(12.0),
+            );
+        }
+    }
+}
+
+fn card_overlay(
+    ui: &mut Ui,
+    overlay: &mut Overlay,
+    analysis: &AnalysisState,
+    curve_open: &mut bool,
+    tree_open: &mut bool,
+) -> OverlayToggles {
+    let mut toggles = OverlayToggles {
+        policy_toggled: false,
+        moves_heat_toggled: false,
+    };
     card(ui, |ui| {
         theme::section_title(ui, "叠加层");
         ui.checkbox(&mut overlay.show_candidates, "候选点圆圈");
@@ -1327,6 +1389,16 @@ fn card_overlay(ui: &mut Ui, overlay: &mut Overlay, curve_open: &mut bool, tree_
                 "引擎还没搜索时的第一直觉（策略网络先验），\
                  不是搜索后的推荐——推荐看「候选点」。",
             );
+        toggles.policy_toggled = policy.changed();
+        let moves_heat = ui
+            .checkbox(&mut overlay.show_moves_heat, "候选点领地")
+            .on_hover_text(
+                "开启后点击候选点定位时，热度图切换为「走这一手之后」的领地\
+                 （紫色层，候选点级 ownership）。代价：每条报告按候选数增重\
+                 （约 +3.4 KB/候选，300 visits 流式一次约 340 KB），\
+                 引擎需重查一次才生效；未聚焦候选点时仍显示当前局面。",
+            );
+        toggles.moves_heat_toggled = moves_heat.changed();
         ui.checkbox(&mut overlay.show_mistakes, "失误标注");
         ui.checkbox(curve_open, "胜率曲线面板");
         ui.checkbox(tree_open, "棋谱树面板");
@@ -1354,10 +1426,10 @@ fn card_overlay(ui: &mut Ui, overlay: &mut Overlay, curve_open: &mut bool, tree_
         });
         ui.weak("圆圈大小 ∝ √visits，白环为主选点；热度深色 = 黑势、浅色 = 白势；\
                  策略层靛蓝色块 ∝ 先验概率，只铺空点");
-        // 策略层开关的变化交给 App 转入 AnalysisState（opt-in 重查在 sync 里）。
-        policy_toggled = policy.changed();
+        // 热度图来源行：与棋盘同源判定，说明当前画的是哪路数据。
+        heat_source_line(ui, overlay, analysis);
     });
-    policy_toggled
+    toggles
 }
 
 /// 「整谱快扫」卡片：对当前线 0..=手数逐手低 visits 批量分析。
@@ -1399,8 +1471,13 @@ fn card_batch(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &mut
     });
 }
 
-/// 「消息」卡片：各类用户可见提示（非法落子 / 载入另存 / 引擎错误等）。
-/// 无任何提示时不渲染（原「无提示。」占位行去除，语义不变）。
+/// 「消息」卡片：各类用户可见提示（非法落子 / 载入另存 / 引擎错误 /
+/// 引擎字段警告等）。无任何提示时不渲染（原「无提示。」占位行去除，
+/// 语义不变）。
+/// 引擎字段警告（WARN 色，会话内保留、按字段名去重——去重在
+/// [`AnalysisState`] 侧完成）单独列出：它是「配置可能拼错了」的提醒，
+/// 与瞬时错误（红）语义不同，不能混排，也不能只落无人可见的日志。
+#[allow(clippy::too_many_arguments)]
 fn card_messages(
     ui: &mut Ui,
     notice: Option<IllegalReason>,
@@ -1409,13 +1486,15 @@ fn card_messages(
     save_notice: Option<&LoadNotice>,
     persist_notice: Option<&str>,
     transient_error: &Option<String>,
+    engine_warnings: &[super::analysis::EngineWarning],
 ) {
     let has_any = notice.is_some()
         || startup_notice.is_some()
         || load_notice.is_some()
         || save_notice.is_some()
         || persist_notice.is_some()
-        || transient_error.is_some();
+        || transient_error.is_some()
+        || !engine_warnings.is_empty();
     if !has_any {
         return;
     }
@@ -1429,6 +1508,9 @@ fn card_messages(
         }
         if let Some(text) = startup_notice {
             ui.colored_label(theme::colors::WARN, text);
+        }
+        for warning in engine_warnings {
+            ui.colored_label(theme::colors::WARN, &warning.text);
         }
         if let Some(text) = transient_error {
             ui.colored_label(theme::colors::WARN, text);

@@ -1,5 +1,5 @@
 //! 棋盘分析叠加层（TASKS 4.1 / 4.2 / 4.4）：候选点圆圈、ownership 热度图、
-//! 失误标注、侧栏点击定位高亮与主变幽灵子。
+//! 「候选点走后」领地图、失误标注、侧栏点击定位高亮与主变幽灵子。
 //!
 //! 数据只读自 [`Snapshot`] 与 [`AnalysisState`]（分析结果唯一存放点，
 //! 失误标注按手数从历史缓冲现场派生），几何换算复用 [`Layout`]；
@@ -18,6 +18,14 @@
 //!   （下限 [`HEAT_SCALE_MIN`]）线性归一化后乘最大不透明度（开局各点
 //!   目差实测 |v| < 1，绝对刻度会整层不可见）；黑势叠深色块、白势叠
 //!   浅色块，绘制在棋子之下，棋子保持清晰；
+//! - **候选点领地图**（opt-in `includeMovesOwnership`）：侧栏聚焦某候选点
+//!   且该候选带 ownership 时，热度图数据源从「当前局面」切换为「走该手
+//!   之后」的领地，并**换一套色相**（紫灰 vs 根层暖黑/暖白）让两种层
+//!   肉眼可辨；无聚焦 / 候选无数据时回落根局面并如实标注来源。
+//!   **聚焦切换不重发查询**（设计决策）：聚焦是点击触发而非 hover，无
+//!   查询风暴风险；且引擎搜索树跨查询存活，同 visits 重查虽快，但一次
+//!   查询的 moveInfos 已携带**全部**候选点的 ownership——切焦点只是从
+//!   已到手的候选表里换一条向量，重查纯属浪费，还能保持流式刷新连续。
 //! - 策略热度图：`policy` 为策略网络的选点先验（「还没搜索时的第一直觉」，
 //!   与候选点的「搜索后结论」是不同维度），只取前 size² 项、只画**空点**
 //!   （已有棋子的点没有落子意义，policy 在那里是噪声）；按当前快照空点
@@ -72,6 +80,11 @@ pub struct Overlay {
     /// 策略热度图层开关（引擎还没搜索时的第一直觉，非推荐）。
     /// 默认关闭：opt-in 数据，打开时 `App` 同步 `AnalysisState` 重发查询。
     pub show_policy: bool,
+    /// 「候选点领地」开关（opt-in `includeMovesOwnership`）：开启后聚焦
+    /// 候选点时热度图切换为「走该手之后」的领地（紫灰色相）。
+    /// 默认关闭：每候选 × 361 float 的查询字段，打开时 `App` 同步
+    /// `AnalysisState` 重发查询。
+    pub show_moves_heat: bool,
     /// 失误标注层开关（疑问手及以上才画，关闭时零绘制开销）。
     pub show_mistakes: bool,
     /// 侧栏点击定位；局面变化（快照作废）时由 App 清除。
@@ -129,34 +142,100 @@ pub(crate) fn severity_color(severity: Severity) -> Color32 {
     }
 }
 
-/// ownership 热度图：整格色块铺在网格之上、棋子之下。
-/// `None` / 长度不符 / 空局面（turn == 0）安全跳过。
-pub(crate) fn draw_heat(painter: &Painter, layout: &Layout, snapshot: &Snapshot) {
-    if snapshot.turn == 0 {
-        return; // 空局面不渲染热度
+/// 热度图数据源：聚焦候选点的「走后领地」，或回落当前局面。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HeatSource {
+    /// 当前局面（根 ownership）。
+    Position,
+    /// 聚焦候选点（`at` = 该候选落点）走之后的领地。
+    Candidate(Coord),
+}
+
+impl HeatSource {
+    /// 侧栏 / 图例的来源标注文案。
+    pub fn label(self, size: crate::board::Size) -> String {
+        match self {
+            Self::Position => "当前局面".to_owned(),
+            Self::Candidate(c) => format!("候选 {} 走后", c.to_gtp(size)),
+        }
     }
-    let Some(ownership) = &snapshot.ownership else {
-        return;
-    };
+}
+
+/// 候选点领地层的色相与透明度（与根局面层明显区分）：
+/// - 根局面层：暖黑 / 暖白（贴近「实地成片」的直观感受）；
+/// - 候选点层：紫灰相（冷色，一看即知「这不是现在的领地，是走那手之后
+///   的假想图」），且整体透明度上调一档——层内最大 |ownership| 通常比
+///   根局面大（走一手后空点更多成空），同刻度会显得更刺眼，压一档平衡。
+const CAND_HEAT_DARK: (u8, u8, u8) = (44, 20, 66);
+const CAND_HEAT_LIGHT: (u8, u8, u8) = (232, 222, 246);
+const CAND_HEAT_MAX_ALPHA: f32 = 170.0;
+
+/// 解析热度图的数据源：优先聚焦候选点（侧栏点击设置）的
+/// `MoveInfo::ownership`；无聚焦 / 候选无数据 / 长度不符时回落根局面。
+/// 返回 `(数据源标识, 向量)`；两路都无数据返回 `None`（整层跳过）。
+pub(crate) fn heat_source<'a>(
+    snapshot: &'a Snapshot,
+    focus: Option<&Focus>,
+) -> Option<(HeatSource, &'a [f32])> {
     let size = snapshot.size;
-    if ownership.len() != size.point_count() {
-        return; // 长度不符：数据不可信，整层跳过
+    let count = size.point_count();
+    if let Some(focus) = focus {
+        // 只认「聚焦点 = 该候选落点」的条目：局面刷新后 focus 被 App 清除，
+        // 不会出现跨局面错配；弃着（mv = None）不参与。
+        if let Some(info) = snapshot
+            .moves
+            .iter()
+            .find(|info| Some(focus.at) == info.mv)
+            && let Some(vec) = info.ownership.as_deref()
+            && vec.len() == count
+        {
+            return Some((HeatSource::Candidate(focus.at), vec));
+        }
     }
-    // 分母取当前快照最大 |ownership|（下限保底），线性映射：
+    // 回落：根局面 ownership（开关未开 / 未聚焦 / 该候选无数据均到此）。
+    snapshot
+        .ownership
+        .as_deref()
+        .filter(|vec| vec.len() == count)
+        .map(|vec| (HeatSource::Position, vec))
+}
+
+/// ownership 热度图：整格色块铺在网格之上、棋子之下。
+/// 数据源 = [`heat_source`]（聚焦候选点的「走后领地」优先，回落当前
+/// 局面）；候选点层用紫灰色相与根局面层（暖黑/暖白）肉眼区分。
+/// `None` / 空局面（turn == 0）安全跳过。
+pub(crate) fn draw_heat(
+    painter: &Painter,
+    layout: &Layout,
+    snapshot: &Snapshot,
+    focus: Option<&Focus>,
+) -> Option<HeatSource> {
+    if snapshot.turn == 0 {
+        return None; // 空局面不渲染热度
+    }
+    let (source, ownership) = heat_source(snapshot, focus)?;
+    let candidate_layer = matches!(source, HeatSource::Candidate(_));
+    // 分母取当前数据源最大 |ownership|（下限保底），线性映射：
     // 最强点取最大不透明度，弱值回落，避免开局小值被放大成整盘雾感。
     let scale = ownership.iter().fold(HEAT_SCALE_MIN, |a, &b| a.max(b.abs()));
+    let (dark, light, max_alpha) = if candidate_layer {
+        (CAND_HEAT_DARK, CAND_HEAT_LIGHT, CAND_HEAT_MAX_ALPHA)
+    } else {
+        ((16, 22, 30), (246, 249, 253), HEAT_MAX_ALPHA)
+    };
     for (i, v) in ownership.iter().enumerate() {
-        let alpha = (v.abs() / scale * HEAT_MAX_ALPHA).round() as u8;
+        let alpha = (v.abs() / scale * max_alpha).round() as u8;
         if alpha == 0 {
             continue; // 接近零的点不画，省去大半填充
         }
-        let Some(c) = Coord::from_index(size, i) else { continue };
+        let Some(c) = Coord::from_index(snapshot.size, i) else { continue };
         // 外扩半像素，避免相邻色块之间出现细缝。
         let rect = Rect::from_center_size(layout.point(c), Vec2::splat(layout.spacing + 0.5));
         // 正值 = 黑势（引擎约定）：黑势叠深色，白势叠浅色。
-        let (r, g, b) = if *v > 0.0 { (16, 22, 30) } else { (246, 249, 253) };
+        let (r, g, b) = if *v > 0.0 { dark } else { light };
         painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(r, g, b, alpha));
     }
+    Some(source)
 }
 
 /// 策略热度图：策略网络的选点先验铺在空点上（棋子之下）。

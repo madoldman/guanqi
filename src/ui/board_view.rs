@@ -101,6 +101,8 @@ pub fn show(
     let response = ui.allocate_rect(board_area, sense);
 
     let size = board.size();
+    // 热度图数据源标识（棋盘块内赋值，块外供状态栏标注读取）。
+    let mut heat_tag = None;
     if let Some(layout) = Layout::fit(response.rect, size) {
         let snapshot = analysis.snapshot.as_ref();
         let painter = ui.painter_at(layout.rect.expand(2.0));
@@ -109,10 +111,17 @@ pub fn show(
         draw_stars(&painter, &layout, size);
         draw_coordinates(&painter, &layout, size);
         // 热度图压在棋子之下：只染交叉点格块，棋子保持清晰。
+        // 「候选点领地」开关开启时热度图可切换到聚焦候选点的「走后」
+        // 领地（无聚焦回落当前局面）；实际用哪路数据由 draw_heat 内的
+        // heat_source 判定，返回来源供状态栏 / 图例标注。
         if overlay.show_heat
             && let Some(snapshot) = snapshot
         {
-            overlay::draw_heat(&painter, &layout, snapshot);
+            let focus = overlay
+                .show_moves_heat
+                .then_some(overlay.focus.as_ref())
+                .flatten();
+            heat_tag = overlay::draw_heat(&painter, &layout, snapshot, focus);
         }
         // 策略热度图同样压在棋子之下（棋子之上于热度图，同开时策略层
         // 的小圆片叠在 ownership 大方块上，两种数据都可见）。
@@ -193,7 +202,32 @@ pub fn show(
         BranchSel::None => {}
     }
 
+    // 热度图数据源标识（候选点走后 / 当前局面）：有内容时在状态栏
+    // 显式标出，让「现在这层紫灰色画的是哪手的领地」永远可判读。
+    if let Some(source) = heat_tag {
+        draw_heat_source_tag(ui, board.size(), source);
+    }
+
     draw_status(ui, board, *notice, branch_notice.as_deref(), play, &limits);
+}
+
+/// 热度图数据源标识行：棋盘上方小字（琥珀/紫色弱化），只在候选点层
+/// 激活时显示「候选 X 走后」；回落当前局面时保持沉默（默认态无需解释，
+/// 但候选点层有「走后」假想语义，必须显式标注防误读）。
+fn draw_heat_source_tag(ui: &mut Ui, size: Size, source: overlay::HeatSource) {
+    if let overlay::HeatSource::Candidate(at) = source {
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 0.0),
+            egui::Layout::left_to_right(egui::Align::Min),
+            |ui| {
+                ui.label(
+                    RichText::new(format!("热度图：候选 {} 走后（紫灰 = 假想领地）", at.to_gtp(size)))
+                        .color(Color32::from_rgb(196, 168, 240))
+                        .size(11.0),
+                );
+            },
+        );
+    }
 }
 
 /// 分支选择器的一帧交互结果（绘制期间收集，绘制后统一执行）。
