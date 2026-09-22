@@ -623,6 +623,31 @@ impl GuanqiApp {
         self.notice = None;
     }
 
+    /// 「沿主变前进」的执行体（预览式语义 (a)）：只在谱上**已存在**的
+    /// 着法上导航。每手在当前节点的子分支里找与 PV 一致的着法（落点 +
+    /// 行棋方都相同，弃着比对 Pass），找不到即停——绝不新建分支，
+    /// `move_count()` 不变。游标停在哪算哪（用户看到棋盘走到哪）；
+    /// 若 PV 首手不在子分支里则完全不动。
+    fn handle_advance_pv(&mut self, pv: Vec<Option<crate::board::Coord>>) {
+        for step in pv {
+            let target = match step {
+                Some(at) => crate::board::Action::Place(at),
+                None => crate::board::Action::Pass,
+            };
+            // 子分支着法 = 子节点记录；只认当前行棋方产生的记录，
+            // 防止 PV 与实际轮转错位时误走对手的着法。
+            let matched = (0..self.board.child_count()).find(|&i| {
+                self.board
+                    .child_move(i)
+                    .is_some_and(|r| r.action == target && r.player == self.board.to_play())
+            });
+            match matched {
+                Some(i) if self.board.select_child(i) => {}
+                _ => break, // 谱上没有这手：预览到此为止
+            }
+        }
+    }
+
     /// 切换到原谱（`others` 中 `from_move == None` 的那份）；已在原谱或
     /// 原谱不在列表时静默不动。
     fn switch_to_original(&mut self) {
@@ -934,6 +959,14 @@ impl eframe::App for GuanqiApp {
             }
             analysis_panel::PanelAction::ClearLimits => {
                 self.analysis.clear_limits();
+            }
+            // 沿候选主变前进（预览式）：只在谱上**已存在**的着法上导航。
+            // 每手在当前节点的子分支里找与 PV 一致的着法（落点 + 行棋方
+            // 都相同，弃着比对 Pass），找不到即停——绝不新建分支，游标
+            // 停在哪算哪（用户看到棋盘走到哪）。逐段导航：若 PV 首手
+            // 不在子分支里则完全不动。
+            analysis_panel::PanelAction::AdvancePv { pv, .. } => {
+                self.handle_advance_pv(pv);
             }
         }
 

@@ -13,7 +13,7 @@
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2};
 
-use crate::board::{Board, Coord, IllegalReason, Stone};
+use crate::board::{Board, Coord, IllegalReason, Size, Stone};
 use crate::engine::{Difficulty, EngineConfig, RootInfo};
 use crate::play::{PlayState, resign_text};
 use crate::sgf::GameMeta;
@@ -24,6 +24,11 @@ use super::theme;
 /// 侧栏展示的候选点条数（空盘时引擎可回上百条，只取前几条；
 /// 与棋盘叠加层 `CANDIDATE_LIMIT` 解耦，各自维护）。
 const MOVE_LIMIT: usize = 6;
+
+/// 主变（PV）显示 / 幽灵子虚影共用的截断手数：侧栏 PV 文本行与棋盘
+/// 预览（`overlay::GHOST_LIMIT`）必须一致——用户看到的文本和棋盘上
+/// 摆出的预览是同一个主变的前缀，两处各写一个数迟早漂移。
+pub(crate) const PV_LIMIT: usize = 8;
 
 /// 侧栏按钮触发的动作（由调用方在绘制结束后执行，避免借用冲突）。
 #[derive(Default)]
@@ -73,6 +78,15 @@ pub enum PanelAction {
     /// 区域开关切换（`Some(())` = 请求开启，`None` = 请求关闭并清除区域）。
     /// 开启只需改模式（区域等用户在棋盘上拖出）。
     SetRegion(Option<()>),
+    /// 点了候选行的「沿主变前进」：沿该候选的 PV 逐手**预览前进**——
+    /// 只在已存在的着法上导航（每手要求当前节点已有匹配的子分支，
+    /// 否则停住），**不新建分支、不改棋谱树**。App 完成实际导航。
+    AdvancePv {
+        /// 主变首手（与 PV 同源，弃着行不出现该动作）。
+        at: Coord,
+        /// 主变序列（首手起，`None` = 弃着），截断到 [`PV_LIMIT`]。
+        pv: Vec<Option<Coord>>,
+    },
 }
 
 /// 「打开棋谱」流程的用户可见提示（App 写入，随侧栏提示行显示）。
@@ -200,6 +214,24 @@ fn info_line(ui: &mut Ui, label: &str, value: &str) {
         ui.label(RichText::new(label).weak());
         ui.label(RichText::new(value).size(12.5));
     });
+}
+
+/// 主变（PV）文本：`D4 → Q16 → …`，截断到 [`PV_LIMIT`] 手。
+/// 坐标用 GTP 格式（跳 I）；`None`（弃着）显示「弃着」；
+/// 被截断时以「 …」结尾提示还有后续。空 PV 返回 `None`（不显示该行）。
+fn pv_text(pv: &[Option<Coord>], size: Size) -> Option<String> {
+    if pv.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = pv
+        .iter()
+        .take(PV_LIMIT)
+        .map(|c| c.map_or_else(|| "弃着".to_owned(), |c| c.to_gtp(size)))
+        .collect();
+    if pv.len() > PV_LIMIT {
+        parts.push("…".to_owned());
+    }
+    Some(parts.join(" → "))
 }
 
 /// 绘制分析侧栏。`settings_open` 由本面板与顶部按钮共享；
@@ -829,7 +861,8 @@ fn card_winrate(ui: &mut Ui, analysis: &AnalysisState) {
     });
 }
 
-/// 「候选点」卡片：全宽按钮行，点 / 胜率 / visits 三段排版，点击定位。
+/// 「候选点」卡片：全宽按钮行，点 / 胜率 / visits 三段排版，点击定位；
+/// 行下方弱色小字显示该候选的主变（PV）前缀。
 fn card_candidates(
     ui: &mut Ui,
     analysis: &AnalysisState,
@@ -860,6 +893,8 @@ fn card_candidates(
 /// 候选点行：自绘全宽按钮（左坐标 / 中胜率 / 右 visits），选中态与
 /// 棋盘定位高亮呼应（琥珀填充）；弃着行不可点。行尾「排除」小钮把
 /// 该手加入 avoidMoves（再次点击同点行间互斥由 `AnalysisState` 去重）。
+/// 行体下方为该候选的主变（PV）弱色小字行；行尾「沿主变前进」小钮
+/// 只沿**已存在**的着法导航（预览式，不新建分支，见 [`PanelAction::AdvancePv`]）。
 #[allow(clippy::too_many_arguments)]
 fn candidate_row(
     ui: &mut Ui,
@@ -880,10 +915,12 @@ fn candidate_row(
         .as_ref()
         .is_some_and(|f| Some(f.at) == info.mv);
     let interactive = info.mv.is_some();
+    // PV 文本行：空 PV（罕见，引擎至少回首手）不占位。
+    let pv_line = pv_text(&info.pv, size);
 
     let height = 24.0;
-    // 行尾「排除」按钮占宽（弃着行没有，行体占满整行）。
-    let tail = if interactive { 46.0 } else { 0.0 };
+    // 行尾「排除」「前进」按钮占宽（弃着行没有，行体占满整行）。
+    let tail = if interactive { 92.0 } else { 0.0 };
     let (rect, mut response) = ui.allocate_exact_size(
         Vec2::new(ui.available_width() - tail, height),
         if interactive {
@@ -949,12 +986,14 @@ fn candidate_row(
         *action = PanelAction::Focus { at, ghosts };
     }
 
-    // 行尾「排除」按钮：独立交互区（右键棋盘空点是等效入口）。
+    // 行尾「排除」「前进」按钮：独立交互区（排除另可右键棋盘空点）。
     if let Some(at) = info.mv
         && let Some(player) = to_play
     {
+        // 两个小钮并排（排除 / 沿主变前进），等宽对齐。
+        let btn_w = (tail - 8.0) / 2.0;
         let (brect, btn) =
-            ui.allocate_exact_size(Vec2::new(tail - 4.0, height - 4.0), Sense::click());
+            ui.allocate_exact_size(Vec2::new(btn_w, height - 4.0), Sense::click());
         let painter = ui.painter_at(brect);
         let hover = btn.hovered() || btn.is_pointer_button_down_on();
         painter.rect_filled(
@@ -981,6 +1020,54 @@ fn candidate_row(
         if btn.clicked() {
             *action = PanelAction::ToggleAvoid { player, at };
         }
+
+        let (frect, fwd) =
+            ui.allocate_exact_size(Vec2::new(btn_w, height - 4.0), Sense::click());
+        let painter = ui.painter_at(frect);
+        let hover = fwd.hovered() || fwd.is_pointer_button_down_on();
+        painter.rect_filled(
+            frect,
+            4.0,
+            if hover {
+                Color32::from_rgb(44, 58, 72)
+            } else {
+                Color32::from_rgb(42, 48, 56)
+            },
+        );
+        painter.text(
+            frect.center(),
+            Align2::CENTER_CENTER,
+            "前进",
+            FontId::proportional(10.5),
+            if hover {
+                Color32::from_rgb(150, 200, 255)
+            } else {
+                Color32::from_rgb(168, 186, 206)
+            },
+        );
+        let fwd = fwd.on_hover_text(
+            "沿该候选的主变逐手前进（只走谱上已有的着法，缺处即停；不新建分支）",
+        );
+        if fwd.clicked() {
+            *action = PanelAction::AdvancePv {
+                at,
+                pv: info.pv.iter().take(PV_LIMIT).copied().collect(),
+            };
+        }
+    }
+
+    // PV 文本行：小字号 + 弱化色，紧贴候选行下方；点击不与上方行体冲突。
+    if let Some(text) = pv_line {
+        ui.horizontal_wrapped(|ui| {
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(text)
+                    .monospace()
+                    .size(10.5)
+                    .color(Color32::from_rgb(140, 148, 160)),
+            )
+            .on_hover_text("该候选的主变（PV）前缀，与棋盘预览截断一致");
+        });
     }
 }
 

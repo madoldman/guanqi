@@ -31,8 +31,9 @@ use super::board_view::Layout;
 
 /// 棋盘上绘制的候选点条数（与侧栏 `MOVE_LIMIT` 解耦，各自维护）。
 const CANDIDATE_LIMIT: usize = 8;
-/// 主变幽灵子最多绘制的手数。
-const GHOST_LIMIT: usize = 8;
+/// 主变幽灵子最多绘制的手数（与侧栏 PV 文本行共用 [`PV_LIMIT`]，
+/// 保证「看到的主变文本」与「棋盘预览」截断一致）。
+const GHOST_LIMIT: usize = super::analysis_panel::PV_LIMIT;
 /// 热度归一化分母下限（目）：开局 |ownership| 很小，保底分母避免噪声放大过度。
 const HEAT_SCALE_MIN: f32 = 2.0;
 /// 热度块最大不透明度（0-255），为网格与棋子留出辨识度。
