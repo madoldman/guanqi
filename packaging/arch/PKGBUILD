@@ -1,17 +1,22 @@
 # Maintainer: 刘传玉
 # 观棋 —— KataGo 围棋 AI 引擎图形前端（本地打包，暂不提交 AUR）
 #
-# 打包方式（在仓库 packaging/arch/ 目录说明，实际构建在仓库外进行，例如
-# /home/madoldman/build/guanqi-pkg/）：
-#   1) 生成源码包（在仓库根目录执行；含工作树中的 LICENSE，排除 .git/target/packaging）：
-#      tar --exclude-vcs --exclude=target --exclude=packaging \
-#          --transform 's,^\./,guanqi-0.1.0/,' \
-#          -czf /home/madoldman/build/guanqi-pkg/guanqi-0.1.0.tar.gz .
-#      （主流程把 LICENSE 提交入库后，可改为标准做法：
-#        git archive --format=tar.gz --prefix=guanqi-0.1.0/ -o guanqi-0.1.0.tar.gz HEAD）
-#   2) 生成离线依赖包：cargo vendor <目录> 后 tar -czf vendor.tar.gz <目录名>
-#   3) 把本 PKGBUILD 复制到构建目录（桌面入口与图标随源码包分发，无需单独复制）
-#   4) makepkg 构建，sudo pacman -U guanqi-0.1.0-1-x86_64.pkg.tar.zst 安装
+# 打包方式（实际构建在仓库外进行，例如 /home/madoldman/build/guanqi-pkg/）：
+#   1) 生成源码包（仓库根目录执行。用 git archive：只打包已提交内容，
+#      天然排除 .git/target，且同一提交产出可复现的 tarball）：
+#        git archive --format=tar.gz --prefix=guanqi-0.1.0/ \
+#            -o /home/madoldman/build/guanqi-pkg/guanqi-0.1.0.tar.gz HEAD
+#   2) 离线依赖包 vendor.tar.gz：依赖（Cargo.toml/Cargo.lock）有变动时才需重建，
+#      命令 `cargo vendor <目录>` 后 `tar -czf vendor.tar.gz <目录名>`；
+#      未变动就复用构建目录里已有的 vendor.tar.gz（sha256 不变，见下）。
+#   3) 更新下面的 sha256sums：源码包每次必换（内容随提交变），vendor 包仅在重建时换。
+#      用 `sha256sum guanqi-0.1.0.tar.gz vendor.tar.gz` 取值。
+#   4) 把本 PKGBUILD 复制到构建目录（桌面入口与图标随源码包分发，无需单独复制）；
+#      源码有改动时递增 pkgrel（同一上游版本的新构建，便于区分已装版本）。
+#   5) makepkg -f 构建（保留构建目录里的 src/target 可增量编译），
+#      然后 sudo pacman -U guanqi-<pkgver>-<pkgrel>-x86_64.pkg.tar.zst 安装。
+#      装完可用 `pacman -Q guanqi` 核对版本、`grep -a 整谱快扫 /usr/bin/guanqi`
+#      之类的字符串抽查确认新功能确实进了包。
 #
 # 共用资源：桌面入口与图标位于仓库 `resources/`（`resources/guanqi.desktop`、
 # `resources/icons/guanqi.svg` 与各尺寸 PNG）—— 放仓库共用目录而非本目录，
@@ -19,7 +24,7 @@
 
 pkgname=guanqi
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc='观棋 —— KataGo 围棋 AI 引擎图形前端'
 arch=('x86_64')
 license=('MIT')
@@ -58,7 +63,7 @@ source=(
   "guanqi-$pkgver.tar.gz"
   'vendor.tar.gz'
 )
-sha256sums=('1f96c495bf1b4885bea0be6e7b3f5452e1dae4200b68165989f9a102cff50a5a'
+sha256sums=('f5939e2498bc57b085a80ebc7aac18d142d7056f88e9bf5de6913d828495768a'
             '126bfe2b530670e39af8307d5552790bf4c408a82b3e203cb60bbe8691153ac1')
 
 prepare() {
