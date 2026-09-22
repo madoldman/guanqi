@@ -973,6 +973,17 @@ impl eframe::App for GuanqiApp {
             analysis_panel::PanelAction::AdvancePv { pv, .. } => {
                 self.handle_advance_pv(pv);
             }
+            // 整谱快扫：对当前线逐手低 visits 批量分析（报告按 turnNumber
+            // 回填逐手历史，曲线自动填满）。发起失败的提示走消息区。
+            analysis_panel::PanelAction::StartBatch => {
+                if let Some(reason) = self.analysis.start_batch(&self.board, self.komi) {
+                    self.load_notice = Some(analysis_panel::LoadNotice::Warn(reason));
+                }
+            }
+            // 取消整谱快扫：terminate 在飞块，提示由下一帧 take_batch_notice 落位。
+            analysis_panel::PanelAction::CancelBatch => {
+                self.analysis.cancel_batch();
+            }
         }
 
         // 胜率曲线底部面板（TASKS 4.3）：隐藏时不创建，零额外计算；
@@ -1159,6 +1170,10 @@ impl eframe::App for GuanqiApp {
             && self.board.cursor() == self.board.line_len();
         self.analysis
             .sync(&self.board, &self.engine_cfg, self.komi, want_play_query);
+        // 整谱快扫结束提示（完成 / 取消 / 局面变化自动取消）落位到消息区。
+        if let Some(notice) = self.analysis.take_batch_notice() {
+            self.load_notice = Some(analysis_panel::LoadNotice::Ok(notice));
+        }
         // 局面变化会先作废快照（见 AnalysisState::sync），借此时机清除定位高亮。
         if self.analysis.snapshot.is_none() {
             self.overlay.focus = None;
@@ -1194,7 +1209,10 @@ impl eframe::App for GuanqiApp {
 
         // 启动 / 分析期间保持低频重绘，让状态与计时可见
         // （事件到达时 waker 已会触发立即重绘）。
-        if matches!(self.analysis.engine, EngineStatus::Starting) || self.analysis.analyzing() {
+        if matches!(self.analysis.engine, EngineStatus::Starting)
+            || self.analysis.analyzing()
+            || self.analysis.batch_progress().is_some()
+        {
             ctx.request_repaint_after(Duration::from_millis(500));
         } else {
             // 空闲兜底：复盘浏览时若没有任何 repaint 源（引擎空闲、无对话框、

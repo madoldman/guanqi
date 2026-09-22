@@ -92,6 +92,11 @@ pub enum PanelAction {
         /// 主变序列（首手起，`None` = 弃着），截断到 [`PV_LIMIT`]。
         pv: Vec<Option<Coord>>,
     },
+    /// 点了「整谱快扫」：对当前线逐手低 visits 批量分析（App 转交
+    /// [`AnalysisState::start_batch`]，报告按 turnNumber 回填逐手历史）。
+    StartBatch,
+    /// 点了「取消快扫」：terminate 在飞批量查询并结束任务。
+    CancelBatch,
 }
 
 /// 「打开棋谱」流程的用户可见提示（App 写入，随侧栏提示行显示）。
@@ -358,6 +363,9 @@ fn panel_body(
 
     // ---- 失误统计（TASKS 4.4）----
     card_mistakes(ui, analysis, board);
+
+    // ---- 整谱快扫（批量分析当前线，曲线自动填满）----
+    card_batch(ui, analysis, board, &mut action);
 
     // ---- 叠加层（返回策略层开关是否变化，交由 App 转发重查）----
     let policy_toggled = card_overlay(ui, overlay, curve_open, tree_open);
@@ -1179,6 +1187,45 @@ fn card_overlay(ui: &mut Ui, overlay: &mut Overlay, curve_open: &mut bool, tree_
         policy_toggled = policy.changed();
     });
     policy_toggled
+}
+
+/// 「整谱快扫」卡片：对当前线 0..=手数逐手低 visits 批量分析。
+/// 进行中显示进度条 + 已用时长 + 取消按钮；空闲时显示发起入口
+/// （总手数为 0 的空盘无谱可扫，入口置灰）。
+fn card_batch(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &mut PanelAction) {
+    card(ui, |ui| {
+        theme::section_title(ui, "整谱快扫");
+        if let Some((done, total, elapsed)) = analysis.batch_progress() {
+            // 进度条 + 计数 / 时长：批量的主要反馈（曲线随进度同步填充）。
+            ui.add(
+                egui::ProgressBar::new(done as f32 / total.max(1) as f32)
+                    .show_percentage()
+                    .desired_height(14.0),
+            );
+            ui.weak(format!(
+                "{done} / {total} 手 · 已用 {}",
+                crate::ui::analysis::format_batch_elapsed(elapsed),
+            ));
+            ui.add_space(2.0);
+            if wide_button(ui, "取消快扫").clicked() {
+                *action = PanelAction::CancelBatch;
+            }
+        } else {
+            ui.weak(format!(
+                "对当前线 {} 手逐手 {} visits 快扫，填满胜率曲线与失误统计。",
+                board.line_len(),
+                crate::ui::analysis::BATCH_VISITS,
+            ));
+            ui.add_space(2.0);
+            let empty = board.line_len() == 0;
+            let entry = ui.add_enabled(!empty, egui::Button::new("整谱快扫"));
+            if empty {
+                entry.on_disabled_hover_text("空盘无谱可扫");
+            } else if entry.clicked() {
+                *action = PanelAction::StartBatch;
+            }
+        }
+    });
 }
 
 /// 「消息」卡片：各类用户可见提示（非法落子 / 载入另存 / 引擎错误等）。

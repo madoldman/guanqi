@@ -84,6 +84,11 @@ pub struct AnalysisQuery {
     /// 显式指定要分析的 turn 列表（`None` = 只分析 `moves` 结束后的最终局面）。
     /// 实测引擎对每个 turn 独立搜索并逐个输出终态报告。
     pub analyze_turns: Option<Vec<usize>>,
+    /// 查询优先级（整数，越大越优先被引擎调度）。v1.18.2 实测有效：
+    /// 61-turn 批量查询占满队列时，带 `priority: 10` 的单 turn 查询可在
+    /// 数秒内插队返回；不带则被完全阻塞（90 秒无响应，threads=1 与 4 一致）。
+    /// 交互查询应高于批量查询（KaTrain 同款用法：base_priority + priority）。
+    pub priority: i32,
     /// 选点限制（限定区域 = allowMoves / 排除选点 = avoidMoves）。
     /// 实测二者同时给出会被引擎拒绝（`Cannot specify both allowMoves and
     /// avoidMoves`），上层必须互斥。
@@ -150,6 +155,7 @@ impl AnalysisQuery {
             include_policy: false,
             report_during_search_every: None,
             analyze_turns: None,
+            priority: 0,
             move_rules: None,
         }
     }
@@ -157,6 +163,10 @@ impl AnalysisQuery {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+fn is_zero_i32(v: &i32) -> bool {
+    *v == 0
 }
 
 /// 序列化用的线上结构（字段名对齐协议的 camelCase）。
@@ -182,6 +192,9 @@ struct WireQuery<'a> {
     report_during_search_every: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     analyze_turns: Option<&'a [usize]>,
+    /// 查询优先级（实测有效，见 [`AnalysisQuery::priority`]）；0 = 缺省不发送。
+    #[serde(skip_serializing_if = "is_zero_i32")]
+    priority: i32,
     /// allowMoves 与 avoidMoves 引擎实测互斥，至多出现其一。
     #[serde(skip_serializing_if = "Option::is_none")]
     allow_moves: Option<Vec<WireMoveRule<'a>>>,
@@ -269,6 +282,7 @@ impl AnalysisQuery {
             include_policy: self.include_policy,
             report_during_search_every: self.report_during_search_every,
             analyze_turns: self.analyze_turns.as_deref(),
+            priority: self.priority,
             allow_moves,
             avoid_moves,
         };

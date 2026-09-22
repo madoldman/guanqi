@@ -36,7 +36,6 @@ use crate::engine::{
     AnalysisQuery, AnalysisReport, Difficulty, Engine, EngineConfig, EngineError, EngineEvent,
     MoveRules, QueryId, RootInfo, MoveInfo,
 };
-
 /// 引擎事件唤醒回调：与 `engine::process::Waker` 同构（类型别名未公开，
 /// 此处按相同定义书写，透明等价）。
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
@@ -45,6 +44,24 @@ pub type Waker = Arc<dyn Fn() + Send + Sync>;
 /// 11 条中间报告（visits 27→51→…→303 递增），实时感与序列化压力平衡；
 /// 更密的间隔只会放大 JSON 解析与重绘频次，实时感提升有限。
 const REPORT_EVERY_SECS: f32 = 0.5;
+
+/// 整谱快扫的每手搜索量：实测 b18 OpenCL 下约 0.94s/手（threads=1），
+/// 80 手 ≈ 75 秒、250 手 ≈ 4 分钟；40 visits 的胜率/目差已稳定在
+/// 好棋/尚可分界（0.3 目）的噪声量级内，够填曲线用（实测算依据见
+/// /tmp/batch-notes.md §4）。
+pub const BATCH_VISITS: u32 = 40;
+
+/// 整谱快扫的交互查询优先级：实测带 `priority: 10` 的查询可在批量占满
+/// 队列时数秒内插队返回（不带则被完全阻塞，见 /tmp/batch-notes.md §3）。
+pub(crate) const INTERACTIVE_PRIORITY: i32 = 10;
+
+/// 批量查询优先级：缺省 0（低于 [`INTERACTIVE_PRIORITY`]，排队即可）。
+const BATCH_PRIORITY: i32 = 0;
+
+/// 整谱快扫的分块大小（一次 `analyzeTurns` 的手数）：实测 40 visits 约
+/// 0.94s/手，20 手一块 ≈ 19 秒，取消响应与进度刷新粒度都足够；块间串行
+/// （引擎 search tree 跨查询缓存还能让相邻块的重叠局面加速）。
+const BATCH_CHUNK: usize = 20;
 
 /// 逐手历史容量上限（条目数，各分支分开计数）。19 路盘的实用对局
 /// 远小于此，超出部分不再写入，避免无界增长。
@@ -430,6 +447,47 @@ struct Inflight {
     sig: Vec<MoveRecord>,
 }
 
+/// 批量在飞块：一次 `analyzeTurns` 查询的跟踪信息。
+struct BatchChunk {
+    id: QueryId,
+    /// 尚待收到的报告数（每 turn 一条，含 noResults 空报告）。
+    expect: usize,
+    /// 派发时刻（卡死兜底：超过 [`BATCH_CHUNK_STALL`] 未收齐即放弃该块）。
+    since: Instant,
+}
+
+/// 在飞块的最长等待：20 手 @0.94s ≈ 19s，留交互插队（实测 3–6s）与
+/// 引擎波动的余量后取 90s；超时放弃该块继续推进，批量永不悬挂。
+const BATCH_CHUNK_STALL: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// 整谱快扫任务状态：对当前线（根 → 叶子）逐手低 visits 分析，报告按
+/// turnNumber 回填逐手历史（曲线自动填满）。协议事实（/tmp/batch-notes.md）：
+/// - 多 turn 查询逐 turn 返回终态，但 **到达顺序不保证**（threads≥2 时实测
+///   turn 2 先于 turn 0）⇒ 回填必须按报告自带 `turnNumber` 定位局面签名；
+/// - 批量会占满引擎队列，交互查询须带高 `priority` 插队（实测有效）；
+/// - terminate 多 turn 查询时，已完成 turn 正常补发、未完成 turn 补发
+///   `noResults` 空报告 ⇒ 回填跳过空报告即可。
+struct BatchJob {
+    /// 尚未派发的 turn 区间（每块 [`BATCH_CHUNK`] 个，块间串行）。
+    pending: std::ops::Range<usize>,
+    /// 在飞块（收齐其全部 turn 报告后才派发下一块）。
+    active: Option<BatchChunk>,
+    /// 批量覆盖的 turn 总区间（0..len，len = 手数）。
+    total: std::ops::Range<usize>,
+    /// 批量覆盖的整条线（`line_records`，含游标之后的着法）：查询的
+    /// `moves` 必须覆盖到最深的 analyzeTurn，否则引擎重放缺着即报
+    /// `Invalid turn number`（实测：回看中发起、line 只取到游标时的错误）。
+    line: Vec<MoveRecord>,
+    /// 发起时的局面（`records()`，到游标）：批量期间游标 / 线一变即取消。
+    watch: Vec<MoveRecord>,
+    /// 发起时的棋盘尺寸与贴目（块间跨帧，随查询重发）。
+    size: Size,
+    komi: f64,
+    started: Instant,
+    /// 已回填的有效终态数（进度 = done / total）。
+    done: usize,
+}
+
 /// 引擎接线与分析状态。
 pub struct AnalysisState {
     /// 引擎状态机（侧栏直接显示）。
@@ -471,6 +529,11 @@ pub struct AnalysisState {
     want_policy: bool,
     /// 上次发起查询时的 policy 开关值（比对不一致即重发）。
     sent_policy: bool,
+    /// 整谱快扫任务（`Some` = 进行中）。与常规在飞查询（`inflight`）完全
+    /// 独立：批量报告只回填历史，不落展示快照（`on_report` 按 stage 隔离）。
+    batch: Option<BatchJob>,
+    /// 批量刚结束时的用户提示（完成 / 取消），侧栏读取后由 App 清除。
+    batch_notice: Option<String>,
 }
 
 impl AnalysisState {
@@ -491,6 +554,8 @@ impl AnalysisState {
             sent_epoch: LimitsEpoch(0),
             want_policy: false,
             sent_policy: false,
+            batch: None,
+            batch_notice: None,
         }
     }
 
@@ -661,6 +726,33 @@ impl AnalysisState {
     pub fn sync(&mut self, board: &Board, cfg: &EngineConfig, komi: f64, want_play_query: bool) {
         // 局面签名 = 根到当前节点的着法序列：落子 / 导航 / 悔棋 / 改着都会使其变化。
         let sig = board.records();
+        // 整谱快扫期间局面一变（切分支 / 落子 / 切副本 / 载谱 / 导航）即
+        // 自动取消：批量的报告按「发起时的线」回填，线变了继续算只会
+        // 污染新盘面的历史（比对游标局面而非整条线）。
+        if let Some(job) = self.batch.as_ref()
+            && !job.watch.eq(sig)
+        {
+            self.cancel_batch();
+            self.batch_notice = Some("局面已变化，整谱快扫已自动取消。".to_owned());
+        }
+        // 批量驱动：派发下一块 / 卡死兜底。在飞块超过 [`BATCH_CHUNK_STALL`]
+        // 未收齐（查询被拒后引擎不再补发等异常路径）即放弃剩余部分收尾，
+        // 批量永不悬挂、UI 永远可操作。
+        if let Some(job) = self.batch.as_ref()
+            && let Some(chunk) = job.active.as_ref()
+            && chunk.since.elapsed() >= BATCH_CHUNK_STALL
+        {
+            self.finish_batch(false);
+        }
+        if self.batch.is_some() {
+            self.dispatch_batch_chunk();
+            if let Some(job) = self.batch.as_ref()
+                && job.done >= job.total.end - job.total.start
+                && job.active.is_none()
+            {
+                self.finish_batch(true);
+            }
+        }
         // 限制版本变化（设置区域 / 排除 / 清除）即使局面未变也要重发查询：
         // 限制是查询级字段，引擎不感知「用户改了限制」这一事件。
         // policy 开关同理：查询级 opt-in 字段，开关切换必须重发才生效。
@@ -698,6 +790,144 @@ impl AnalysisState {
         }
     }
 
+    // ---- 整谱快扫（批量分析当前线）----
+
+    /// 发起整谱快扫：对当前线（根 → 当前节点）0..=手数的每个局面按
+    /// [`BATCH_VISITS`] 低 visits 分析，报告按 turnNumber 回填逐手历史。
+    /// 已在批量中时幂等忽略；引擎未就绪时返回提示不发起。
+    pub fn start_batch(&mut self, board: &Board, komi: f64) -> Option<String> {
+        if self.batch.is_some() {
+            return Some("整谱快扫已在进行中。".to_owned());
+        }
+        if !matches!(self.engine, EngineStatus::Ready) {
+            return Some("引擎未就绪，无法开始整谱快扫。".to_owned());
+        }
+        // 记录整条线（moves 需覆盖最深 turn）与当前局面（变化即取消）：
+        // 批量期间局面一变（切分支 / 切副本 / 载谱 / 落子 / 导航）即自动
+        // 取消，防止把 A 盘面的报告回填进 B 盘面的历史。
+        self.batch = Some(BatchJob {
+            pending: 0..board.line_len(),
+            active: None,
+            total: 0..board.line_len(),
+            line: board.line_records().to_vec(),
+            watch: board.records().to_vec(),
+            size: board.size(),
+            komi,
+            started: Instant::now(),
+            done: 0,
+        });
+        self.dispatch_batch_chunk();
+        None
+    }
+
+    /// 取消整谱快扫（用户点取消或局面变化自动取消）：terminate 在飞块，
+    /// 未完成 turn 由引擎补发 noResults 空报告，回填时按空报告跳过。
+    pub fn cancel_batch(&mut self) {
+        let Some(job) = self.batch.take() else { return };
+        if let Some(chunk) = job.active
+            && let Some(handle) = self.handle.as_mut()
+        {
+            handle.terminate(chunk.id);
+        }
+        let elapsed = job.started.elapsed();
+        self.batch_notice = Some(format!(
+            "整谱快扫已取消：完成 {}/{} 手，用时 {}。",
+            job.done,
+            job.total.end - job.total.start,
+            format_duration(elapsed),
+        ));
+    }
+
+    /// 批量进度（侧栏显示）：完成数 / 总数、已用时长与在飞标记。
+    pub fn batch_progress(&self) -> Option<(usize, usize, std::time::Duration)> {
+        self.batch
+            .as_ref()
+            .map(|job| (job.done, job.total.end - job.total.start, job.started.elapsed()))
+    }
+
+    /// 取走批量结束提示（完成或取消），由 App 转为用户可见消息。
+    pub fn take_batch_notice(&mut self) -> Option<String> {
+        self.batch_notice.take()
+    }
+
+    /// 派发下一块（`analyzeTurns` 20 手一块；块间串行）。剩余块派发完但
+    /// 报告未收齐时保持任务直至 done==total 或卡死兜底收尾。
+    fn dispatch_batch_chunk(&mut self) {
+        let Some(job) = self.batch.as_mut() else { return };
+        if job.active.is_some() {
+            return;
+        }
+        let start = job.pending.start.min(job.pending.end);
+        let end = start + BATCH_CHUNK.min(job.pending.end - start);
+        if start >= end {
+            return; // 无剩余块：等最后一批报告收尾
+        }
+        let Some(handle) = self.handle.as_mut() else { return };
+        // moves = 整条线（引擎按 analyzeTurns 逐局面分析）。
+        let moves: Vec<(Stone, Action)> = job
+            .line
+            .iter()
+            .map(|record| (record.player, record.action))
+            .collect();
+        let mut query = AnalysisQuery::new(job.size, moves);
+        query.komi = job.komi;
+        query.max_visits = Some(BATCH_VISITS);
+        // 批量只填曲线：不开流式、不要 ownership/policy（省 60%+ 报告体积）。
+        query.analyze_turns = Some((start..end).collect());
+        query.priority = BATCH_PRIORITY;
+        let id = handle.analyze(query);
+        job.active = Some(BatchChunk {
+            id,
+            expect: end - start,
+            since: Instant::now(),
+        });
+        job.pending.start = end;
+    }
+
+    /// 批量终态收尾：完成数报满则生成完成提示；未满（卡死兜底被调用）
+    /// 则按实际完成数生成部分完成提示。两种情况都结束任务。
+    fn finish_batch(&mut self, complete: bool) {
+        let Some(job) = self.batch.take() else { return };
+        let total = job.total.end - job.total.start;
+        let elapsed = job.started.elapsed();
+        self.batch_notice = Some(if complete {
+            format!("整谱快扫完成：{total} 手，用时 {}。", format_duration(elapsed))
+        } else {
+            format!(
+                "整谱快扫已结束：完成 {}/{} 手（部分块超时被跳过），用时 {}。",
+                job.done,
+                total,
+                format_duration(elapsed),
+            )
+        });
+    }
+
+    /// 批量报告回填：按报告 `turnNumber` 定位局面签名（批量期间线不变，
+    /// 签名 = 前 turn 手记录的滚动哈希），复用逐手历史的 visits 覆盖规则。
+    /// **只回填历史，不落展示快照**——批量分析的是其它手数的局面，
+    /// 侧栏数值必须继续反映当前局面的交互分析。
+    /// 返回 true = 在飞块已收齐全部 turn 报告（含 noResults），可派发下一块。
+    fn on_batch_report(&mut self, job: &mut BatchJob, id: QueryId, report: AnalysisReport) -> bool {
+        // id 不符 = 已被取消的旧块补发（terminate 后引擎仍会补发终态），丢弃。
+        if job.active.as_ref().is_none_or(|chunk| chunk.id != id) {
+            return false;
+        }
+        if !report.no_results
+            && let Some(root) = &report.root_info
+        {
+            // 按报告 turnNumber 重算该局面的签名（到达顺序不可信，笔记 §2）。
+            let line = job.line.clone();
+            let sig = position_sig(&line[..report.turn_number.min(line.len())]);
+            self.record_history(report.turn_number, root, sig);
+            job.done += 1;
+        }
+        // 空报告（noResults，terminate 后未完成 turn 的补发）无数据，只计数。
+        if let Some(chunk) = job.active.as_mut() {
+            chunk.expect = chunk.expect.saturating_sub(1);
+        }
+        job.active.as_ref().is_none_or(|chunk| chunk.expect == 0)
+    }
+
     /// 载入新棋谱时清空全部分析状态：作废在飞查询与快照、清空逐手
     /// 胜率历史（新对局不能混入旧曲线）。引擎进程保持运行，下一帧
     /// `sync` 会因局面签名变化自动对新局面发起查询。
@@ -707,6 +937,10 @@ impl AnalysisState {
         {
             handle.terminate(inflight.id);
         }
+        // 载谱 / 新对局：批量静默丢弃（历史即将清空，任务已无意义），
+        // 在飞块随局面替换 terminate，残余报告因历史清空自然失效。
+        self.batch = None;
+        self.batch_notice = None;
         self.analyzed_sig = None;
         self.snapshot = None;
         self.transient_error = None;
@@ -732,12 +966,40 @@ impl AnalysisState {
                 self.request(board, cfg, Stage::Analysis, komi);
             }
             EngineEvent::Report { id, report, is_final } => {
+                // 批量在飞时报告先按批量 id 归属：批量查询与常规查询的 id
+                // 空间互斥（引擎按 id 回传），命中批量即只回填历史不落快照。
+                if self
+                    .batch
+                    .as_ref()
+                    .is_some_and(|job| job.active.as_ref().is_some_and(|chunk| chunk.id == id))
+                {
+                    // 先把任务从 self 里取出来再回填，规避 self 双重可变借用
+                    //（回填要访问 self.record_history / self.history）。
+                    let Some(mut job) = self.batch.take() else { return };
+                    let chunk_done = Self::on_batch_report(self, &mut job, id, report);
+                    if chunk_done {
+                        // 块收齐：关闭在飞并派发下一块（串行推进）。
+                        job.active = None;
+                        self.batch = Some(job);
+                        self.dispatch_batch_chunk();
+                        if let Some(job) = self.batch.as_ref()
+                            && job.done >= job.total.end - job.total.start
+                        {
+                            self.finish_batch(true);
+                        }
+                    } else {
+                        self.batch = Some(job);
+                    }
+                    return;
+                }
                 self.on_report(id, report, is_final, board, cfg);
             }
             EngineEvent::Log(line) => self.last_log = Some(line),
             EngineEvent::Failed(err) => self.on_failed(err),
             EngineEvent::Exited(status) => {
                 self.inflight = None;
+                // 引擎退出批量随之失效（错误状态已可见，不再另发提示）。
+                self.batch = None;
                 self.engine = EngineStatus::Failed(format!("引擎进程已退出（{status}）"));
             }
         }
@@ -898,6 +1160,10 @@ impl AnalysisState {
         // 选点限制（限定区域 / 排除选点）随查询发给引擎，展示与走子口径
         // 都受限（区域模式研究局部时，引擎应手也应在局部走才自然）。
         query.move_rules = move_rules_of(&self.limits, board);
+        // 交互查询带高优先级：整谱快扫占满引擎队列时，实测不带 priority 的
+        // 交互查询会被无限期阻塞（90 秒无响应），带 10 可数秒内插队返回
+        // （/tmp/batch-notes.md §3/§7）。
+        query.priority = INTERACTIVE_PRIORITY;
         let id = handle.analyze(query);
         self.analyzed_sig = Some(board.records().to_vec());
         self.sent_epoch = self.limits_epoch;
@@ -916,4 +1182,19 @@ impl Default for AnalysisState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 时长的人类可读形式（进度与完成提示共用）：1 分 32 秒 / 45 秒。
+fn format_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 60 {
+        format!("{} 分 {} 秒", secs / 60, secs % 60)
+    } else {
+        format!("{secs} 秒")
+    }
+}
+
+/// 时长的人类可读形式（侧栏进度显示用，与内部提示同一口径）。
+pub fn format_batch_elapsed(d: std::time::Duration) -> String {
+    format_duration(d)
 }
