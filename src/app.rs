@@ -199,6 +199,7 @@ impl GuanqiApp {
             overlay: overlay::Overlay {
                 show_candidates: true,
                 show_heat: true,
+                show_policy: false,
                 show_mistakes: true,
                 focus: None,
             },
@@ -947,6 +948,10 @@ impl eframe::App for GuanqiApp {
                 } else {
                     self.analysis.set_region(None);
                 }
+            }
+            // 策略热度图开关：转交 AnalysisState（want/sent 比对驱动重查）。
+            analysis_panel::PanelAction::SetWantPolicy(want) => {
+                self.analysis.set_want_policy(want);
             }
             analysis_panel::PanelAction::ToggleAvoid { player, at } => {
                 self.analysis.toggle_avoid(player, at);

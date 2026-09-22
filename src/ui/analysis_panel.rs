@@ -80,6 +80,9 @@ pub enum PanelAction {
     /// 区域开关切换（`Some(())` = 请求开启，`None` = 请求关闭并清除区域）。
     /// 开启只需改模式（区域等用户在棋盘上拖出）。
     SetRegion(Option<()>),
+    /// 策略热度图层开关切换：opt-in 数据，需转入 [`AnalysisState`]
+    /// 重发查询（`sync` 比对开关状态后重查，局面未变也重发）。
+    SetWantPolicy(bool),
     /// 点了候选行的「沿主变前进」：沿该候选的 PV 逐手**预览前进**——
     /// 只在已存在的着法上导航（每手要求当前节点已有匹配的子分支，
     /// 否则停住），**不新建分支、不改棋谱树**。App 完成实际导航。
@@ -356,8 +359,11 @@ fn panel_body(
     // ---- 失误统计（TASKS 4.4）----
     card_mistakes(ui, analysis, board);
 
-    // ---- 叠加层 ----
-    card_overlay(ui, overlay, curve_open, tree_open);
+    // ---- 叠加层（返回策略层开关是否变化，交由 App 转发重查）----
+    let policy_toggled = card_overlay(ui, overlay, curve_open, tree_open);
+    if policy_toggled {
+        action = PanelAction::SetWantPolicy(overlay.show_policy);
+    }
 
     // ---- 消息（非法落子 / 载入另存 / 引擎错误等提示；无则不占位）----
     card_messages(
@@ -1129,11 +1135,19 @@ fn card_mistakes(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
 }
 
 /// 「叠加层」卡片：各层开关（复选框）与胜率色阶图例。
-fn card_overlay(ui: &mut Ui, overlay: &mut Overlay, curve_open: &mut bool, tree_open: &mut bool) {
+/// 返回值：策略热度图开关是否被本帧改动（opt-in 重查由 App 转发）。
+fn card_overlay(ui: &mut Ui, overlay: &mut Overlay, curve_open: &mut bool, tree_open: &mut bool) -> bool {
+    let mut policy_toggled = false;
     card(ui, |ui| {
         theme::section_title(ui, "叠加层");
         ui.checkbox(&mut overlay.show_candidates, "候选点圆圈");
         ui.checkbox(&mut overlay.show_heat, "局势热度图");
+        let policy = ui
+            .checkbox(&mut overlay.show_policy, "策略热度图")
+            .on_hover_text(
+                "引擎还没搜索时的第一直觉（策略网络先验），\
+                 不是搜索后的推荐——推荐看「候选点」。",
+            );
         ui.checkbox(&mut overlay.show_mistakes, "失误标注");
         ui.checkbox(curve_open, "胜率曲线面板");
         ui.checkbox(tree_open, "棋谱树面板");
@@ -1159,8 +1173,12 @@ fn card_overlay(ui: &mut Ui, overlay: &mut Overlay, curve_open: &mut bool, tree_
             }
             ui.weak("黑优");
         });
-        ui.weak("圆圈大小 ∝ √visits，白环为主选点；热度深色 = 黑势、浅色 = 白势");
+        ui.weak("圆圈大小 ∝ √visits，白环为主选点；热度深色 = 黑势、浅色 = 白势；\
+                 策略层靛蓝色块 ∝ 先验概率，只铺空点");
+        // 策略层开关的变化交给 App 转入 AnalysisState（opt-in 重查在 sync 里）。
+        policy_toggled = policy.changed();
     });
+    policy_toggled
 }
 
 /// 「消息」卡片：各类用户可见提示（非法落子 / 载入另存 / 引擎错误等）。

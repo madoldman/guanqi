@@ -18,6 +18,14 @@
 //!   （下限 [`HEAT_SCALE_MIN`]）线性归一化后乘最大不透明度（开局各点
 //!   目差实测 |v| < 1，绝对刻度会整层不可见）；黑势叠深色块、白势叠
 //!   浅色块，绘制在棋子之下，棋子保持清晰；
+//! - 策略热度图：`policy` 为策略网络的选点先验（「还没搜索时的第一直觉」，
+//!   与候选点的「搜索后结论」是不同维度），只取前 size² 项、只画**空点**
+//!   （已有棋子的点没有落子意义，policy 在那里是噪声）；按当前快照空点
+//!   最大值（下限 [`POLICY_SCALE_MIN`]）做**相对刻度**归一化（绝对概率
+//!   常在 1e-4～1e-1，不归一化会看不见），透明度走 sqrt 曲线（policy 分布
+//!   高度尖锐，线性刻度下除 argmax 外全部不可见，与候选点圆圈的
+//!   √visits 同理）；色用深靛蓝小圆角块，与 ownership 的暖黑/暖白
+//!   整格方块同开时可分辨。
 //! - 失误标注（KaTrain 风格）：疑问手及以上的落子处叠小色点
 //!   （黄疑问手 / 橙失误 / 红恶手），画在棋子之上但不遮棋子辨识；
 //!   当前手恰为失误手时额外加外环。回看中同样针对所有已知手数绘制。
@@ -38,6 +46,21 @@ const GHOST_LIMIT: usize = super::analysis_panel::PV_LIMIT;
 const HEAT_SCALE_MIN: f32 = 2.0;
 /// 热度块最大不透明度（0-255），为网格与棋子留出辨识度。
 const HEAT_MAX_ALPHA: f32 = 140.0;
+/// 策略概率归一化分母下限：相对刻度按快照空点最大值缩放，但最大值
+/// 过小（接近全盘均匀分布的 1/362 ≈ 0.0028）时按均匀分布取分母，
+/// 避免纯噪声被放大成满盘亮斑。
+const POLICY_SCALE_MIN: f32 = 1.0 / 362.0;
+/// 策略热度块最大不透明度：与 ownership 热度图同档。颜色选深靛蓝，
+/// 混色实测：木底（211,168,92）上 alpha 200 混合后蓝红差 44、蓝绿差 66，
+/// 色相可辨；淡紫（96,74,190）低透明度混合后偏灰不可辨（已否决）。
+const POLICY_MAX_ALPHA: f32 = 200.0;
+/// 策略热度块的最大不透明度之下限：低于此 alpha 的点不画。policy 分布
+/// 高度尖锐（top1 常占过半），sqrt 刻度会把 1e-4 量级的长尾也拉成可见块，
+/// 满盘噪点反而淹没亮区；截断后可见点集中在前几名，与候选点列表可对照。
+const POLICY_MIN_ALPHA: f32 = 36.0;
+/// 策略热度块相对间距的边长：接近整格（略缩避免相邻相接），与
+/// ownership 的整格方块观感接近；小圆角 + 靛蓝色相负责区分两者。
+const POLICY_FILL_RATIO: f32 = 0.86;
 
 /// 叠加层状态：层开关与侧栏定位（App 持有，本次运行内保持）。
 #[derive(Debug)]
@@ -46,6 +69,9 @@ pub struct Overlay {
     pub show_candidates: bool,
     /// 局势热度图层开关。
     pub show_heat: bool,
+    /// 策略热度图层开关（引擎还没搜索时的第一直觉，非推荐）。
+    /// 默认关闭：opt-in 数据，打开时 `App` 同步 `AnalysisState` 重发查询。
+    pub show_policy: bool,
     /// 失误标注层开关（疑问手及以上才画，关闭时零绘制开销）。
     pub show_mistakes: bool,
     /// 侧栏点击定位；局面变化（快照作废）时由 App 清除。
@@ -130,6 +156,52 @@ pub(crate) fn draw_heat(painter: &Painter, layout: &Layout, snapshot: &Snapshot)
         // 正值 = 黑势（引擎约定）：黑势叠深色，白势叠浅色。
         let (r, g, b) = if *v > 0.0 { (16, 22, 30) } else { (246, 249, 253) };
         painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(r, g, b, alpha));
+    }
+}
+
+/// 策略热度图：策略网络的选点先验铺在空点上（棋子之下）。
+/// `None` / 长度不符 / 空局面（turn == 0）安全跳过；末位（推定弃着）
+/// 与已有棋子的点不画。概率按当前快照空点最大值做相对刻度归一化。
+pub(crate) fn draw_policy(
+    painter: &Painter,
+    layout: &Layout,
+    board: &Board,
+    snapshot: &Snapshot,
+) {
+    if snapshot.turn == 0 {
+        return; // 空局面不渲染（开局直觉图信息量低且全是空点噪声）
+    }
+    let Some(policy) = &snapshot.policy else {
+        return;
+    };
+    let size = snapshot.size;
+    if policy.len() != size.point_count() + 1 {
+        return; // 长度不符：数据不可信，整层跳过
+    }
+    let board_policy = &policy[..size.point_count()];
+    // 分母取**空点**的最大值（已有棋子的点不参与，否则死子附近的噪声
+    // 值会压低全部有效点的亮度）；下限按均匀分布保底，防纯噪声放大。
+    let mut scale = POLICY_SCALE_MIN;
+    for (i, &v) in board_policy.iter().enumerate() {
+        if Coord::from_index(size, i).is_some_and(|c| board.get(c).is_none()) {
+            scale = scale.max(v);
+        }
+    }
+    for (i, &v) in board_policy.iter().enumerate() {
+        let Some(c) = Coord::from_index(size, i) else { continue };
+        if board.get(c).is_some() {
+            continue; // 只画空点：已有棋子的点没有落子意义
+        }
+        let alpha = ((v / scale).sqrt().clamp(0.0, 1.0) * POLICY_MAX_ALPHA).round() as u8;
+        if (alpha as f32) < POLICY_MIN_ALPHA {
+            continue; // 长尾噪声不画：截断后亮区集中在前几名
+        }
+        // 深靛蓝：与 ownership 的暖黑/暖白色块、候选点的蓝黄绿圆圈都不同相；
+        // 小圆角方块与 ownership 的整格大方块拉开形状辨识度。
+        let center = layout.point(c);
+        let radius = layout.spacing * 0.5 * POLICY_FILL_RATIO;
+        let rect = Rect::from_center_size(center, Vec2::splat(radius * 2.0));
+        painter.rect_filled(rect, radius * 0.4, Color32::from_rgba_unmultiplied(52, 36, 140, alpha));
     }
 }
 

@@ -208,6 +208,11 @@ pub struct Snapshot {
     /// 各点局势值（opt-in，查询时已开启）：下标与 `Coord::index` 一致，
     /// 正值 = 黑势。叠加层热度图直接取用。
     pub ownership: Option<Vec<f32>>,
+    /// 策略网络先验（opt-in，策略热度图层开启时才请求）：长度 = size²+1，
+    /// 前 size² 项下标与 `Coord::index` 一致，末位推定为弃着（渲染忽略）。
+    /// 策略头一次前向即完整，第一条流式中间报告里就有，是「搜索早期
+    /// 即可显示」的独特数据。
+    pub policy: Option<Vec<f32>>,
 }
 
 /// 局面签名：对手数记录前缀逐字节做 FNV-1a（行棋方 / 着法 / 提子）。
@@ -459,6 +464,13 @@ pub struct AnalysisState {
     limits_epoch: LimitsEpoch,
     /// 上次发起查询时的限制版本号。
     sent_epoch: LimitsEpoch,
+    /// 策略热度图层的请求开关（由 `App` 随 Overlay 开关写入）。opt-in
+    /// 数据必须随开关变化重新查询：引擎不会主动补发/撤回 policy 字段，
+    /// 打开后已完成的快照没有 policy，需重发；关闭后继续收 policy 纯属
+    /// 浪费（每条报告 +5 KB）。与 limits epoch 同一机制（局面未变也重发）。
+    want_policy: bool,
+    /// 上次发起查询时的 policy 开关值（比对不一致即重发）。
+    sent_policy: bool,
 }
 
 impl AnalysisState {
@@ -477,6 +489,8 @@ impl AnalysisState {
             limits: AnalysisLimits::default(),
             limits_epoch: LimitsEpoch(0),
             sent_epoch: LimitsEpoch(0),
+            want_policy: false,
+            sent_policy: false,
         }
     }
 
@@ -550,6 +564,18 @@ impl AnalysisState {
 
     fn bump_limits(&mut self) {
         self.limits_epoch.0 += 1;
+    }
+
+    /// 设置策略热度图层的请求开关（`App` 随 Overlay 复选框写入）。
+    /// 值变化即作废已完成的快照（旧快照缺 policy 或已无必要携带），
+    /// `sync` 检测到 `sent_policy` 不一致后自动重发查询。
+    pub fn set_want_policy(&mut self, want: bool) {
+        if self.want_policy == want {
+            return;
+        }
+        self.want_policy = want;
+        // 开关切换后旧快照的 policy 有无与新开关矛盾，直接作废重查。
+        self.snapshot = None;
     }
 
     /// 用当前配置（重）启动引擎；设置面板「应用并重启」与错误重试共用。
@@ -637,8 +663,10 @@ impl AnalysisState {
         let sig = board.records();
         // 限制版本变化（设置区域 / 排除 / 清除）即使局面未变也要重发查询：
         // 限制是查询级字段，引擎不感知「用户改了限制」这一事件。
+        // policy 开关同理：查询级 opt-in 字段，开关切换必须重发才生效。
         let limits_changed = self.limits_epoch != self.sent_epoch;
-        if Some(sig) != self.analyzed_sig.as_deref() || limits_changed {
+        let policy_changed = self.want_policy != self.sent_policy;
+        if Some(sig) != self.analyzed_sig.as_deref() || limits_changed || policy_changed {
             self.snapshot = None;
             self.transient_error = None;
             if let Some(inflight) = self.inflight.take()
@@ -758,6 +786,7 @@ impl AnalysisState {
             root: root.clone(),
             moves,
             ownership: report.ownership,
+            policy: report.policy,
         };
         // 走子口径落位：只认终态（中间报告对决策无意义，守卫见
         // `play::engine_move_decision` 的 is_final 判断）。局面签名随查询
@@ -857,6 +886,11 @@ impl AnalysisState {
         // 中间报告同样携带（每条约 7–9 KB，0.5s 键下 300 visits 共约 11 条，
         // 见 /tmp/stream-notes.md），开销可忽略，热度图因此也能边搜边显示。
         query.include_ownership = true;
+        // policy 只在策略热度图层开启时才请求（opt-in）：362 个浮点使每条
+        // 流式报告增约 5 KB（300 visits 整次查询约 +50 KB，实测见
+        // /tmp/policy-notes.md），关闭时必须零开销。开关切换由 `sync` 的
+        // want/sent 比对触发重发（局面未变也重发）。
+        query.include_policy = self.want_policy;
         // 展示口径开启流式中间报告（边搜边刷新界面）；走子口径只认终态。
         if stage.streaming() {
             query.report_during_search_every = Some(REPORT_EVERY_SECS);
@@ -867,6 +901,7 @@ impl AnalysisState {
         let id = handle.analyze(query);
         self.analyzed_sig = Some(board.records().to_vec());
         self.sent_epoch = self.limits_epoch;
+        self.sent_policy = self.want_policy;
         self.inflight = Some(Inflight {
             id,
             turn: board.cursor(),

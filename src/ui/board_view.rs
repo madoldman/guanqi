@@ -114,6 +114,13 @@ pub fn show(
         {
             overlay::draw_heat(&painter, &layout, snapshot);
         }
+        // 策略热度图同样压在棋子之下（棋子之上于热度图，同开时策略层
+        // 的小圆片叠在 ownership 大方块上，两种数据都可见）。
+        if overlay.show_policy
+            && let Some(snapshot) = snapshot
+        {
+            overlay::draw_policy(&painter, &layout, board, snapshot);
+        }
         draw_stones(&painter, &layout, board);
         draw_last_move_mark(&painter, &layout, board);
         // 失误标注画在棋子之上：小色点不遮棋子辨识。

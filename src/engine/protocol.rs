@@ -18,6 +18,12 @@
 //!   会立刻返回（实测 <0.1s），上层据此避免重复查询。
 //! - `ownership` 为 opt-in；排列与 [`crate::board::Coord::index`] 一致
 //!   （`y*size + x`，`y=0` 为顶行），正值 = 黑势。
+//! - `policy` 为 opt-in（`includePolicy: true`）：长度 = `size² + 1`，
+//!   前 `size²` 项排列与 [`crate::board::Coord::index`] 一致（v1.18.2 b18
+//!   下标标定实测：空盘 4 重对称 + 提子/布局局面的 argmax 与 moveInfos
+//!   首选交叉验证 + 镜像组，`y*19+x` 映射唯一同时解释全部证据），
+//!   **末位推定为弃着**（未确证，渲染层忽略）。概率全盘求和约 1，
+//!   单点常在 1e-4～1e-1，渲染必须做相对刻度归一化才可见。
 
 use crate::board::{Action, Coord, Size, Stone};
 use serde::{Deserialize, Serialize};
@@ -67,6 +73,10 @@ pub struct AnalysisQuery {
     pub max_visits: Option<u32>,
     /// 是否返回 ownership（opt-in，缺省引擎不返回该字段）。
     pub include_ownership: bool,
+    /// 是否返回 policy（策略网络先验，opt-in）。开启后每条报告（含流式
+    /// 中间报告）增约 5 KB（362 个浮点的 JSON 文本，实测见模块文档），
+    /// 必须只在策略热度图层开启时才请求。
+    pub include_policy: bool,
     /// 流式中间报告的输出间隔（秒）；`None` = 不开启，只回终态。
     /// 开启后搜索期间约每 N 秒一条 `isDuringSearch: true` 的中间报告，
     /// 最后仍有一条 `false` 终态（v1.18.2 实测，见模块文档）。
@@ -137,6 +147,7 @@ impl AnalysisQuery {
             moves,
             max_visits: None,
             include_ownership: false,
+            include_policy: false,
             report_during_search_every: None,
             analyze_turns: None,
             move_rules: None,
@@ -165,6 +176,8 @@ struct WireQuery<'a> {
     max_visits: Option<u32>,
     #[serde(skip_serializing_if = "is_false")]
     include_ownership: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    include_policy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     report_during_search_every: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -253,6 +266,7 @@ impl AnalysisQuery {
             board_y_size: self.board_size.n(),
             max_visits: self.max_visits,
             include_ownership: self.include_ownership,
+            include_policy: self.include_policy,
             report_during_search_every: self.report_during_search_every,
             analyze_turns: self.analyze_turns.as_deref(),
             allow_moves,
@@ -313,6 +327,7 @@ struct WireMessage {
     move_infos: Option<Vec<WireMoveInfo>>,
     root_info: Option<WireRootInfo>,
     ownership: Option<Vec<f32>>,
+    policy: Option<Vec<f32>>,
 }
 
 #[derive(Default, Deserialize)]
@@ -397,6 +412,10 @@ pub struct AnalysisReport {
     /// 各点局势值（opt-in 才有）：长度 = size²，下标与 [`crate::board::Coord::index`]
     /// 一致，正值 = 黑势，单位约为目。
     pub ownership: Option<Vec<f32>>,
+    /// 策略网络先验（opt-in 才有）：长度 = size²+1，前 size² 项下标与
+    /// [`crate::board::Coord::index`] 一致，末位推定为弃着（未确证，渲染忽略）。
+    /// 值为归一化前的原始概率（全盘和约 1）。
+    pub policy: Option<Vec<f32>>,
 }
 
 impl AnalysisReport {
@@ -417,6 +436,7 @@ pub(crate) struct RawReport {
     pub root_info: Option<RootInfo>,
     pub move_infos: Vec<RawMoveInfo>,
     pub ownership: Option<Vec<f32>>,
+    pub policy: Option<Vec<f32>>,
 }
 
 impl RawReport {
@@ -446,6 +466,7 @@ impl RawReport {
                 })
                 .collect(),
             ownership: self.ownership,
+            policy: self.policy,
         }
     }
 }
@@ -535,6 +556,7 @@ impl WireMessage {
                 })
                 .collect(),
             ownership: self.ownership,
+            policy: self.policy,
         };
         Incoming::Report { id, report }
     }
