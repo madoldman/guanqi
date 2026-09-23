@@ -44,7 +44,7 @@
 //! - [`Board::play`] / [`Board::pass`]：**在非叶节点落子即创建变着分支**
 //!   （不再返回 `IllegalReason::NotAtLatestMove`）；若该着法已存在于某个
 //!   子节点，直接切换到它，不重复建分支。
-//! - [`Board::captured_by`] / [`Board::lost_by`]：沿根到当前节点的路径累计。
+//! - [`Board::captured_by`]：沿根到当前节点的路径累计。
 //!
 //! # 分支导航（供棋谱树控件使用）
 //!
@@ -329,6 +329,13 @@ impl Board {
         }
     }
 
+    /// 根节点（预设局面）的行棋方：让子 / 摆子局为白、普通局为黑。
+    /// 「第 0 手局面轮到谁」的唯一事实来源——第 0 手没有着法记录可反推，
+    /// 硬编码黑会让让子局（白先）的第 0 点视角换算出错。
+    pub fn root_to_play(&self) -> Stone {
+        self.root_to_play
+    }
+
     /// 游标处的盘面切片。
     pub fn grid(&self) -> &[Option<Stone>] {
         &self.nodes[self.current].grid
@@ -388,13 +395,6 @@ impl Board {
             Stone::Black => self.captured_by_black,
             Stone::White => self.captured_by_white,
         }
-    }
-
-    /// `color` 方累计被提走的子数（即对方提走的，截至游标）。
-    // 阶段 4 侧栏（双方损失统计）使用；接入前无调用方。
-    #[allow(dead_code)]
-    pub fn lost_by(&self, color: Stone) -> u32 {
-        self.captured_by(color.opposite())
     }
 
     // ---- 谱树查询与分支导航 ----

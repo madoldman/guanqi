@@ -30,7 +30,6 @@ use std::path::{Path, PathBuf};
 use super::tree::{GameInfo, GameTree, Node};
 use super::{SgfError, parse_bytes};
 use crate::board::{Action, Board, SetupError, Size, Stone};
-
 /// 载入整体失败（此时**不应替换**用户当前棋盘）。
 #[derive(Debug)]
 pub enum LoadError {
@@ -72,6 +71,11 @@ pub struct GameMeta {
     /// 逐手注释：键 = 局面签名（根到该节点着法路径的 FNV-1a，见
     /// `position_sig`）。不按手数索引的理由见模块文档。
     comments: HashMap<u64, String>,
+    /// **未识别属性**的保全存储：键与 [`Self::comments`] 同一套局面签名，
+    /// 值为该节点上我们不写回的属性原样列表（另存时原样追加，另存不丢
+    /// 标记 / 死子标注 / 第三方扩展属性）。收集口径见 [`collect_extras`]；
+    /// 属性顺序、同名多值、值内容（转义已解码）全部原样保留。
+    extras: HashMap<u64, Vec<super::tree::Property>>,
 }
 
 impl GameMeta {
@@ -107,6 +111,9 @@ impl GameMeta {
             result_block: None,
             },
             comments: HashMap::new(),
+            // 新建（非载入）的棋谱没有历史属性可保全：空表 = 无第三方属性，
+            // 另存路径零开销。
+            extras: HashMap::new(),
         }
     }
 
@@ -124,6 +131,50 @@ impl GameMeta {
     pub fn comment_by_sig(&self, sig: u64) -> Option<&str> {
         self.comments.get(&sig).map(String::as_str)
     }
+
+    /// 按局面签名取该节点保全的未识别属性（「另存为」原样写回用）。
+    /// 无保全返回空切片。
+    pub fn extras_by_sig(&self, sig: u64) -> &[super::tree::Property] {
+        self.extras.get(&sig).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// 有多少条未识别属性被保全（报告与验证用：0 = 无第三方属性）。
+    pub fn extras_count(&self) -> usize {
+        self.extras.values().map(Vec::len).sum()
+    }
+}
+
+/// 我们「已经专门写」的属性名单（另存路径会自行生成这些属性）：未识别
+/// 属性保全必须**排除**它们，否则同一属性在输出节点上出现两份——
+/// 部分解析器（含本项目的 [`super::tree::Node::get`]）只取第一个，
+/// 用户改了第二份也不会生效，属制造数据混乱。名单与 `save.rs` 的
+/// 写出集合一一对应，两处改动需同步。
+fn is_owned_by_save(ident: &str) -> bool {
+    matches!(
+        ident,
+        // 行棋 / 注释：逐手节点写出（C 仅在有注释时写，但保全侧统一
+        // 排除——根注释与逐手注释另有原样回写通道）。
+        "B" | "W" | "C"
+        // 对局信息：build_root 按 info 写出。
+        | "KM" | "HA" | "PL" | "PB" | "PW" | "BR" | "WR" | "BT" | "WT" | "RE" | "DT" | "EV"
+        | "RO" | "PC" | "GN" | "RU" | "TM" | "OT"
+        // 通用属性：build_root 恒写（GM/FF/CA/AP/SZ）。
+        | "GM" | "FF" | "CA" | "AP" | "SZ"
+        // 摆子：build_root 从根盘面重建（压缩矩形已展开，原值不再复用）。
+        | "AB" | "AW" | "AE"
+    )
+}
+
+/// 收集一个节点上需要保全的未识别属性：既不是程序写回集合（见
+/// [`is_owned_by_save`]），也不是已识别进 `GameInfo` 的常见文本信息。
+/// 判定按属性名，值原样克隆（解码后的语义值，写出时经词法层重新转义，
+/// 与全仓「树内不存转义」的表示约定一致）。
+fn collect_extras(node: &Node) -> Vec<super::tree::Property> {
+    node.props
+        .iter()
+        .filter(|prop| !is_owned_by_save(&prop.ident))
+        .cloned()
+        .collect()
 }
 
 /// 一次成功（可能是部分）的载入结果。棋盘游标已定位于开局第 0 手。
@@ -138,6 +189,9 @@ pub struct LoadedGame {
     /// 主变是否中途停止（非法着法 / 行棋方不符），即「部分载入」；
     /// 仅变着分支被舍弃时为 `false`。
     pub partial: bool,
+    /// 无法对应到任何节点的未识别属性条数（挂在被载入过程丢弃的节点上，
+    /// 例如非法着法的节点、纯注释节点）：另存写不出它们，App 据此提示。
+    pub unplaced_props: usize,
 }
 
 impl LoadedGame {
@@ -177,12 +231,25 @@ pub fn load_from_bytes(source: &Path, bytes: &[u8]) -> Result<LoadedGame, LoadEr
     if let Some(text) = &info.root_comment {
         comments.insert(position_sig(&[]), text.clone());
     }
+    // 未识别属性保全：根节点先收（签名 = 空路径），其余随 walk 逐节点收。
+    // 挂不上任何节点的条数（被丢弃节点上的属性）单独累计，随结果带出。
+    let mut extras = HashMap::new();
+    let mut orphan_extras = 0usize;
+    {
+        let root = tree.root().expect("from_tree 成功则根节点必然存在");
+        let root_props = collect_extras(root);
+        if !root_props.is_empty() {
+            extras.insert(position_sig(&[]), root_props);
+        }
+    }
     let mut warnings = Vec::new();
     let mut partial = false;
     walk(
         &mut board,
         &tree,
         &mut comments,
+        &mut extras,
+        &mut orphan_extras,
         &mut warnings,
         &mut partial,
         None,
@@ -206,10 +273,12 @@ pub fn load_from_bytes(source: &Path, bytes: &[u8]) -> Result<LoadedGame, LoadEr
             source: source.to_path_buf(),
             info,
             comments,
+            extras,
         },
         board,
         warning: (!warnings.is_empty()).then(|| warnings.join("；")),
         partial,
+        unplaced_props: orphan_extras,
     })
 }
 
@@ -221,10 +290,17 @@ pub fn load_from_bytes(source: &Path, bytes: &[u8]) -> Result<LoadedGame, LoadEr
 /// `None`；`skip_first` 仅最外层调用为 true（根节点已按预设局面处理）。
 /// 任一节点的着法无法载入时放弃**当前分支**并返回：主线同时置
 /// `partial`，变着分支不影响已走完的其它分支。
+///
+/// 未识别属性随节点收集：落子成功的节点按**落子后的局面签名**挂入
+/// `extras`（与注释同一套键——保存端逐节点重放路径可还原同一签名）；
+/// 被跳过 / 丢弃节点上的条数计入 `orphan_extras`（写不出，需如实提示）。
+#[allow(clippy::too_many_arguments)]
 fn walk(
     board: &mut Board,
     tree: &GameTree,
     comments: &mut HashMap<u64, String>,
+    extras: &mut HashMap<u64, Vec<super::tree::Property>>,
+    orphan_extras: &mut usize,
     warnings: &mut Vec<String>,
     partial: &mut bool,
     label: Option<&str>,
@@ -247,10 +323,21 @@ fn walk(
                 if let Some(text) = node.comment().filter(|text| !text.is_empty()) {
                     comments.insert(position_sig(board.records()), text.to_owned());
                 }
+                // 未识别属性同键保全（TR/SQ/TB/TW 及一切第三方属性）。
+                let props = collect_extras(node);
+                if !props.is_empty() {
+                    extras.insert(position_sig(board.records()), props);
+                }
             }
             // 无行棋属性的节点（纯注释 / 空节点）跳过，注释随之丢弃。
-            Ok(false) => {}
+            // 其上若挂有未识别属性，同样写不出（没有 board 节点可对应
+            // 签名）——计数带出，另存时如实提示而非静默丢。
+            Ok(false) => {
+                *orphan_extras += collect_extras(node).len();
+            }
             Err(reason) => {
+                // 非法着法节点被丢弃：其上未识别属性无处可挂，计数带出。
+                *orphan_extras += collect_extras(node).len();
                 if label.is_none() {
                     *partial = true;
                     warnings.push(format!("{}无法载入：{reason}", site(turn)));
@@ -283,6 +370,8 @@ fn walk(
             board,
             child,
             comments,
+            extras,
+            orphan_extras,
             warnings,
             partial,
             child_label.as_deref(),

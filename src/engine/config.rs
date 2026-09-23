@@ -460,13 +460,50 @@ pub fn save_settings(cfg: &EngineConfig) -> Result<(), String> {
 }
 
 /// `analysis.cfg` 不存在时按当前配置生成一份可用的默认配置；
-/// 已存在则**不覆盖**（用户可自由修改）。返回是否新写入了文件。
+/// 已存在时**仅当其中的 `numSearchThreads` 与当前配置不一致**才原地
+/// 更新线程数（其余内容不动——用户可自由修改该文件，程序只接管线
+/// 需要的那一个键）。返回是否新写入 / 更新了文件。
+///
+/// 背景：`search_threads` 此前只用于首次生成配置——文件已存在时改了
+/// 设置等于没改。保存设置时调用本函数即可让新线程数真的生效
+///（引擎重启后读新配置）。
 pub fn ensure_analysis_cfg(path: &Path, cfg: &EngineConfig) -> Result<bool, String> {
-    if path.exists() {
+    let threads = cfg.search_threads.max(1);
+    if !path.exists() {
+        write_atomically(path, &default_analysis_cfg_text(cfg))?;
+        return Ok(true);
+    }
+    // 已存在：仅同步 numSearchThreads（管线接管的键），其余行原样保留。
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let mut changed = false;
+    let mut seen = false;
+    for line in &mut lines {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("numSearchThreads") && trimmed.contains('=') {
+            seen = true;
+            if trimmed != format!("numSearchThreads = {threads}") {
+                *line = format!("numSearchThreads = {threads}");
+                changed = true;
+            }
+        }
+    }
+    if seen && !changed {
         return Ok(false);
     }
-    write_atomically(path, &default_analysis_cfg_text(cfg))?;
-    Ok(true)
+    if !seen {
+        // 配置被用户删掉了该键：KataGo 缺省 numSearchThreads = 1，
+        // 把当前值追加到必填键区块，保证设置改动有处落。
+        lines.push(format!("numSearchThreads = {threads}"));
+        changed = true;
+    }
+    if changed {
+        let mut out = lines.join("\n");
+        out.push('\n');
+        write_atomically(path, &out)?;
+    }
+    Ok(changed)
 }
 
 fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
@@ -481,13 +518,21 @@ fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
 
 /// 生成的默认引擎配置正文。键值取舍以实测为准：
 /// - `numAnalysisThreads` / `nnMaxBatchSize`：无默认值的必填键；
+/// - `numSearchThreads`：搜索线程数（来自 [`EngineConfig::search_threads`]）。
+///   **实测口径**（b18 + 680M iGPU / OpenCL，本机）：16 线程比 8 线程快
+///   17–21%（2000 visits 走子查询 23.8s vs 28.6s），未测出界面被饿死
+///   （KataGo 的搜索线程与 UI 无关，界面在独立进程里）。若个别机器上
+///   出现卡顿可降到物理核数。OpenCL 只做网络前向、搜索全在 CPU 线程上：
+///   线程越多越能喂满 GPU 批，这也是「搜索线程 ≈ 物理核数」比
+///   「每个物理核一线程更省」传说更快的原因；
 /// - `reportAnalysisWinratesAs = BLACK`：胜率固定黑方视角；查询级
 ///   `overrideSettings` 会逐查询覆盖它（本项目每条查询都显式发送该
 ///   字段，cfg 值只是兜底），前端不翻转；
 /// - `logToStderr/stdout = false`：stdout 保留给 JSON 行协议；
 /// - `reportDuringSearchEvery` 等 GTP `kata-analyze` 专用键不写入
 ///   （实测对 analysis 引擎无效）；
-/// - 线程 / 批量等参数来自 [`EngineConfig`]，用户可直接编辑本文件覆盖。
+/// - 线程 / 批量等参数来自 [`EngineConfig`]，用户可直接编辑本文件覆盖
+///   （`numSearchThreads` 除外——设置保存时会把它同步回当前配置值）。
 fn default_analysis_cfg_text(cfg: &EngineConfig) -> String {
     let log_dir = home_dir().join(".local/state/guanqi/katago");
     let threads = cfg.search_threads.max(1);
@@ -495,9 +540,13 @@ fn default_analysis_cfg_text(cfg: &EngineConfig) -> String {
     let batch = threads.clamp(8, 64).max(16);
     format!(
         "# 观棋 (Guanqi) 生成的 KataGo analysis 引擎配置。\
-         \n# 可自由修改；本文件只在缺失时生成，程序不会覆盖已有内容。\
+         \n# 可自由修改；本文件在缺失时生成，设置保存时会按程序内配置\
+         \n# 同步 numSearchThreads 一项，其余内容不会被覆盖。\
          \n\
          \n# ---- 搜索预算（查询级 maxVisits 可覆盖此处的 maxVisits）----\
+         \n# 搜索线程：OpenCL 只做网络前向、搜索全在 CPU 线程上，线程越多\
+         \n# 越能喂满 GPU 批。实测（b18 + 680M iGPU）：16 线程比 8 快 17–21%\
+         \n# （2000 visits：23.8s vs 28.6s），界面未被饿死；若发滞可降到物理核数。\
          \nmaxVisits = {visits}\
          \nnumSearchThreads = {threads}\
          \n\

@@ -30,6 +30,8 @@ pub struct SettingsUi {
         weights_dir: String,
         backend: EngineBackend,
         visits: u32,
+        /// 搜索线程数（写入 `analysis.cfg` 的 `numSearchThreads`）。
+        search_threads: u32,
         /// 规则草稿：`None` = 自动（跟随棋谱）；`Some(规则)` = 显式指定。
         rules: Option<crate::engine::Rules>,
     }
@@ -43,6 +45,7 @@ impl SettingsUi {
                 weights_dir: cfg.weights_dir.display().to_string(),
                 backend: cfg.backend,
                 visits: cfg.visits,
+                search_threads: cfg.search_threads,
                 rules: cfg.rules.as_deref().and_then(crate::engine::Rules::from_wire),
             },
             weights: Vec::new(),
@@ -64,7 +67,7 @@ impl SettingsUi {
             weights_dir: PathBuf::from(self.draft.weights_dir.trim()),
             backend: self.draft.backend,
             visits: self.draft.visits.max(1),
-            search_threads: base.search_threads,
+            search_threads: self.draft.search_threads.max(1),
             analysis_cfg: base.analysis_cfg.clone(),
             // 对弈难度不在本窗口编辑（侧栏 / 新对局窗口改），原值保留。
             play_difficulty: base.play_difficulty,
@@ -169,6 +172,27 @@ fn body(ui: &mut Ui, state: &mut SettingsUi, cfg: &mut EngineConfig, action: &mu
             );
             ui.end_row();
 
+            // 搜索线程数：写入 analysis.cfg 的 numSearchThreads。此前无
+            // 控件（只能手改配置文件），且该值只在首次生成配置时生效。
+            // 现在「保存并重启引擎」会把它同步进配置文件，重启即生效。
+            ui.label("搜索线程");
+            ui.vertical(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut state.draft.search_threads)
+                        .range(1..=256)
+                        .suffix(" 线程"),
+                )
+                .on_hover_text(
+                    "KataGo 搜索线程数（写入 analysis.cfg 的 numSearchThreads）。\
+                     OpenCL 只做网络前向、搜索全在 CPU 线程上，线程越多越能喂满 GPU 批。\
+                     实测（b18 + 680M iGPU）：16 线程比 8 快 17–21%（2000 visits：\
+                     23.8s vs 28.6s），界面未被饿死；若个别机器发滞可降到物理核数。\
+                     修改后需「保存并重启引擎」生效。",
+                );
+                ui.weak("实测 16 比 8 快 17–21%；发滞可降物理核数");
+            });
+            ui.end_row();
+
             // 规则下拉：自动（跟随棋谱 RU[]）/ 六种规范规则。改动后随
             // 「保存」持久化；分析层（AnalysisState）检测到规则变化会
             // 自动重发查询并清空旧规则下的历史数据。
@@ -214,11 +238,22 @@ fn body(ui: &mut Ui, state: &mut SettingsUi, cfg: &mut EngineConfig, action: &mu
         ui.colored_label(color, text);
     }
     ui.add_space(4.0);
-    ui.weak("修改引擎路径 / 权重 / 后端后，需要重启引擎进程才能生效。");
+    ui.weak("修改引擎路径 / 权重 / 后端 / 搜索线程后，需要重启引擎进程才能生效。");
 }
 
 /// 权重下拉选择：显示文件名与体积，按训练步数新→旧（`scan_weights` 已排序）。
+/// 已配置路径**不存在**时（权重被移动 / 删除）以红色如实标注——此前
+/// 只回显文件名，失效配置被一直当成有效值，引擎启动必然失败也看不出来。
 fn weight_selector(ui: &mut Ui, state: &mut SettingsUi) {
+    // 失效标注独立于下拉：即便目录扫描不出候选，也显示路径状态行。
+    if let Some(path) = &state.draft.model_path
+        && !path.is_file()
+    {
+        ui.colored_label(
+            Color32::from_rgb(255, 120, 110),
+            format!("权重文件不存在：{}", path.display()),
+        );
+    }
     if state.weights.is_empty() {
         ui.weak("目录中未找到 *.bin.gz 权重");
         return;

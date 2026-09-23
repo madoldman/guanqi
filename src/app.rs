@@ -41,6 +41,9 @@ use crate::ui::{
 /// 噪声收敛到远低于半目；一局已终，多花几秒把结果定稳值得）。
 const TERMINAL_EVAL_TARGET_VISITS: u32 = 800;
 
+/// 复盘 / 无对局信息时的默认贴目（`KM` 缺失时载入谱也用它分析）。
+const DEFAULT_KOMI: f64 = 7.5;
+
 /// 另存对话框的默认文件名：取档案路径的文件名，无法取得时退回
 /// `guanqi.sgf`（新对局的档案路径为占位符，走此默认）。
 fn default_sgf_name(source: &Path) -> String {
@@ -171,8 +174,11 @@ enum PendingConfirm {
     None,
     /// 丢弃指定编号的研究副本（编号在发起确认时锁定，确认时定位）。
     DropCopy { number: usize },
-    /// 确认后重新发起「打开棋谱」对话框（路径在确认后才产生）。
-    LoadGame(#[allow(dead_code)] PathBuf),
+    /// 确认后重新发起「打开棋谱」对话框。不带路径：用户选中的棋谱
+    /// 路径在确认后才产生（载入对话框在确认后重新发起），早先放的
+    /// `PathBuf` 恒为空串占位、从未被读取——正是本项目两次栽跟头的
+    /// 「只写不读」字段，删除。
+    LoadGame,
     /// 确认后开始新对局。
     NewGame(crate::play::GameSetup),
 }
@@ -183,7 +189,7 @@ impl PendingConfirm {
     fn text(&self, copies: usize, moves: usize) -> String {
         let base = match self {
             Self::DropCopy { .. } => "丢弃该研究副本后".to_owned(),
-            Self::LoadGame(_) => "载入新棋谱会替换原谱".to_owned(),
+            Self::LoadGame => "载入新棋谱会替换原谱".to_owned(),
             Self::NewGame(_) => "开始新对局会替换原谱".to_owned(),
             Self::None => String::new(),
         };
@@ -253,7 +259,7 @@ impl GuanqiApp {
             active_rules: None,
             new_game_open: false,
             new_game: new_game::NewGameUi::new(),
-            komi: 7.5,
+            komi: DEFAULT_KOMI,
             manual_revealed: false,
             manual_sig: None,
             others: Vec::new(),
@@ -275,7 +281,7 @@ impl GuanqiApp {
         // 载入会替换原谱：所有副本（含活动若是副本）连同研究一起丢弃，
         // 用户选中的棋谱路径在确认前尚未取得，确认即重新发起对话框。
         if self.research_moves() > 0 {
-            self.pending_confirm = PendingConfirm::LoadGame(PathBuf::new());
+            self.pending_confirm = PendingConfirm::LoadGame;
             return;
         }
         if let Some(notice) = self.dialog_guard() {
@@ -302,17 +308,22 @@ impl GuanqiApp {
     }
 
     /// 发起「另存为」对话框（菜单入口与 Ctrl+Shift+S 共用）。
-    /// 默认文件名取当前档案名（已含 `.sgf` 后缀），从未存过时 `guanqi.sgf`。
+    /// 默认文件名：原谱取档案名；研究副本取「原名-副本N.sgf」
+    ///（[`Self::copy_default_name`]），提示文件尚未真实存盘。
     fn save_file_dialog(&mut self) {
         if let Some(notice) = self.dialog_guard() {
             self.save_notice = Some(notice);
             return;
         }
-        let default_name = self
-            .loaded
-            .as_ref()
-            .map(|meta| default_sgf_name(&meta.source))
-            .unwrap_or_else(|| "guanqi.sgf".to_owned());
+        let default_name = if self.active_from_move.is_some() {
+            // 活动文档是副本：默认名带编号（来源路径仍是原谱，不能用原名）。
+            self.copy_default_name(self.active_number)
+        } else {
+            self.loaded
+                .as_ref()
+                .map(|meta| default_sgf_name(&meta.source))
+                .unwrap_or_else(|| "guanqi.sgf".to_owned())
+        };
         match FileDialog::save_file("另存棋谱（SGF）", &default_name, Some(self.waker.clone()))
         {
             Ok(dialog) => {
@@ -359,7 +370,13 @@ impl GuanqiApp {
             }
             Ok(loaded) => {
                 let (warning, partial) = (loaded.warning.clone(), loaded.partial);
+                let unplaced_props = loaded.unplaced_props;
                 let (board, meta) = loaded.into_parts();
+                // 载入棋谱的贴目进入分析口径：查询 komi 改取谱上的 KM
+                // （缺失时默认 7.5）。此前 `komi` 只在 start_new_game 赋值，
+                // 载入 KM[6.5] 的谱仍按 7.5 分析（或按上一盘的值），侧栏
+                // 显示的却是谱里的真值——显示与分析口径不一致。
+                self.komi = meta.info.komi.unwrap_or(DEFAULT_KOMI);
                 // 载入棋谱：退出「新对局锁定规则」态，规则恢复走
                 // 「设置显式 > 棋谱 RU > 默认」解析链。
                 self.active_rules = None;
@@ -401,6 +418,17 @@ impl GuanqiApp {
                 let notice = if dropped > 0 {
                     LoadNotice::Warn(format!(
                         "{}（研究副本连同 {dropped} 手研究成果已丢弃。）",
+                        notice.text()
+                    ))
+                } else {
+                    notice
+                };
+                // 挂在被载入丢弃节点上的未识别属性（非法着法节点 /
+                // 纯注释节点上的第三方属性）：另存写不出，如实提示。
+                let notice = if unplaced_props > 0 {
+                    LoadNotice::Warn(format!(
+                        "{}（谱上另有 {unplaced_props} 条标记/扩展属性挂在无法载入的\
+                         节点上，另存时将无法保留。）",
                         notice.text()
                     ))
                 } else {
@@ -513,8 +541,7 @@ impl GuanqiApp {
         // 对局双方按执子写入（任务 B：人机对弈的 SGF 缺 PB/PW 的补口）；
         // 时限写 TM/OT（TM = 包干或读秒主时间，OT = 读秒描述）。
         let mut meta = GameMeta::for_path(Path::new("guanqi.sgf"), setup.size);
-        meta.info.komi = Some(setup.komi);
-        meta.info.handicap = handicap.min(9) as u8;
+        meta.info.komi = Some(setup.komi);        meta.info.handicap = handicap.min(9) as u8;
         let (human_name, engine_name) = match setup.human {
             Stone::Black => (&mut meta.info.player_black, &mut meta.info.player_white),
             Stone::White => (&mut meta.info.player_white, &mut meta.info.player_black),
@@ -777,10 +804,14 @@ impl GuanqiApp {
     }
 
     /// 从当前手创建研究副本：预设局面 + 当前线前缀重放（独立树），元信息
-    /// 克隆自当前活动文档（注释按局面签名自动跟随），`source` 换成带编号
-    /// 的「-副本N」名。当前活动文档（原谱或某份副本皆可）整体推入
-    /// `others`，新副本进主槽并成为活动文档。对弈模式在此关闭：多份
-    /// 文档不能同时自动应手。
+    /// 克隆自当前活动文档（注释按局面签名自动跟随）。当前活动文档
+    /// （原谱或某份副本皆可）整体推入 `others`，新副本进主槽并成为
+    /// 活动文档。对弈模式在此关闭：多份文档不能同时自动应手。
+    ///
+    /// 副本元信息的 `source` **保持原谱真实路径**：它只是「另存为」默认名
+    /// 的来源，此前换成虚构的「-副本N.sgf」会让 UI 显示一个不存在的文件，
+    /// 用户误以为副本已存盘——如实显示来源（另存前显示原谱名，另存后
+    /// 由 `save_game` 更新为真实落盘路径）。
     ///
     /// 前置条件（UI 已守卫，此处 assert 兜底）：已载入棋谱。
     fn create_copy(&mut self) {
@@ -792,14 +823,13 @@ impl GuanqiApp {
         self.next_number += 1;
         let from_move = self.board.cursor();
         let board = self.board.linear_prefix(from_move);
-        let mut meta = self
+        // 元信息克隆：source 不改（保持来源谱的真实路径）。另存默认名
+        // 单独从编号推导（见 copy_default_name），不再借道 meta.source。
+        let meta = self
             .loaded
             .as_ref()
             .expect("前置条件已检查 loaded 存在")
             .clone();
-        // 「另存为」默认名：xxx.sgf → xxx-副本N.sgf（名字只影响默认名，
-        // 用户在另存对话框里可任意改名）。
-        meta.source = PathBuf::from(self.copy_default_name(number));
         self.play = PlayState::review();
         // 当前文档退入 others（带上身份），新副本进主槽。
         self.others.push(Doc {
@@ -1145,6 +1175,9 @@ impl eframe::App for GuanqiApp {
             analysis_panel::PanelAction::RetryEngine => {
                 self.analysis.start_engine(&self.engine_cfg, &self.waker);
             }
+            // 查询超时 / 被拒后的「重试分析」：引擎仍可用，作废已发送
+            // 口径让下一帧 sync 重新发起当前局面的查询。
+            analysis_panel::PanelAction::RetryQuery => self.analysis.retry_query(),
             analysis_panel::PanelAction::Focus { at, ghosts } => {
                 // 再点同一行取消定位。
                 let same = self.overlay.focus.as_ref().is_some_and(|f| f.at == at);
@@ -1419,6 +1452,13 @@ impl eframe::App for GuanqiApp {
             if matches!(action, settings::SettingsAction::ApplyRestart) {
                 // 已保存的配置不会再有损坏提示。
                 self.startup_notice = None;
+                // 搜索线程等 cfg 级改动落到 analysis.cfg（文件已存在时
+                // 也同步 numSearchThreads——此前该键只在首次生成时写入，
+                // 改了等于没改）。失败不阻断重启：引擎用旧配置仍可跑。
+                let cfg_path = crate::engine::effective_analysis_cfg(&self.engine_cfg);
+                if let Err(text) = crate::engine::ensure_analysis_cfg(&cfg_path, &self.engine_cfg) {
+                    self.persist_notice = Some(text);
+                }
                 self.analysis.start_engine(&self.engine_cfg, &self.waker);
             }
         }
@@ -1459,7 +1499,7 @@ impl eframe::App for GuanqiApp {
                     match action {
                         PendingConfirm::DropCopy { number } => self.drop_copy(number),
                         // 载入的路径在确认后才由用户选择，此处重新发起对话框。
-                        PendingConfirm::LoadGame(_) => self.open_file_dialog_after_confirm(),
+                        PendingConfirm::LoadGame => self.open_file_dialog_after_confirm(),
                         PendingConfirm::NewGame(setup) => self.start_new_game(setup),
                         PendingConfirm::None => {}
                     }
@@ -1467,7 +1507,7 @@ impl eframe::App for GuanqiApp {
                 Some(false) => {
                     // 取消：若是「载入新谱」则连等待中的文件对话框一起收起，
                     // 用户重新点「打开棋谱」即可（对话框结果被忽略）。
-                    if matches!(self.pending_confirm, PendingConfirm::LoadGame(_)) {
+                    if matches!(self.pending_confirm, PendingConfirm::LoadGame) {
                         self.dialog = None;
                     }
                     self.pending_confirm = PendingConfirm::None;

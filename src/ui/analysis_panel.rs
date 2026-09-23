@@ -14,7 +14,7 @@
 use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2};
 
 use crate::board::{Board, Coord, IllegalReason, Size, Stone};
-use crate::engine::{Difficulty, EngineConfig, RootInfo};
+use crate::engine::{Difficulty, EngineConfig};
 use crate::play::{PlayState, resign_text};
 use crate::sgf::GameMeta;
 
@@ -43,6 +43,9 @@ pub enum PanelAction {
     None,
     /// 请求用当前配置重启引擎（错误重试按钮）。
     RetryEngine,
+    /// 重发当前局面的查询（查询超时 / 被拒后的「重试分析」按钮）：
+    /// 引擎进程仍可用，作废在飞与已发送口径即重查。
+    RetryQuery,
     /// 点击候选点行：在棋盘上定位该点（再点同一行取消，由 App 处理）。
     Focus {
         /// 候选落点。
@@ -211,18 +214,6 @@ fn model_name(cfg: &EngineConfig) -> String {
         .as_ref()
         .and_then(|p| p.file_name())
         .map_or_else(|| "未配置".to_owned(), |n| n.to_string_lossy().into_owned())
-}
-
-/// 胜率 / 目差文本（黑方视角）。
-///
-/// 显示换算统一走 `card_winrate` 内的 [`display_values`]（按当前视角）；
-/// 本函数保留给不按视角换算的黑视角文本场景。
-#[allow(dead_code)]
-fn eval_lines(root: &RootInfo) -> (String, String) {
-    (
-        format!("黑方胜率 {:.1}%", root.winrate * 100.0),
-        format!("目差 {:+.1}", root.score_lead),
-    )
 }
 
 /// 用分区卡片包住一段内容：卡片底色 + 细边框 + 圆角 + 内边距。
@@ -433,6 +424,7 @@ fn panel_body(
         persist_notice,
         &analysis.transient_error,
         analysis.engine_warnings(),
+        &mut action,
     );
 
     action
@@ -654,6 +646,11 @@ fn card_engine(
         });
         if let EngineStatus::Failed(message) = &analysis.engine {
             ui.colored_label(status_color, message);
+            // 引擎退出时 stderr 尾行已并入 message（engine 层带出）；
+            // 这里再补最近日志行，双保险可见。
+            for line in analysis.log_tail_slice() {
+                ui.label(RichText::new(line).size(11.0).weak());
+            }
             let retry = ui
                 .add(
                     egui::Button::new("重试启动引擎")
@@ -696,6 +693,18 @@ fn card_engine(
                     snapshot.visits_cap
                 ),
             );
+        }
+        // 最近一条引擎日志（诊断可见）：引擎崩溃 / 查询异常时用户在
+        // 界面上至少能看到一行引擎侧原因（此前 `last_log` 只写不读，
+        // 用户只能去翻日志文件）。弱色单行，长行自动折行。
+        if let Some(line) = &analysis.last_log {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("引擎日志：{line}"))
+                        .size(11.0)
+                        .weak(),
+                );
+            });
         }
         ui.add_space(2.0);
         if wide_button(ui, "设置…").clicked() {
@@ -1885,6 +1894,9 @@ fn format_estimate_secs(secs: f64) -> String {
 /// 引擎字段警告（WARN 色，会话内保留、按字段名去重——去重在
 /// [`AnalysisState`] 侧完成）单独列出：它是「配置可能拼错了」的提醒，
 /// 与瞬时错误（红）语义不同，不能混排，也不能只落无人可见的日志。
+/// 瞬时错误（查询超时 / 被拒）附「重试分析」按钮：引擎进程仍可用，
+/// 点击作废已发送口径重查当前局面（`PanelAction::RetryQuery`）——
+/// 此前只能靠改变局面触发重查，界面全空无从下手。
 #[allow(clippy::too_many_arguments)]
 fn card_messages(
     ui: &mut Ui,
@@ -1895,6 +1907,7 @@ fn card_messages(
     persist_notice: Option<&str>,
     transient_error: &Option<String>,
     engine_warnings: &[super::analysis::EngineWarning],
+    action: &mut PanelAction,
 ) {
     let has_any = notice.is_some()
         || startup_notice.is_some()
@@ -1922,6 +1935,9 @@ fn card_messages(
         }
         if let Some(text) = transient_error {
             ui.colored_label(theme::colors::WARN, text);
+            if wide_button(ui, "重试分析").clicked() {
+                *action = PanelAction::RetryQuery;
+            }
         }
         if let Some(msg) = load_notice {
             ui.colored_label(msg.color(), msg.text());

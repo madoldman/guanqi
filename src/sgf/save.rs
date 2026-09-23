@@ -90,6 +90,14 @@ pub fn board_to_sgf(board: &Board, meta: Option<&GameMeta>, stats_block: Option<
             block,
         );
     }
+    // 未识别属性原样写回根节点（TR/SQ/TB/TW 等载入时的保全，见
+    // `load::collect_extras`）：程序已专门写的属性在保全时已排除，
+    // 这里追加的只会是第三方属性，不会重复。
+    if let Some(meta) = meta {
+        for prop in meta.extras_by_sig(SIG_INIT) {
+            root.props.push(prop.clone());
+        }
+    }
     tree.nodes.push(root);
     extend_tree(board, 0, SIG_INIT, meta, &mut tree);
     tree.write()
@@ -212,8 +220,7 @@ fn extend_tree(
             sig_with_record(&mut sig, record);
             tree.nodes.push(record_node(record, sig, meta));
         }
-        if node.children().len() > 1 {
-            let children = node.children().to_vec();
+        if node.children().len() > 1 {            let children = node.children().to_vec();
             for &branch in &children {
                 let mut child_tree = GameTree::default();
                 extend_tree(board, branch, sig, meta, &mut child_tree);
@@ -230,6 +237,13 @@ fn extend_tree(
 
 /// 一手棋 → SGF 节点：`B[xx]` / `W[xx]`（弃着写 `B[]`），有注释带 `C[..]`。
 /// 注释按 `sig`（根到该手着法路径的签名）查 [`GameMeta`]。
+///
+/// 载入时保全的**未识别属性**（`TR` / `SQ` / `TB` / `TW` 等标记与第三方
+/// 扩展）按同一签名查 [`GameMeta::extras_by_sig`] 原样追加到**该手节点**
+/// 上——手数节点写回该手，与载入时「属性挂在产生该局面的节点」对应。
+/// 程序已专门写的属性（`B`/`W`/`C` 等）在保全时已排除（见
+/// `load::is_owned_by_save`），追加的不会与上面两个属性重复；
+/// 用户本轮新增的注释/着法不影响：写回以局面签名为键，新局面无保全。
 fn record_node(record: &MoveRecord, sig: u64, meta: Option<&GameMeta>) -> SgfNode {
     let mut node = SgfNode::default();
     let ident = match record.player {
@@ -246,6 +260,11 @@ fn record_node(record: &MoveRecord, sig: u64, meta: Option<&GameMeta>) -> SgfNod
         .filter(|text| !text.is_empty())
     {
         node.props.push(prop("C", text));
+    }
+    if let Some(meta) = meta {
+        for extra in meta.extras_by_sig(sig) {
+            node.props.push(extra.clone());
+        }
     }
     node
 }

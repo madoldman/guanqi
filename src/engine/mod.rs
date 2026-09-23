@@ -41,8 +41,27 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-/// 单个查询无终态报告的等待上限。
-const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// 超时缩放的**实测锚点**：2000 visits 走子查询在本机（b18 + 680M iGPU
+/// / OpenCL、16 线程）实测 26.8s 完成（8 线程 33.8s，探针实测）。
+/// 缩放公式取「2×(visits/60) + 15s 基准」，锚点处约 82s——旧固定 30s
+/// 与「最强」档自报的每手约 34s 公开矛盾，8 线程下实测已超线（33.8s
+/// > 30s），复杂位置必然被超时误杀。
+const QUERY_TIMEOUT_BASE_SECS: f64 = 15.0;
+/// 超时缩放的 visits 速率分母：与难度档等待估算同一实测口径（约 60
+/// visits/s，见 `config::ESTIMATED_VISITS_PER_SEC` 文档）。
+const QUERY_TIMEOUT_VISITS_PER_SEC: f64 = 60.0;
+
+/// 按查询 visits 计算超时线（秒）：`2×(visits/60) + 15`，下限 30s、
+/// 上限 10 分钟（`visits_max` 哨兵 = 不限 visits 的批量/默认查询）。
+/// 系数取 2× 是给「复杂位置 + 慢机」留余量——超时误杀的代价（界面
+/// 全空、分析缺失）远大于晚几秒报警。
+fn query_timeout_secs(visits: u32) -> u64 {
+    if visits == u32::MAX {
+        return 30;
+    }
+    let estimate = f64::from(visits) / QUERY_TIMEOUT_VISITS_PER_SEC;
+    ((2.0 * estimate + QUERY_TIMEOUT_BASE_SECS) as u64).clamp(30, 600)
+}
 /// 启动可用性判定上限（模型加载 + 可能的 OpenCL 调优实测可达约 60s）。
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
 /// 优雅关闭的等待上限，超时后强杀。
@@ -62,6 +81,8 @@ pub enum EngineError {
     ProcessGone,
     /// 尚未配置权重文件，无法启动。
     ModelNotConfigured,
+    /// 权重文件不存在（被移动 / 删除）：启动必然失败，提前拦截。
+    ModelMissing(PathBuf),
     /// 引擎配置文件生成失败。
     Config(String),
     /// 启动后在限定时间内未见就绪标记（区分「启动中」与「卡死」）。
@@ -84,6 +105,11 @@ impl std::fmt::Display for EngineError {
             Self::ModelNotConfigured => {
                 write!(f, "尚未配置权重文件，请在设置中选择一个网络权重")
             }
+            Self::ModelMissing(p) => write!(
+                f,
+                "权重文件不存在：{}（可能已被移动或删除，请到设置中重新选择）",
+                p.display()
+            ),
             Self::Config(m) => write!(f, "引擎配置问题：{m}"),
             Self::StartupTimeout(d) => {
                 write!(f, "引擎在 {d:.0?} 内未就绪，可能已卡死（如 OpenCL 调优异常）")
@@ -125,19 +151,25 @@ pub enum EngineEvent {
     /// 结构化失败（启动超时 / 查询超时 / 查询被拒等）。
     Failed(EngineError),
     /// 进程退出（崩溃、被 kill 或优雅关闭；用 `ExitStatus` 判定方式）。
-    Exited(std::process::ExitStatus),
+    /// 携带退出前**最后若干行 stderr**（[`STDERR_TAIL_LINES`] 条）：崩溃
+    /// 时 stderr 尾部几乎总有直接原因（OpenCL 编译失败、配置键非法、
+    /// panic 信息），事件里不带的话 UI 只能显示「已退出（信号 11）」，
+    /// 用户无从查起。
+    Exited(std::process::ExitStatus, Vec<String>),
 }
 
 /// 在飞的查询信息：棋盘尺寸（坐标解码用）、视角（SIDETOMOVE 报告归一化
-/// 用）与超时线。
+/// 用）与超时线（按该查询的 maxVisits 缩放，随查询记录——超时错误要
+/// 报出真实等待时长，光有 deadline 反推不回超时线）。
 struct Pending {
     size: Size,
     /// 该查询请求的报告视角：`SideToMove` 时报告在 Engine 出口按行棋方
     /// 归一化回黑视角（口径见 `protocol::WinrateView` 实测文档）。
     view: WinrateView,
     deadline: Instant,
+    /// 本查询的超时线（[`query_timeout_secs`] 的结果）。
+    timeout: Duration,
 }
-
 /// KataGo analysis 桥接器。
 ///
 /// UI 侧典型用法：
@@ -158,7 +190,17 @@ pub struct Engine {
     ready_seen: bool,
     startup_timeout_emitted: bool,
     exit_reported: bool,
+    /// 进程退出前的**最后若干行 stderr**（[`STDERR_TAIL_LINES`] 条环形
+    /// 缓冲）：由 [`Engine::try_recv`] 在消费 stderr 日志事件时顺手记录，
+    /// 进程退出时随 [`EngineEvent::Exited`] 一并带出。stderr 读线程本身
+    /// 不缓存——它只管转发，缓存放消费侧可同时覆盖「读线程转发」与
+    /// 「退出时取尾」两个时机，无需加锁。
+    stderr_tail: std::collections::VecDeque<String>,
 }
+
+/// [`EngineEvent::Exited`] 携带的 stderr 尾行数：崩溃原因几乎总在最后
+/// 几行（panic 摘要 / OpenCL 报错），取 8 行足够；再多只会淹没 UI。
+const STDERR_TAIL_LINES: usize = 8;
 
 impl Engine {
     /// 启动引擎（不等待模型加载完成）。配置 / 权重路径来自 [`EngineConfig`]；
@@ -175,6 +217,12 @@ impl Engine {
             .model_path
             .clone()
             .ok_or(EngineError::ModelNotConfigured)?;
+        // 存在性检查：只看 is_some() 会「成功启动」一个必然失败的引擎
+        //（权重被删后引擎进程立刻退出，用户只看到一个含糊的崩溃），且
+        // 设置面板一直把失效路径当有效配置回显。提前拦下并给出可读错误。
+        if !model_path.is_file() {
+            return Err(EngineError::ModelMissing(model_path));
+        }
         let cfg_path = effective_analysis_cfg(cfg);
         ensure_analysis_cfg(&cfg_path, cfg).map_err(EngineError::Config)?;
         let args = vec![
@@ -195,18 +243,25 @@ impl Engine {
             ready_seen: false,
             startup_timeout_emitted: false,
             exit_reported: false,
+            stderr_tail: std::collections::VecDeque::with_capacity(STDERR_TAIL_LINES),
         })
     }
 
     /// 提交分析查询，返回其 id（单调递增）。错误经 [`EngineEvent::Failed`]
     /// 异步上报，不在此处阻塞或 panic。
+    ///
+    /// 超时线按查询的 maxVisits 缩放（见 [`query_timeout_secs`]）：固定
+    /// 30s 会误杀「最强」档（2000 visits，实测 26.8–33.8s、复杂位置更久）
+    /// 的合法查询。
     pub fn analyze(&mut self, query: AnalysisQuery) -> QueryId {
         let id = self.alloc_id();
         self.last_size = Some(query.board_size);
+        let timeout = Duration::from_secs(query_timeout_secs(query.max_visits.unwrap_or(u32::MAX)));
         self.pending.insert(id, Pending {
             size: query.board_size,
             view: query.view,
-            deadline: Instant::now() + QUERY_TIMEOUT,
+            deadline: Instant::now() + timeout,
+            timeout,
         });
         if let Err(e) = self.process.write_line(&query.encode(id)) {
             self.pending.remove(&id);
@@ -237,17 +292,27 @@ impl Engine {
         }
         // 2. 查询超时判定：上报并对引擎发 terminate 止损。
         if let Some((id, overdue)) = self.next_timed_out() {
+            // 先取该查询的超时线再移除（错误文案要报真实等待时长）。
+            let timeout = self.pending.get(&id).map(|p| p.timeout);
             self.pending.remove(&id);
             self.send_control(ControlRequest::Terminate(id));
             return Some(EngineEvent::Failed(EngineError::QueryTimeout {
                 id,
-                elapsed: QUERY_TIMEOUT + overdue,
+                elapsed: timeout.unwrap_or_default() + overdue,
             }));
         }
         // 3. 通道事件（顺序化）。
         match self.process.try_event() {
             Some(PipeEvent::Stdout(incoming)) => return self.handle_incoming(incoming),
-            Some(PipeEvent::StderrLine(line)) => return Some(EngineEvent::Log(line)),
+            Some(PipeEvent::StderrLine(line)) => {
+                // 尾行缓存（环形，留最后 N 条）：进程退出时随 Exited 带出，
+                // 崩溃原因可见（见 STDERR_TAIL_LINES 文档）。
+                if self.stderr_tail.len() == STDERR_TAIL_LINES {
+                    self.stderr_tail.pop_front();
+                }
+                self.stderr_tail.push_back(line.clone());
+                return Some(EngineEvent::Log(line));
+            }
             Some(PipeEvent::Ready) => {
                 self.ready_seen = true;
                 return Some(EngineEvent::Ready);
@@ -385,7 +450,10 @@ impl Engine {
         if let Some(status) = self.process.try_exit() {
             self.exit_reported = true;
             self.pending.clear();
-            return Some(EngineEvent::Exited(status));
+            // 临终 stderr 尾行随事件带出（取最后 STDERR_TAIL_LINES 行）：
+            // 崩溃原因（OpenCL 失败 / 配置非法 / panic）几乎总在尾部。
+            let tail: Vec<String> = self.stderr_tail.drain(..).collect();
+            return Some(EngineEvent::Exited(status, tail));
         }
         None
     }

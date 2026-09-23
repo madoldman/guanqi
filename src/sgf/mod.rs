@@ -38,7 +38,6 @@ pub use error::{Position, SgfError, SgfErrorKind};
 pub use load::{GameMeta, LoadError, LoadedGame, load_from_bytes};
 pub use save::{SaveError, board_to_sgf, save_to_file};
 pub use tree::{GameInfo, GameTree, Node, Property};
-
 use std::borrow::Cow;
 
 use lexer::Cursor;

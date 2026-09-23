@@ -60,6 +60,12 @@ use crate::engine::{
 /// 此处按相同定义书写，透明等价）。
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
+/// 引擎 stderr 日志的可见保留行数（`EngineEvent::Log` 逐条推入
+/// [`AnalysisState::log_tail`] 环形缓冲）：侧栏显示最后一行；保留 5 行
+/// 供「最近几条日志」一起展示（诊断时启动期的行早已滚走，5 行足够
+/// 覆盖崩溃前的原因行），更多只会放大每帧的 UI 成本。
+const LOG_TAIL_LINES: usize = 5;
+
 /// 流式中间报告的输出间隔（秒）：协议实测 0.5s 键下 300 visits 产出约
 /// 11 条中间报告（visits 27→51→…→303 递增），实时感与序列化压力平衡；
 /// 更密的间隔只会放大 JSON 解析与重绘频次，实时感提升有限。
@@ -390,11 +396,11 @@ pub struct Snapshot {
     pub size: Size,
     /// 该查询的 visits 上限（常规分析为配置值，走子口径为难度值）。
     pub visits_cap: u32,
-    /// 是否按该查询的 visits 上限**搜完的终态**（流式改造后的语义：
-    /// 不再有快 / 深两段，`deep == is_final`）。人机对弈的自动应手只认
-    /// 走子口径的终态快照——中间报告只用于渐进显示，不能拿去走子。
-    pub deep: bool,
     /// 是否为终态报告（`false` = 引擎的渐进中间报告，后续还会更新）。
+    /// 人机对弈的自动应手只认走子口径的终态快照——中间报告只用于渐进
+    /// 显示，不能拿去走子。早先另有 `deep` 字段（「快 / 深两段式」时代的
+    /// 是否搜满标志），流式改造后与 `is_final` 恒等、成为只写不读的
+    /// 重复字段，已删除。
     pub is_final: bool,
     /// 从发起到收到报告的耗时。
     pub elapsed: std::time::Duration,
@@ -410,11 +416,10 @@ pub struct Snapshot {
     /// 策略头一次前向即完整，第一条流式中间报告里就有，是「搜索早期
     /// 即可显示」的独特数据。
     pub policy: Option<Vec<f32>>,
-    /// 每个候选点的「走这一手之后」领地图（opt-in
-    /// `include_moves_ownership` 才有；随报告整表落位，缺省 `None` =
-    /// 未开启或引擎过旧，上层回落根局面 `ownership`）。
-    /// 与 `moves` 同下标对齐（按 `order` 排序后的候选列表）。
-    pub moves_have_ownership: bool,
+    // 「候选点是否带候选级领地图」的 `moves_have_ownership` 标志已删除：
+    // 它与 `moves.iter().any(|m| m.ownership.is_some())` 恒等、只写不读
+    //（判定函数 `overlay::heat_source` 直接查 moves 本身），存一份快照
+    // 只会成为过期的第二事实来源。
 }
 
 impl Snapshot {
@@ -1026,8 +1031,13 @@ pub struct AnalysisState {
     pub snapshot: Option<Snapshot>,
     /// 瞬时错误（查询被拒 / 超时等）：引擎进程仍可用，显示但不进错误状态。
     pub transient_error: Option<String>,
-    /// 最近一条引擎日志（诊断用）。
+    /// 最近一条引擎日志（诊断用）。**侧栏「引擎」卡片直接读取**（弱色
+    /// 单行显示）：引擎崩溃 / 查询被拒时用户至少能看到一行引擎侧原因，
+    /// 而不必去翻日志文件。全部最近行见 [`Self::log_tail_slice`]。
     pub last_log: Option<String>,
+    /// 引擎 stderr 日志的**最近 [`LOG_TAIL_LINES`] 行**环形缓冲：
+    /// 只留最后一行时，崩溃前的关键原因常被启动期日志冲掉。
+    log_tail: std::collections::VecDeque<String>,
     /// 引擎「顶层未知字段」警告（会话内保留、按字段名去重）：同一字段
     /// 只提示一条，避免流式查询每 0.5s 一条报告前都警告一次刷屏。
     /// 侧栏「消息」卡片直接读取（WARN 色）——不能只落 `last_log`：
@@ -1096,6 +1106,10 @@ pub struct AnalysisState {
     want_rules: Option<String>,
     /// 上次发起查询时实际发给引擎的规则（含自动解析结果，规范名）。
     sent_rules: Option<String>,
+    /// 上次发起查询时发给引擎的贴目。贴目是查询级字段（`komi`），换谱 /
+    /// 新对局后贴目变化必须重发查询，否则旧贴目的分析结果会一直挂在
+    /// 新贴目的局面上（载入 KM 不同的谱时表现最明显）。
+    sent_komi: Option<f64>,
     /// 历史与候选表当前**数据的规则口径**（`None` = 无数据）。request
     /// 时刻与解析结果比对：实际变化才清空历史 + 提示（两种规则的
     /// 胜率 / 目差不可混在同一条曲线，见模块文档「规则口径」）。
@@ -1142,6 +1156,7 @@ impl AnalysisState {
             snapshot: None,
             transient_error: None,
             last_log: None,
+            log_tail: std::collections::VecDeque::with_capacity(LOG_TAIL_LINES),
             engine_warnings: Vec::new(),
             history: HashMap::new(),
             candidates: HashMap::new(),
@@ -1163,6 +1178,7 @@ impl AnalysisState {
             gating: CandidateGating::Immediate,
             want_rules: None,
             sent_rules: None,
+            sent_komi: None,
             data_rules: None,
             want_view: DisplayView::Black,
             sent_view: DisplayView::Black,
@@ -1333,6 +1349,12 @@ impl AnalysisState {
         &self.engine_warnings
     }
 
+    /// 引擎 stderr 最近几行（`LOG_TAIL_LINES` 条以内；诊断缓冲，当前
+    /// 侧栏只显示最后一行，此切片供错误态展开展示）。
+    pub fn log_tail_slice(&self) -> impl Iterator<Item = &str> {
+        self.log_tail.iter().map(String::as_str)
+    }
+
     // ---- 规则 / 目数视角（口径变更：重发 + 清历史）----
 
     /// 当前期望的分析规则设置（`None` = 自动跟随棋谱；侧栏引擎卡片显示用）。
@@ -1420,11 +1442,24 @@ impl AnalysisState {
                     self.handle = Some(handle);
                     EngineStatus::Starting
                 }
+                // 权重路径失效（文件被删）等启动前错误同样进可显示状态，
+                // 不区分于进程启动失败。
                 Err(err) => EngineStatus::Failed(err.to_string()),
             }
         } else {
             EngineStatus::Unconfigured
         };
+    }
+
+    /// 手动重试当前局面的查询（消息区「重试分析」按钮）：作废已发送
+    /// 口径（签名 / 规则 / 贴目 / 限制版本），下一帧 `sync` 比对不一致
+    /// 即重发。引擎进程保持运行——瞬时错误（超时 / 被拒）不影响进程，
+    /// 无需重启引擎。清掉瞬时错误避免重试前重复显示。
+    pub fn retry_query(&mut self) {
+        self.analyzed_sig = None;
+        self.sent_rules = None;
+        self.sent_komi = None;
+        self.transient_error = None;
     }
 
     /// 是否有在飞查询（就绪 + 在飞 = 界面显示「分析中」）。
@@ -1441,12 +1476,14 @@ impl AnalysisState {
     pub fn line_points(&self, board: &Board) -> Vec<Option<HistoryPoint>> {
         let records = board.line_records();
         let mut points = Vec::with_capacity(records.len() + 1);
-        // 第 0 手局面（空盘）的行棋方：恒黑（开局黑先口径）。
+        // 第 0 手局面（预设局面）的行棋方：取棋盘真实的根行棋方——
+        // 让子 / 摆子局白先（HA[n] / PL[W]），硬编码黑会让第 0 点的
+        // 交替视角换算错（白先局面第 0 点显示值应为 1−黑视角值）。
         points.push(
             self.history
                 .get(&0xcbf2_9ce4_8422_2325)
                 .copied()
-                .map(|p| HistoryPoint { to_play: Stone::Black, ..p }),
+                .map(|p| HistoryPoint { to_play: board.root_to_play(), ..p }),
         );
         let mut sig = 0xcbf2_9ce4_8422_2325;
         for record in records {
@@ -1660,6 +1697,9 @@ impl AnalysisState {
         let policy_changed = self.want_policy != self.sent_policy;
         let moves_ownership_changed = self.want_moves_ownership != self.sent_moves_ownership;
         let view_changed = self.want_view != self.sent_view;
+        // 贴目：查询级字段，want/sent 比对（复刻 policy 机制）——载入
+        // KM 不同的谱 / 新对局换贴目后，局面未变也必须重发查询。
+        let komi_changed = self.sent_komi != Some(komi);
         // 每帧解析一次生效规则（设置的显式值 > 棋谱 RU 的宽容映射 > 默认）：
         // 换谱 / 改设置后解析结果变化即重发查询。开销可忽略（短串上几次
         // 大小写归一与关键词匹配）。
@@ -1671,6 +1711,7 @@ impl AnalysisState {
             || moves_ownership_changed
             || view_changed
             || rules_changed
+            || komi_changed
         {
             self.snapshot = None;
             self.transient_error = None;
@@ -2235,16 +2276,31 @@ impl AnalysisState {
                 }
                 self.on_report(id, report, is_final, board, cfg, game_rules);
             }
-            EngineEvent::Log(line) => self.last_log = Some(line),
+            EngineEvent::Log(line) => {
+                // 尾行环形缓冲 + 单行显示（诊断可见性：崩溃时至少一行原因）。
+                if self.log_tail.len() == LOG_TAIL_LINES {
+                    self.log_tail.pop_front();
+                }
+                self.log_tail.push_back(line.clone());
+                self.last_log = Some(line);
+            }
             EngineEvent::Warning { id, field, message } => {
                 self.on_warning(id, field, message);
             }
             EngineEvent::Failed(err) => self.on_failed(err),
-            EngineEvent::Exited(status) => {
+            EngineEvent::Exited(status, stderr_tail) => {
                 self.inflight = None;
                 // 引擎退出批量随之失效（错误状态已可见，不再另发提示）。
                 self.batch = None;
-                self.engine = EngineStatus::Failed(format!("引擎进程已退出（{status}）"));
+                // 临终 stderr 尾行并入错误文案：崩溃原因（OpenCL 报错 /
+                // 配置非法 / panic）几乎总在 stderr 尾部，只报退出码用户
+                // 无从查起。行数由 engine 层的 STDERR_TAIL_LINES（8 行）定。
+                let mut message = format!("引擎进程已退出（{status}）");
+                for line in &stderr_tail {
+                    message.push_str("\n　");
+                    message.push_str(line);
+                }
+                self.engine = EngineStatus::Failed(message);
             }
         }
     }
@@ -2299,30 +2355,21 @@ impl AnalysisState {
         }
         let (stage, turn, started) = (inflight.stage, inflight.turn, inflight.started);
         let mut moves = report.move_infos;
-        // 「候选点是否带候选级领地图」要在 moves 被 move 进快照前判定
-        //（流式中间报告与终态同构，实测都带；判定一次 O(候选数)）。
-        let moves_have_ownership = moves.iter().any(|info| info.ownership.is_some());
-        moves.sort_by_key(|info| info.order);
         // 候选表快照在 moves 被 move 进快照前提取（终态才用得到，
         // 但提前提取成本可忽略：表长 ≤ 候选数）。
         let (candidates, candidates_total) = Self::candidates_from(&moves);
+        moves.sort_by_key(|info| info.order);
         let root = report.root_info;
         let snapshot = Snapshot {
             turn,
             size: board.size(),
             visits_cap: stage.cap(cfg),
-            // 语义（流式改造后）：是否按该查询的 visits 上限搜完的终态。
-            // 展示快照可以比终态浅（中间报告），走子决策另见 play_snapshot。
-            deep: is_final,
             is_final,
             elapsed: started.elapsed(),
             root: root.clone(),
             moves,
             ownership: report.ownership,
             policy: report.policy,
-            // 候选点级 ownership 随 moves 整表落位（MoveInfo.ownership），
-            // 这里只记「有没有」供来源标注与回落判定。
-            moves_have_ownership,
         };
         // 走子口径落位：只认终态（中间报告对决策无意义，守卫见
         // `play::engine_move_decision` 的 is_final 判断）。局面签名随查询
@@ -2553,10 +2600,11 @@ impl AnalysisState {
         self.sent_epoch = self.limits_epoch;
         self.sent_policy = self.want_policy;
         self.sent_moves_ownership = self.want_moves_ownership;
-        // 规则 / 视角随查询定格：want/sent 比对的基准（规则变化在下次
-        // sync 比对中触发重发；视角同理）。
+        // 规则 / 视角 / 贴目随查询定格：want/sent 比对的基准（规则变化在下次
+        // sync 比对中触发重发；视角与贴目同理）。
         self.sent_rules = Some(query_rules_after);
         self.sent_view = self.want_view;
+        self.sent_komi = Some(komi);
         self.inflight = Some(Inflight {
             id,
             turn: board.cursor(),
