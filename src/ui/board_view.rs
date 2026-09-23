@@ -62,8 +62,11 @@ const BRANCH_HEIGHT: f32 = 42.0;
 /// 回看中新建变着分支时写入后者，任何一次成功操作后清除，
 /// 使提示能跨帧稳定显示。`analysis` 提供当前局面快照（候选点 / 热度图）
 /// 与当前线历史（失误标注）；`overlay` 持有层开关与侧栏定位状态。
+/// `manual_revealed` 为候选类手动显示模式下的「用户已按 F」标志
+/// （App 持有，局面变化时由 App 复位）。
 /// `play` 为人机对弈状态（`None` = 尚未初始化，按纯复盘处理）；
 /// 对弈模式开启时 Ctrl+Z 悔棋回到「轮到人类」的状态（见 [`undo_to_human`]）。
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut Ui,
     board: &mut Board,
@@ -71,6 +74,7 @@ pub fn show(
     branch_notice: &mut Option<String>,
     analysis: &mut AnalysisState,
     overlay: &Overlay,
+    manual_revealed: bool,
     play: Option<&PlayState>,
 ) {
     handle_keyboard(ui, board, notice, branch_notice, play);
@@ -103,6 +107,11 @@ pub fn show(
     let size = board.size();
     // 热度图数据源标识（棋盘块内赋值，块外供状态栏标注读取）。
     let mut heat_tag = None;
+    // 候选类显示门控（第 5 项）：候选点圆圈 / 定位高亮（幽灵子）/ 候选点
+    // 领地层都属「候选类」，延迟与手动模式下未到时机不显示。胜率 / 目差
+    // 数字、曲线、失误标注不受门控（流式实时是它们的价值）。判定只影响
+    // 绘制取数，不影响任何数据接收与走子决策。
+    let candidates_visible = analysis.candidates_visible(manual_revealed);
     if let Some(layout) = Layout::fit(response.rect, size) {
         let snapshot = analysis.snapshot.as_ref();
         let painter = ui.painter_at(layout.rect.expand(2.0));
@@ -117,8 +126,9 @@ pub fn show(
         if overlay.show_heat
             && let Some(snapshot) = snapshot
         {
-            let focus = overlay
-                .show_moves_heat
+            // 聚焦候选点的「走后领地」属候选类内容，随门控隐藏；
+            // 回落当前局面的根 ownership 不是候选类，照常显示。
+            let focus = (overlay.show_moves_heat && candidates_visible)
                 .then_some(overlay.focus.as_ref())
                 .flatten();
             heat_tag = overlay::draw_heat(&painter, &layout, snapshot, focus);
@@ -136,13 +146,16 @@ pub fn show(
         if overlay.show_mistakes {
             overlay::draw_mistakes(&painter, &layout, board, analysis);
         }
-        // 候选点与定位高亮画在棋子之上。
+        // 候选点与定位高亮画在棋子之上（随候选类门控）。
         if overlay.show_candidates
+            && candidates_visible
             && let Some(snapshot) = snapshot
         {
             overlay::draw_candidates(&painter, &layout, snapshot);
         }
-        if let Some(focus) = &overlay.focus {
+        if candidates_visible
+            && let Some(focus) = &overlay.focus
+        {
             overlay::draw_focus(&painter, &layout, board, focus);
         }
         // 选点限制的可视化：区域遮罩 + 排除点标记（画在候选点之上更醒目）。
@@ -206,6 +219,22 @@ pub fn show(
     // 显式标出，让「现在这层紫灰色画的是哪手的领地」永远可判读。
     if let Some(source) = heat_tag {
         draw_heat_source_tag(ui, board.size(), source);
+    }
+
+    // 手动门控等待按键：不刺眼的一行小字（不弹窗、不抢焦点）。
+    // 判定与棋盘候选隐藏同一状态源，二者不可能不一致。
+    if analysis.awaiting_manual_reveal(manual_revealed) {
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 0.0),
+            egui::Layout::left_to_right(egui::Align::Min),
+            |ui| {
+                ui.label(
+                    RichText::new("候选点已隐藏——按 F 显示（手动模式）")
+                        .color(Color32::from_rgb(150, 156, 166))
+                        .size(11.0),
+                );
+            },
+        );
     }
 
     draw_status(ui, board, *notice, branch_notice.as_deref(), play, &limits);
@@ -459,6 +488,8 @@ fn draw_avoid_marks(painter: &Painter, layout: &Layout, avoid: &[(Stone, Coord)]
 
 // ---- 几何 ----/// 棋盘几何：屏幕坐标与交叉点的唯一换算点。
 /// `point` / `spacing` 供叠加层（`overlay` 模块）复用，其余仅供本模块。
+/// 小棋盘回放盘（`ui::mini_board`）经 `fit` 复用同一套几何与绘制函数，
+/// 保证「主棋盘怎么画，小盘就怎么画」。
 pub(crate) struct Layout {
     size: Size,
     /// 交叉点 (0, 0) 的屏幕坐标。
@@ -468,12 +499,12 @@ pub(crate) struct Layout {
     /// 交叉点区域到棋盘边缘的留白。
     margin: f32,
     /// 棋盘整体（含留白）所占的区域。
-    rect: Rect,
+    pub(crate) rect: Rect,
 }
 
 impl Layout {
     /// 在 `avail` 内居中放置棋盘；空间过小时返回 `None`（不绘制，不 panic）。
-    fn fit(avail: Rect, size: Size) -> Option<Self> {
+    pub(crate) fn fit(avail: Rect, size: Size) -> Option<Self> {
         let side = avail.width().min(avail.height());
         if !side.is_finite() || side <= 8.0 {
             return None;
@@ -524,12 +555,12 @@ fn coord(size: Size, x: u8, y: u8) -> Coord {
 
 // ---- 绘制 ----
 
-fn draw_board(painter: &Painter, layout: &Layout) {
+pub(crate) fn draw_board(painter: &Painter, layout: &Layout) {
     painter.rect_filled(layout.rect.expand(2.0), 5.0, WOOD_EDGE);
     painter.rect_filled(layout.rect, 4.0, WOOD);
 }
 
-fn draw_grid(painter: &Painter, layout: &Layout, size: Size) {
+pub(crate) fn draw_grid(painter: &Painter, layout: &Layout, size: Size) {
     let n = size.n();
     let width = (layout.spacing * 0.05).max(1.0);
     for i in 0..n {
@@ -573,7 +604,7 @@ fn star_points(n: u8) -> &'static [(u8, u8)] {
     }
 }
 
-fn draw_stars(painter: &Painter, layout: &Layout, size: Size) {
+pub(crate) fn draw_stars(painter: &Painter, layout: &Layout, size: Size) {
     let radius = (layout.spacing * 0.11).max(1.5);
     for &(x, y) in star_points(size.n()) {
         painter.circle_filled(layout.point(coord(size, x, y)), radius, LINE);
@@ -582,7 +613,7 @@ fn draw_stars(painter: &Painter, layout: &Layout, size: Size) {
 
 /// 坐标注释：列字母在棋盘下方，行号在左侧。
 /// 字母与行号一律取自 [`Coord::to_gtp`] 的输出，与 GTP 口径共用同一实现。
-fn draw_coordinates(painter: &Painter, layout: &Layout, size: Size) {
+pub(crate) fn draw_coordinates(painter: &Painter, layout: &Layout, size: Size) {
     if layout.spacing < 14.0 {
         return; // 空间过小时标注会互相重叠，直接省略
     }
@@ -624,7 +655,7 @@ fn draw_stones(painter: &Painter, layout: &Layout, board: &Board) {
 }
 
 /// 单颗棋子：落影 + 明暗两层，做出基础立体感（不引入图片资源）。
-fn draw_stone(painter: &Painter, center: Pos2, radius: f32, stone: Stone) {
+pub(crate) fn draw_stone(painter: &Painter, center: Pos2, radius: f32, stone: Stone) {
     painter.circle_filled(
         center + Vec2::new(radius * 0.10, radius * 0.16),
         radius,

@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::board::{Board, IllegalReason, Size, Stone};
+use crate::board::{Board, IllegalReason, MoveRecord, Size, Stone};
 use crate::engine::{Difficulty, EngineConfig, load_settings, save_settings};
 use crate::play::{self, GameSetup, PlayState};
 use crate::portal::{FileDialog, PortalEvent};
@@ -33,7 +33,7 @@ use crate::ui;
 use crate::ui::{
     analysis::{AnalysisState, EngineStatus, Waker},
     analysis_panel::{self, LoadNotice},
-    curve, new_game, overlay, settings, tree,
+    curve, mini_board, new_game, overlay, settings, tree,
 };
 
 /// 另存对话框的默认文件名：取档案路径的文件名，无法取得时退回
@@ -65,6 +65,8 @@ pub struct GuanqiApp {
     tree_open: bool,
     /// 棋谱树控件跨帧状态（布局缓存与自动滚动记忆）。
     tree_ui: tree::TreeUi,
+    /// 小棋盘 PV 回放状态机（第 6 项；开关在叠加层卡片，默认关）。
+    mini_board: mini_board::MiniBoard,
     /// 棋盘替换代数：整体替换棋盘（载谱 / 新对局）时递增，混入树布局
     /// 指纹，防止「着法序列恰好相同的另一盘棋」复用过期布局。
     tree_epoch: u64,
@@ -98,6 +100,12 @@ pub struct GuanqiApp {
     new_game: new_game::NewGameUi,
     /// 当前生效的贴目（新对局时设置；查询随局面发给引擎）。
     komi: f64,
+    /// 候选类手动显示模式下「用户已按 F」标志（第 5 项）。局面一变
+    /// （签名变化）即复位，重新要求按键确认。
+    manual_revealed: bool,
+    /// 上次按 F 时的局面签名：比对检测「局面已变」，变化即清
+    /// `manual_revealed`。
+    manual_sig: Option<Vec<MoveRecord>>,
     /// 驻留内存的**非活动**文档列表（原谱与各研究副本轮流退入）。
     ///
     /// 主槽始终显示当前文档；创建副本时当前文档整体推入本列表、新副本
@@ -202,11 +210,14 @@ impl GuanqiApp {
                 show_policy: false,
                 show_moves_heat: false,
                 show_mistakes: true,
+                show_score_lead: true,
+                show_mini_board: false,
                 focus: None,
             },
             curve_open: true,
             tree_open: false,
             tree_ui: tree::TreeUi::default(),
+            mini_board: mini_board::MiniBoard::default(),
             tree_epoch: 0,
             engine_cfg,
             settings,
@@ -223,6 +234,8 @@ impl GuanqiApp {
             new_game_open: false,
             new_game: new_game::NewGameUi::new(),
             komi: 7.5,
+            manual_revealed: false,
+            manual_sig: None,
             others: Vec::new(),
             active_from_move: None,
             active_number: 0,
@@ -787,6 +800,27 @@ impl eframe::App for GuanqiApp {
         if ui.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.ctrl && i.modifiers.shift) {
             self.save_file_dialog();
         }
+        // F 键：候选类手动显示模式（第 5 项）的「显示」确认。仅手动门控
+        // 下消费该按键（其它模式 F 无绑定，不干扰）；局面签名记在按下时
+        // 刻，此后局面一变由每帧的签名比对复位（重新要求确认）。
+        let manual_gating =
+            self.analysis.gating() == crate::ui::analysis::CandidateGating::Manual;
+        if manual_gating && ui.input(|i| i.key_pressed(egui::Key::F)) {
+            self.manual_revealed = true;
+            self.manual_sig = Some(self.board.records().to_vec());
+        }
+        // 局面一变即撤回手动确认：游标 / 分支 / 落子 / 换谱都会改签名。
+        // 顺序（先处理按键、再比对签名）意味着「同帧内局面刚变又按 F」时
+        // 以新局面的签名记录确认 ⇒ 按键对当前局面生效，符合直觉。
+        if self.manual_revealed
+            && self
+                .manual_sig
+                .as_ref()
+                .is_none_or(|sig| !sig.eq(self.board.records()))
+        {
+            self.manual_revealed = false;
+            self.manual_sig = None;
+        }
         // 顶部菜单栏：文件 → 打开棋谱… / 另存为…；对局 → 新对局…
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -899,6 +933,7 @@ impl eframe::App for GuanqiApp {
                     &mut self.overlay,
                     &mut self.curve_open,
                     &mut self.tree_open,
+                    self.manual_revealed,
                     self.loaded.as_ref(),
                     comment,
                     self.load_notice.as_ref(),
@@ -1021,6 +1056,15 @@ impl eframe::App for GuanqiApp {
             analysis_panel::PanelAction::GotoTurn(turn) => {
                 self.board.go_to(turn);
             }
+            // 候选类显示门控切换（第 5 项）：只改显示判定，数据流与走子
+            // 决策不受影响。切回立即 / 延迟时清掉手动确认残留。
+            analysis_panel::PanelAction::SetGating(gating) => {
+                self.analysis.set_gating(gating);
+                if gating != crate::ui::analysis::CandidateGating::Manual {
+                    self.manual_revealed = false;
+                    self.manual_sig = None;
+                }
+            }
         }
 
         // 胜率曲线底部面板（TASKS 4.3）：隐藏时不创建，零额外计算；
@@ -1030,7 +1074,28 @@ impl eframe::App for GuanqiApp {
                 .default_size(120.0)
                 .resizable(true)
                 .show(ui, |ui| {
-                    curve::show(ui, &self.analysis, &self.board);
+                    curve::show(ui, &self.analysis, &self.board, self.overlay.show_score_lead);
+                });
+        }
+
+        // 小棋盘 PV 回放面板（第 6 项）：与曲线面板并列的底部面板。
+        // 面板里只做预览式摆子（本地合成网格），绝不改棋谱树；数据源
+        // 优先聚焦候选点、回落引擎首选，来源标注在面板标题行。
+        // 隐藏时不创建，不占主棋盘空间。
+        if self.overlay.show_mini_board {
+            egui::Panel::bottom("mini_board_panel")
+                .default_size(mini_board::MINI_SIDE + 46.0)
+                .size_range(120.0..=460.0)
+                .resizable(true)
+                .show(ui, |ui| {
+                    self.mini_board.show(
+                        ui,
+                        self.board.grid(),
+                        self.board.size(),
+                        self.board.to_play(),
+                        self.analysis.snapshot.as_ref(),
+                        &self.overlay,
+                    );
                 });
         }
 
@@ -1083,6 +1148,7 @@ impl eframe::App for GuanqiApp {
                 &mut self.branch_notice,
                 &mut self.analysis,
                 &self.overlay,
+                self.manual_revealed,
                 Some(&self.play),
             );
         });

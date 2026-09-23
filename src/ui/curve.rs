@@ -1,5 +1,5 @@
 //! 胜率曲线（TASKS 4.3 / 4.4）：底部面板逐手黑方胜率折线、当前手指示、
-//! 悬停数值与失误联动。
+//! 悬停数值与失误联动，并可叠加同横轴的**目差折线**（右侧目差刻度）。
 //!
 //! 数据经 [`AnalysisState::line_points`] 只取**当前线**（根到当前节点沿
 //! 选中子分支）上的历史点——历史缓冲按局面签名存储，同手数的不同分支
@@ -12,6 +12,10 @@
 //!   [`overlay::severity_color`] 并稍加大，一眼看出曲线在哪一段跳水；
 //! - 胜率一律**黑方视角**（`reportAnalysisWinratesAs = BLACK`），不翻转，
 //!   标题与提示文案均注明；
+//! - 目差折线（可开关）：与胜率线同一数据源（`HistoryPoint::score_lead`，
+//!   黑方视角），**虚线 + 暖色**与胜率实线肉眼可分；纵轴按**对称于 0 的
+//!   目差刻度**独立换算（见 [`score_scale`]），右侧标注刻度值，左侧仍是
+//!   胜率 0–100%；
 //! - 当前手（[`Board::cursor`]）用琥珀色竖线 + 大圆点指示，
 //!   该手尚无数据时仍显示竖线位置；
 //! - 悬停时磁吸高亮最近已知手数（竖线 + 白环），并用 egui 原生指针提示
@@ -24,9 +28,9 @@ use crate::board::Board;
 use super::analysis::{loss_from_points, AnalysisState, HistoryPoint, MoveLoss};
 use super::overlay;
 
-/// 曲线区四周留白：轴标注与标题占用。
+/// 曲线区四周留白：轴标注与标题占用（右侧加宽给目差刻度）。
 const PAD_LEFT: f32 = 42.0;
-const PAD_RIGHT: f32 = 12.0;
+const PAD_RIGHT: f32 = 44.0;
 const PAD_TOP: f32 = 24.0;
 const PAD_BOTTOM: f32 = 16.0;
 
@@ -36,14 +40,73 @@ const CURSOR_RADIUS: f32 = 4.5;
 
 /// 折线、当前手（与棋盘定位高亮同一琥珀色）、轴线与文字配色。
 const LINE: Color32 = Color32::from_rgb(120, 200, 255);
+/// 目差折线：偏红橙的暖色 + 虚线，与胜率实线（浅蓝冷色）肉眼可分；
+/// 刻意避开失误标注的橙（255,152,82）与恶手红，避免两套语义混色。
+const SCORE_LEAD_LINE: Color32 = Color32::from_rgb(255, 122, 77);
 const CURSOR: Color32 = Color32::from_rgb(255, 170, 40);
 const AXIS: Color32 = Color32::from_rgb(120, 120, 128);
 const GRID: Color32 = Color32::from_rgb(60, 62, 70);
 const LABEL: Color32 = Color32::from_rgb(160, 160, 168);
 
+/// 目差刻度的**最小跨度**（目，半幅）：可见数据 |目差| 全部小于它时仍用
+/// 它做刻度，避免开局 ±零点几目的数据被放大成满幅噪声，一格多少目始终
+/// 有稳定概念。
+pub(crate) const SCORE_SPAN_MIN: f64 = 2.0;
+
+/// 目差虚线的实段 / 空段长度（逻辑像素）。
+const DASH_LEN: f32 = 6.0;
+const DASH_GAP: f32 = 4.0;
+
+/// 目差刻度：由可见数据计算**对称于 0** 的刻度半幅。
+///
+/// `span = max(|目差|).max(SCORE_SPAN_MIN)`，再向上取整到「好看数」
+/// （1 / 2 / 5 × 10^k）——刻度值必须标在右侧，±7.3 这类刻度不可读；
+/// 取整只会**放大**跨度，数据永不因取整出界。返回值恒 > 0。
+/// 目差 y 换算：`y = plot.center().y - v / span * plot.height() / 2`
+/// （正目差 = 黑优 = 上方，与胜率「高 = 黑优」方向一致）。
+pub fn score_scale(points: &[HistoryPoint]) -> f64 {
+    let raw = points
+        .iter()
+        .map(|p| p.score_lead.abs())
+        .fold(SCORE_SPAN_MIN, f64::max);
+    nice_ceiling(raw)
+}
+
+/// 把值向上取整到 1 / 2 / 5 × 10^k（刻度好看数）。
+fn nice_ceiling(v: f64) -> f64 {
+    let exp = v.abs().log10().floor();
+    let base = 10f64.powf(exp);
+    for m in [1.0, 2.0, 5.0, 10.0] {
+        let nice = m * base;
+        if v <= nice {
+            return nice;
+        }
+    }
+    10.0 * base
+}
+
+/// 目差值 → 曲线区内的像素 y（正值 = 黑优 = 上方；出界值夹回边线，
+/// 与胜率 y 的 clamp 同一纪律——超范围的数据不撕裂坐标系）。
+pub fn score_y(plot: Rect, v: f64, span: f64) -> f32 {
+    let half = plot.height() / 2.0;
+    let t = (v / span).clamp(-1.0, 1.0) as f32;
+    plot.center().y - t * half
+}
+
+/// 刻度值的显示小数位：好看数（1/2/5×10^k）在 <1 时需要小数（如 0.5），
+/// ≥1 时整数足够（10 / 20 / 5 目没有半目刻度）。
+fn nice_decimals(span: f64) -> usize {
+    if span < 1.0 {
+        1
+    } else {
+        0
+    }
+}
+
 /// 绘制胜率曲线面板内容。外层底部面板由 `app` 条件创建：
-/// 面板隐藏时不进入本函数，零额外计算。
-pub fn show(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
+/// 面板隐藏时不进入本函数，零额外计算。`show_score_lead` 为目差折线
+/// 开关（关闭时不计算刻度、零绘制开销）。
+pub fn show(ui: &mut Ui, analysis: &AnalysisState, board: &Board, show_score_lead: bool) {
     // 横轴取**当前线**长度（棋谱树里变着分支各成一条线，与棋盘显示口径一致）。
     let total = board.line_len();
     // 当前线上的历史点（下标 = 手数，0 = 初始空盘）：历史缓冲按局面签名
@@ -94,7 +157,10 @@ pub fn show(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
     let x = |turn: f32| plot.left() + turn / total as f32 * plot.width();
     let y = |winrate: f32| plot.bottom() - winrate.clamp(0.0, 1.0) * plot.height();
 
-    draw_axes(&painter, plot, total);
+    // 目差刻度（对称于 0 的半幅）：只在开关开启时计算与绘制。
+    let span = show_score_lead.then(|| score_scale(&known));
+
+    draw_axes(&painter, plot, total, span);
     painter.text(
         Pos2::new(plot.left(), avail.min.y + 5.0),
         Align2::LEFT_TOP,
@@ -102,6 +168,16 @@ pub fn show(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
         FontId::proportional(12.0),
         LABEL,
     );
+    // 目差线标题：与折线同色，一眼对应（开关关闭时不占位）。
+    if show_score_lead {
+        painter.text(
+            Pos2::new(plot.center().x, avail.min.y + 5.0),
+            Align2::CENTER_TOP,
+            "目差（虚线）",
+            FontId::proportional(12.0),
+            SCORE_LEAD_LINE,
+        );
+    }
 
     // 折线：仅相邻两手都有数据才连线，缺口留空。
     for pair in known.windows(2) {
@@ -113,6 +189,35 @@ pub fn show(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
                     Pos2::new(x(t1 as f32), y(pair[1].winrate as f32)),
                 ],
                 Stroke::new(1.8, LINE),
+            );
+        }
+    }
+
+    // 目差折线（虚线）：画在胜率线之后、点位标记之前，与胜率线同层。
+    // 刻度 span 恒 > 0（score_scale 保证），除法安全。
+    if let Some(span) = span {
+        let sy = |v: f64| score_y(plot, v, span);
+        for pair in known.windows(2) {
+            let (t0, t1) = (pair[0].turn, pair[1].turn);
+            if t1 - t0 == 1 {
+                draw_dashed(
+                    &painter,
+                    [
+                        Pos2::new(x(t0 as f32), sy(pair[0].score_lead)),
+                        Pos2::new(x(t1 as f32), sy(pair[1].score_lead)),
+                    ],
+                    Stroke::new(1.6, SCORE_LEAD_LINE),
+                );
+            }
+        }
+        // 目差已知点：小空心方点（与胜率实心圆点区分），同色系。
+        for p in &known {
+            let center = Pos2::new(x(p.turn as f32), sy(p.score_lead));
+            painter.rect_stroke(
+                Rect::from_center_size(center, Vec2::splat(DOT_RADIUS * 1.8)),
+                1.0,
+                Stroke::new(1.2, SCORE_LEAD_LINE),
+                StrokeKind::Middle,
             );
         }
     }
@@ -140,8 +245,28 @@ pub fn show(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
     draw_hover(&painter, plot, &x, &y, total, response, &known, &losses);
 }
 
+/// 虚线线段：把整段按「实 DASH_LEN + 空 DASH_GAP」交替切成小段绘制。
+/// 端点方向由线段向量归一化给出；长度不足一个实段时退化为实线（不画空）。
+fn draw_dashed(painter: &Painter, [a, b]: [Pos2; 2], stroke: Stroke) {
+    let vec = b - a;
+    let len = vec.length();
+    if len <= DASH_LEN {
+        painter.line_segment([a, b], stroke);
+        return;
+    }
+    let dir = vec / len;
+    let mut s = 0.0;
+    while s < len {
+        let e = (s + DASH_LEN).min(len);
+        painter.line_segment([a + dir * s, a + dir * e], stroke);
+        s = e + DASH_GAP;
+    }
+}
+
 /// 坐标系：底板、边框、Y 轴 0/50/100% 标注、50% 虚线参考线、X 轴首末手数。
-fn draw_axes(painter: &Painter, plot: Rect, total: usize) {
+/// `span` 为目差刻度半幅（`Some` 时在右侧对称标目差刻度：+span / 0 / −span，
+/// 中间再插 ±span/2 两档——档数固定避免随数据抖动）。
+fn draw_axes(painter: &Painter, plot: Rect, total: usize, span: Option<f64>) {
     painter.rect_filled(plot, 3.0, Color32::from_rgb(28, 30, 34));
     painter.rect_stroke(plot, 3.0, Stroke::new(1.0, AXIS), StrokeKind::Middle);
     // Y 轴百分比标注（黑方视角）。
@@ -153,6 +278,37 @@ fn draw_axes(painter: &Painter, plot: Rect, total: usize) {
             FontId::proportional(10.0),
             LABEL,
         );
+    }
+    // 右侧目差刻度（对称于 0）：正 = 黑优在上，与胜率高低方向一致；
+    // 刻度值永远显式标出（否则读者不知道一格多少目）。
+    if let Some(span) = span {
+        let font = FontId::proportional(10.0);
+        for (v, align) in [
+            (span, Align2::LEFT_BOTTOM),
+            (span / 2.0, Align2::LEFT_CENTER),
+            (0.0, Align2::LEFT_CENTER),
+            (-span / 2.0, Align2::LEFT_CENTER),
+            (-span, Align2::LEFT_TOP),
+        ] {
+            // ±span 档贴在框线内侧半行高处，避免文字下半截被裁。
+            let y = match align {
+                Align2::LEFT_BOTTOM => score_y(plot, v, span) + 5.0,
+                Align2::LEFT_TOP => score_y(plot, v, span) - 5.0,
+                _ => score_y(plot, v, span),
+            };
+            let text = if v == 0.0 {
+                "0".to_owned()
+            } else {
+                format!("{:+.*}", nice_decimals(span), v)
+            };
+            painter.text(
+                Pos2::new(plot.right() + 5.0, y),
+                align,
+                text,
+                font.clone(),
+                SCORE_LEAD_LINE,
+            );
+        }
     }
     // 50% 虚线参考线。
     let mid = plot.center().y;

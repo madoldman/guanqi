@@ -108,6 +108,19 @@ pub enum PanelAction {
     /// 点了「局后统计」排行榜某行：跳转到该手（App 调
     /// [`crate::board::Board::go_to`]，曲线 / 棋盘定位随局面联动）。
     GotoTurn(usize),
+    /// 候选类显示门控模式切换（第 5 项）：转入
+    /// [`crate::ui::analysis::AnalysisState::set_gating`]。只改显示判定，
+    /// 不重发查询、不影响走子决策。
+    SetGating(crate::ui::analysis::CandidateGating),
+}
+
+/// 从当前门控模式提取延迟秒数（分段选择器构造「延迟」段时沿用当前值，
+/// 避免用户调好的秒数在切模式时被重置）。
+fn gating_delay(gating: super::analysis::CandidateGating) -> u32 {
+    match gating {
+        super::analysis::CandidateGating::Delayed { secs } => secs,
+        _ => 3,
+    }
 }
 
 /// 「打开棋谱」流程的用户可见提示（App 写入，随侧栏提示行显示）。
@@ -261,6 +274,8 @@ pub(crate) fn pv_text(pv: &[Option<Coord>], size: Size) -> Option<String> {
 /// 绘制分析侧栏。`settings_open` 由本面板与顶部按钮共享；
 /// `overlay` 为棋盘叠加层的层开关与定位状态（本面板读写）；
 /// `curve_open` / `tree_open` 为胜率曲线 / 棋谱树底部面板的显示开关。
+/// `manual_revealed` 为候选类手动显示模式下「用户已按 F」标志
+/// （App 持有并随局面变化复位，本面板只读）。
 /// `board` 提供总手数与各行棋方（失误汇总按手数现场派生）。
 /// `game` / `comment` 为「打开棋谱」相关信息：已载入棋谱的元信息与
 /// 当前手注释；`load_notice` / `save_notice` 为最近一次打开 / 另存
@@ -281,6 +296,7 @@ pub fn show(
     overlay: &mut Overlay,
     curve_open: &mut bool,
     tree_open: &mut bool,
+    manual_revealed: bool,
     game: Option<&GameMeta>,
     comment: Option<&str>,
     load_notice: Option<&LoadNotice>,
@@ -304,6 +320,7 @@ pub fn show(
                 overlay,
                 curve_open,
                 tree_open,
+                manual_revealed,
                 game,
                 comment,
                 load_notice,
@@ -331,6 +348,7 @@ fn panel_body(
     overlay: &mut Overlay,
     curve_open: &mut bool,
     tree_open: &mut bool,
+    manual_revealed: bool,
     game: Option<&GameMeta>,
     comment: Option<&str>,
     load_notice: Option<&LoadNotice>,
@@ -373,7 +391,7 @@ fn panel_body(
     card_limits(ui, analysis, board, &mut action);
 
     // ---- 候选点 ----
-    card_candidates(ui, analysis, overlay, &mut action);
+    card_candidates(ui, analysis, overlay, manual_revealed, &mut action);
 
     // ---- 失误统计（TASKS 4.4）----
     card_mistakes(ui, analysis, board);
@@ -386,7 +404,7 @@ fn panel_body(
     card_batch(ui, analysis, board, &mut action);
 
     // ---- 叠加层（返回策略层 / 候选点领地层开关是否变化，交由 App 转发重查）----
-    let overlay_toggles = card_overlay(ui, overlay, analysis, curve_open, tree_open);
+    let overlay_toggles = card_overlay(ui, overlay, analysis, curve_open, tree_open, &mut action);
     if overlay_toggles.policy_toggled {
         action = PanelAction::SetWantPolicy(overlay.show_policy);
     }
@@ -923,14 +941,38 @@ fn card_winrate(ui: &mut Ui, analysis: &AnalysisState) {
 
 /// 「候选点」卡片：全宽按钮行，点 / 胜率 / visits 三段排版，点击定位；
 /// 行下方弱色小字显示该候选的主变（PV）前缀。
+///
+/// 整张卡片属**候选类**内容（第 5 项门控）：延迟 / 手动模式下未到时机
+/// 时整体不渲染（含「排除 / 前进」按钮——按钮以候选行为载体，候选都
+/// 藏了按钮自然也不该在）。胜率 / 目差卡片与曲线不受门控。
 fn card_candidates(
     ui: &mut Ui,
     analysis: &AnalysisState,
     overlay: &Overlay,
+    manual_revealed: bool,
     action: &mut PanelAction,
 ) {
     card(ui, |ui| {
         theme::section_title(ui, "候选点");
+        if !analysis.candidates_visible(manual_revealed) {
+            // 门控未放行：如实说明隐藏原因，不假装「引擎未返回候选点」。
+            match analysis.gating() {
+                super::analysis::CandidateGating::Delayed { secs } => {
+                    ui.weak(format!(
+                        "候选点延迟 {} 秒显示（避免浅层搜索结果误导）。胜率 / 目差数字仍在实时刷新。",
+                        secs
+                    ));
+                }
+                super::analysis::CandidateGating::Manual => {
+                    ui.colored_label(
+                        Color32::from_rgb(150, 156, 166),
+                        "候选点已隐藏——按 F 显示（手动模式）。",
+                    );
+                }
+                super::analysis::CandidateGating::Immediate => {}
+            }
+            return;
+        }
         match &analysis.snapshot {
             Some(snapshot) if !snapshot.moves.is_empty() => {
                 ui.weak("点 / 黑方胜率 / visits（点击定位）");
@@ -1392,6 +1434,7 @@ fn card_overlay(
     analysis: &AnalysisState,
     curve_open: &mut bool,
     tree_open: &mut bool,
+    action: &mut PanelAction,
 ) -> OverlayToggles {
     let mut toggles = OverlayToggles {
         policy_toggled: false,
@@ -1400,6 +1443,53 @@ fn card_overlay(
     card(ui, |ui| {
         theme::section_title(ui, "叠加层");
         ui.checkbox(&mut overlay.show_candidates, "候选点圆圈");
+
+        // 候选类显示门控（第 5 项）：三选一分段选择器。只影响候选类内容
+        // （候选圆圈 / PV 幽灵子 / 候选列表 / 候选点领地）何时显示；
+        // 胜率 / 目差数字与曲线永远实时。切换即时生效，不重发查询。
+        ui.label(RichText::new("候选点显示").weak());
+        ui.horizontal(|ui| {
+            let gating = analysis.gating();
+            for mode in [
+                super::analysis::CandidateGating::Immediate,
+                super::analysis::CandidateGating::Delayed { secs: gating_delay(gating) },
+                super::analysis::CandidateGating::Manual,
+            ] {
+                let selected = std::mem::discriminant(&gating) == std::mem::discriminant(&mode);
+                let button = egui::Button::selectable(selected, mode.name());
+                let response = ui
+                    .add(button)
+                    .on_hover_text(match mode {
+                        super::analysis::CandidateGating::Immediate => {
+                            "收到报告即显示候选（默认）"
+                        }
+                        super::analysis::CandidateGating::Delayed { .. } => {
+                            "引擎开始思考满 N 秒后才显示候选，避免浅层搜索结果误导"
+                        }
+                        super::analysis::CandidateGating::Manual => {
+                            "按 F 显示候选；局面一变需重新按键"
+                        }
+                    });
+                if response.clicked() {
+                    *action = PanelAction::SetGating(mode);
+                }
+            }
+        });
+        // 延迟秒数（仅延迟模式显示编辑框）。
+        if let super::analysis::CandidateGating::Delayed { secs } = analysis.gating() {
+            ui.horizontal(|ui| {
+                ui.weak("延迟");
+                let mut secs_edit = secs as i32;
+                if ui
+                    .add(egui::DragValue::new(&mut secs_edit).range(1..=30).suffix(" 秒"))
+                    .changed()
+                {
+                    *action = PanelAction::SetGating(super::analysis::CandidateGating::Delayed {
+                        secs: secs_edit.max(1) as u32,
+                    });
+                }
+            });
+        }
         ui.checkbox(&mut overlay.show_heat, "局势热度图");
         let policy = ui
             .checkbox(&mut overlay.show_policy, "策略热度图")
@@ -1418,6 +1508,16 @@ fn card_overlay(
             );
         toggles.moves_heat_toggled = moves_heat.changed();
         ui.checkbox(&mut overlay.show_mistakes, "失误标注");
+        ui.checkbox(&mut overlay.show_score_lead, "曲线叠加目差")
+            .on_hover_text(
+                "在胜率曲线上叠加目差折线（虚线暖色，右侧目差刻度对称于 0）。\
+                 复盘看形势主要看目差，默认开启。",
+            );
+        ui.checkbox(&mut overlay.show_mini_board, "小棋盘回放")
+            .on_hover_text(
+                "底部打开一个小棋盘，把聚焦候选点（未聚焦用引擎首选）的\
+                 主变逐手自动回放。只做预览摆子，不改棋谱树。",
+            );
         ui.checkbox(curve_open, "胜率曲线面板");
         ui.checkbox(tree_open, "棋谱树面板");
         // 胜率色阶图例：与棋盘候选点共用 overlay::winrate_color 同一映射。

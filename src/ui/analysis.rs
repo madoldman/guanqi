@@ -211,6 +211,37 @@ pub enum Severity {
     Blunder,
 }
 
+/// 候选类显示的门控模式（第 5 项）：**只影响界面何时显示「候选类」内容**
+/// （候选点圆圈 / PV 幽灵子 / 侧栏候选列表 / 候选点领地层），不影响任何
+/// 数据接收与走子决策——流式报告照常落 `snapshot`，胜率 / 目差数字照常
+/// 实时刷新，引擎应手只认 `play_snapshot`（走子口径），与门控完全正交。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CandidateGating {
+    /// 立即显示（默认，与流式分析实时性一致）。
+    #[default]
+    Immediate,
+    /// 延迟 N 秒：引擎对当前局面开始思考满 N 秒后才显示候选类内容。
+    /// 治「第一条流式中间报告（40–300 visits 浅层）画满候选点误导用户」：
+    /// 满 N 秒时搜索已推进到可参考的深度。计时基准 = 当前查询的发起时刻
+    /// （`inflight.started`），终态报告一律立即显示（分析已结束无浅层问题）。
+    Delayed { secs: u32 },
+    /// 手动：按快捷键（F）才显示；局面一变（游标 / 分支 / 落子）即重新
+    /// 要求确认。「已确认」状态由 App 持有（键盘输入在 UI 层），本层只
+    /// 提供判定函数。
+    Manual,
+}
+
+impl CandidateGating {
+    /// 界面显示名（侧栏选择器用）。
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Immediate => "立即",
+            Self::Delayed { .. } => "延迟",
+            Self::Manual => "手动",
+        }
+    }
+}
+
 impl Severity {
     /// 由目差损失定档。
     fn from_score_loss(loss: f64) -> Self {
@@ -969,6 +1000,9 @@ pub struct AnalysisState {
     batch_config: BatchConfig,
     /// 批量刚结束时的用户提示（完成 / 取消），侧栏读取后由 App 清除。
     batch_notice: Option<String>,
+    /// 候选类显示的门控模式（第 5 项）。只影响绘制路径的取数判定，
+    /// 不影响任何数据接收与走子决策（见 [`CandidateGating`] 文档）。
+    gating: CandidateGating,
 }
 
 impl AnalysisState {
@@ -996,7 +1030,66 @@ impl AnalysisState {
             batch: None,
             batch_config: BatchConfig::default(),
             batch_notice: None,
+            gating: CandidateGating::Immediate,
         }
+    }
+
+    // ---- 候选类显示门控（第 5 项）----
+
+    /// 当前门控模式（侧栏显示用）。
+    pub fn gating(&self) -> CandidateGating {
+        self.gating
+    }
+
+    /// 设置门控模式（侧栏切换后由 App 转存）。只改显示判定，不重发查询、
+    /// 不作废快照——数据流完全不变。
+    pub fn set_gating(&mut self, gating: CandidateGating) {
+        self.gating = gating;
+    }
+
+    /// 此刻是否允许显示**候选类**内容（候选点圆圈 / PV 幽灵子 / 侧栏候选
+    /// 列表 / 候选点领地层）。
+    ///
+    /// 判定口径：
+    /// - **立即**：恒真（现状行为）；
+    /// - **延迟 N 秒**：当前查询发起已满 N 秒，或最新展示快照已是**终态**
+    ///   （终态一律立即显示——分析已结束，不存在「浅层误导」问题；查询
+    ///   结束后快照仍在，`is_final` 恒可读）。快照为非终态而当前又**没有**
+    ///   在飞查询（例如查询刚被开关变更作废的那一帧、或引擎已退出）时按
+    ///   「未满」处理、继续隐藏：宁可少显示一帧，也不显示可能过期的浅层结果；
+    /// - **手动**：只看 App 传入的「用户已按 F」标志；按过键之后局面一变
+    ///   由 App 负责清掉该标志（重新要求确认），本层不记忆。
+    ///
+    /// **绝不影响走子决策**：`play_snapshot` / `engine_move_decision` 的
+    /// 取数路径不经过本函数；本函数只在绘制与侧栏渲染前被调用。
+    pub fn candidates_visible(&self, manual_revealed: bool) -> bool {
+        match self.gating {
+            CandidateGating::Immediate => true,
+            CandidateGating::Manual => manual_revealed,
+            CandidateGating::Delayed { secs } => {
+                if self
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.is_final)
+                {
+                    return true;
+                }
+                self.inflight
+                    .as_ref()
+                    .is_some_and(|inflight| inflight.started.elapsed().as_secs_f32() >= secs as f32)
+            }
+        }
+    }
+
+    /// 手动模式下「是否正在等待按键确认」（不刺眼的状态提示用）：
+    /// 门控为手动、当前有候选数据可显示、但用户尚未按键。
+    pub fn awaiting_manual_reveal(&self, manual_revealed: bool) -> bool {
+        self.gating == CandidateGating::Manual
+            && self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.moves.is_empty())
+            && !manual_revealed
     }
 
     // ---- 选点限制（限定区域 / 排除选点）----

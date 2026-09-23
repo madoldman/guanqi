@@ -1,10 +1,12 @@
-//! 界面组件：CJK 字体加载、棋盘视图、分析侧栏、曲线、新对局与设置面板。
+//! 界面组件：CJK 字体加载、棋盘视图、分析侧栏、曲线、小棋盘回放、
+//! 新对局与设置面板。
 
 pub mod analysis;
 pub mod analysis_panel;
 pub mod board_view;
 pub mod curve;
 pub mod explain;
+pub mod mini_board;
 pub mod new_game;
 pub mod overlay;
 pub mod settings;

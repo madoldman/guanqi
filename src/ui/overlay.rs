@@ -87,6 +87,13 @@ pub struct Overlay {
     pub show_moves_heat: bool,
     /// 失误标注层开关（疑问手及以上才画，关闭时零绘制开销）。
     pub show_mistakes: bool,
+    /// 胜率曲线面板里叠加**目差折线**（右侧对称目差刻度）。默认开：
+    /// 复盘看形势主要看目差，且目差线为虚线暖色、与胜率实线冷色并存
+    /// 不互相干扰。
+    pub show_score_lead: bool,
+    /// 小棋盘 PV 回放面板开关（底部面板区，与曲线面板并列）。默认关：
+    /// 回放盘是「按节奏细看某条 PV」的低频需求，不默认挤占主棋盘空间。
+    pub show_mini_board: bool,
     /// 侧栏点击定位；局面变化（快照作废）时由 App 清除。
     pub focus: Option<Focus>,
 }
