@@ -167,11 +167,19 @@ fn body(ui: &mut Ui, state: &mut SettingsUi, cfg: &mut EngineConfig, action: &mu
             ui.end_row();
 
             ui.label("思考量");
-            ui.add(
-                egui::DragValue::new(&mut state.draft.visits)
-                    .range(1..=1_000_000)
-                    .suffix(" visits"),
-            );
+            ui.vertical(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut state.draft.visits)
+                        .range(1..=1_000_000)
+                        .suffix(" visits"),
+                )
+                .on_hover_text(
+                    "visits = 引擎搜索时对每个候选点的模拟访问次数，总和即思考量。\
+                     越大越强、越慢：本机实测（b18 权重 + OpenCL）约 60 visits/秒，\
+                     300 visits ≈ 5–6 秒，2000 visits ≈ 半分钟。",
+                );
+                ui.weak("访问次数，越大越强越慢（悬停看量级）");
+            });
             ui.end_row();
 
             // 搜索线程数：写入 analysis.cfg 的 numSearchThreads。此前无
@@ -204,7 +212,7 @@ fn body(ui: &mut Ui, state: &mut SettingsUi, cfg: &mut EngineConfig, action: &mu
                 .draft
                 .rules
                 .map_or(auto, |r| r.name());
-            egui::ComboBox::from_id_salt("analysis_rules")
+            let rules_combo = egui::ComboBox::from_id_salt("analysis_rules")
                 .selected_text(selected)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut state.draft.rules, None, auto);
@@ -212,6 +220,14 @@ fn body(ui: &mut Ui, state: &mut SettingsUi, cfg: &mut EngineConfig, action: &mu
                         ui.selectable_value(&mut state.draft.rules, Some(rule), rule.name());
                     }
                 });
+            // 悬停说明挂在返回的按钮响应上：解释规则口径为何影响胜率数字。
+            rules_combo
+                .response
+                .on_hover_text(
+                    "分析引擎按哪套规则计算胜率与目差（数子 / 数目口径不同，\
+                     同一局面差可达约 1 目）。「自动」按载入棋谱的 RU[] 属性\
+                     宽容映射；谱上未写则按中国规则。",
+                );
             ui.end_row();
         });
 

@@ -293,24 +293,26 @@ fn side_index(stone: Stone) -> usize {
 }
 
 /// 时钟的用户可读文本（侧栏对弈卡片）：包干显示剩余主时间；读秒制
-/// 显示主时间 + 读秒次数，进入读秒期显示当前读秒剩余与剩余次数；
-/// 无限制显示累计用时。
+/// 显示主时间 + 读秒配置，进入读秒期显示当前读秒剩余与剩余次数；
+/// 无限制显示累计用时。一律 mm:ss（超过 1 小时进位为 H:MM:SS），
+/// 计量词用中文（「读秒 30 秒 × 2」而非「30s × 2 次」）。剩余不多的
+/// 醒目配色由调用方（`clock_rows`）按制式判定，与本函数无关。
 pub fn clock_text(system: TimeSystem, clock: &SideClock, total_used: f64) -> String {
     match system {
-        TimeSystem::Unlimited => format!("累计 {} 秒", total_used as u64),
-        TimeSystem::Absolute { .. } => format_mmss(clock.main.max(0.0)),
-        TimeSystem::Byoyomi { .. } => {
+        TimeSystem::Unlimited => format!("累计 {}", format_hms(total_used.max(0.0))),
+        TimeSystem::Absolute { .. } => format_hms(clock.main.max(0.0)),
+        TimeSystem::Byoyomi { period_seconds, .. } => {
             if clock.in_byoyomi() {
                 format!(
-                    "读秒 {} × {} 次",
-                    format_secs_int(clock.period.max(0.0)),
+                    "读秒 {} · 剩 {} 次",
+                    format_mmss(clock.period.max(0.0)),
                     clock.periods_left
                 )
             } else {
                 format!(
-                    "{} + 读秒 {}×{}",
-                    format_mmss(clock.main.max(0.0)),
-                    format_secs_int(system.period_seconds().unwrap_or(0.0)),
+                    "{} · 读秒 {} 秒 × {}",
+                    format_hms(clock.main.max(0.0)),
+                    period_seconds.ceil() as u64,
                     clock.periods_left
                 )
             }
@@ -318,15 +320,23 @@ pub fn clock_text(system: TimeSystem, clock: &SideClock, total_used: f64) -> Str
     }
 }
 
-/// mm:ss（时钟显示）。
+/// 时长 → `H:MM:SS`（不足 1 小时为 `MM:SS`）。时钟显示与累计用时共用：
+/// 墙钟式读数比秒数直观，且长对局（无限制累计 > 1 小时）不能挤成
+/// `75:00` 这种与 `MM:SS` 歧义的形态。
+fn format_hms(secs: f64) -> String {
+    let total = secs.ceil() as u64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
+/// mm:ss（读秒期内当前读秒剩余，恒 < 1 分钟量级）。
 fn format_mmss(secs: f64) -> String {
     let total = secs.ceil() as u64;
     format!("{:02}:{:02}", total / 60, total % 60)
-}
-
-/// 整秒（读秒与次数显示）。
-fn format_secs_int(secs: f64) -> String {
-    format!("{}s", secs.ceil() as u64)
 }
 
 /// 读秒期扣减（模块级自由函数：与 [`Clock::tick`] 共享逻辑，避免

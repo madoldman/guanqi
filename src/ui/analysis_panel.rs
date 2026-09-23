@@ -121,6 +121,9 @@ pub enum PanelAction {
     /// 作废快照并重发查询（视角是查询级 overrideSettings 字段）；历史
     /// 数据两用，不清空。
     SetDisplayView(crate::ui::analysis::DisplayView),
+    /// 终局提示的「另存为…」按钮：发起另存对话框（App 转接既有
+    /// `save_file_dialog`，与菜单 / Ctrl+Shift+S 完全同一动作）。
+    SaveGame,
 }
 
 /// 从当前门控模式提取延迟秒数（分段选择器构造「延迟」段时沿用当前值，
@@ -158,6 +161,51 @@ impl LoadNotice {
             Self::Warn(_) => theme::colors::WARN,
             Self::Failed(_) => theme::colors::ERROR,
         }
+    }
+}
+
+/// 事件型提示的排队上限：新消息进队、超出上限挤出最旧。取 3 的理由：
+/// 消息卡放在侧栏顶部，条目太多会把下面的卡片挤出首屏；3 条已覆盖
+/// 「连续触发两条提示都还能看到」（另存成功不再被后一条顶掉）与常见
+/// 连击操作（载入失败 → 重试 → 再失败），再多只会刷屏。
+pub const MAX_NOTICES: usize = 3;
+
+/// 事件型提示队列（App 持有，「消息」卡片渲染）：按时间排队，新消息
+/// **不顶掉**旧消息，只受 [`MAX_NOTICES`] 上限约束。与常驻类提示
+/// （非法落子 / 启动提示 / 引擎警告 / 瞬时错误）分开：后者是「当前
+/// 状态」而非「发生过的事」，单槽覆盖语义本来就是对的。
+#[derive(Default)]
+pub struct NoticeFeed {
+    items: std::collections::VecDeque<LoadNotice>,
+}
+
+impl NoticeFeed {
+    /// 空队列。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 入队一条提示。与队尾文本相同则忽略（菜单连点 / 每帧重发的同文
+    /// 提示只计一次，防止重复刷屏把其它消息挤出上限）；超出 [`MAX_NOTICES`]
+    /// 时挤出最旧一条。
+    pub fn push(&mut self, notice: LoadNotice) {
+        if self.items.back().is_some_and(|last| last.text() == notice.text()) {
+            return;
+        }
+        if self.items.len() >= MAX_NOTICES {
+            self.items.pop_front();
+        }
+        self.items.push_back(notice);
+    }
+
+    /// 是否没有任何提示。
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// 按入队先后遍历（消息卡按此顺序渲染：最旧在上）。
+    pub fn iter(&self) -> impl Iterator<Item = &LoadNotice> {
+        self.items.iter()
     }
 }
 
@@ -247,11 +295,13 @@ fn wide_button(ui: &mut Ui, text: &str) -> egui::Response {
 }
 
 /// 信息行：弱色前缀 + 正文值（引擎状态 / 棋谱属性这类「标签：值」行）。
-fn info_line(ui: &mut Ui, label: &str, value: &str) {
+/// 返回整行响应，调用方可再挂 `on_hover_text`（概念解释等）。
+fn info_line(ui: &mut Ui, label: &str, value: &str) -> egui::Response {
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(label).weak());
         ui.label(RichText::new(value).size(12.5));
-    });
+    })
+    .response
 }
 
 /// 主变（PV）文本：`D4 → Q16 → …`，截断到 [`PV_LIMIT`] 手。
@@ -302,6 +352,7 @@ pub fn show(
     comment: Option<&str>,
     load_notice: Option<&LoadNotice>,
     save_notice: Option<&LoadNotice>,
+    event_notices: &NoticeFeed,
     persist_notice: Option<&str>,
     play: &mut PlayState,
     new_game_open: &mut bool,
@@ -326,6 +377,7 @@ pub fn show(
                 comment,
                 load_notice,
                 save_notice,
+                event_notices,
                 persist_notice,
                 play,
                 new_game_open,
@@ -354,6 +406,7 @@ fn panel_body(
     comment: Option<&str>,
     load_notice: Option<&LoadNotice>,
     save_notice: Option<&LoadNotice>,
+    event_notices: &NoticeFeed,
     persist_notice: Option<&str>,
     play: &mut PlayState,
     new_game_open: &mut bool,
@@ -361,6 +414,21 @@ fn panel_body(
     docs: &[DocEntry],
 ) -> PanelAction {
     let mut action = PanelAction::None;
+
+    // ---- 消息（侧栏首位的用户提示：另存成功等反馈一眼可见；非法落子 /
+    // 启动 / 引擎警告等常驻提示与事件型排队提示同卡显示）----
+    card_messages(
+        ui,
+        notice,
+        startup_notice,
+        load_notice,
+        save_notice,
+        event_notices,
+        persist_notice,
+        &analysis.transient_error,
+        analysis.engine_warnings(),
+        &mut action,
+    );
 
     // ---- 对局（人机开关 / 难度 / 对局操作）----
     action = card_play(
@@ -413,19 +481,6 @@ fn panel_body(
     if overlay_toggles.moves_heat_toggled {
         action = PanelAction::SetWantMovesHeat(overlay.show_moves_heat);
     }
-
-    // ---- 消息（非法落子 / 载入另存 / 引擎错误 / 引擎字段警告等；无则不占位）----
-    card_messages(
-        ui,
-        notice,
-        startup_notice,
-        load_notice,
-        save_notice,
-        persist_notice,
-        &analysis.transient_error,
-        analysis.engine_warnings(),
-        &mut action,
-    );
 
     action
 }
@@ -573,6 +628,13 @@ fn card_play(
                     "对局结束：双方连续弃着".to_owned()
                 };
                 ui.colored_label(theme::colors::WARN, reason);
+                // 终局出口：结果已写回元信息，此刻存谱正是时候——指明
+                // 快捷键，并给一个直接的动作按钮（复用既有另存对话框），
+                // 不让用户去猜「下一步该干嘛」。
+                ui.weak("棋谱可用 Ctrl+Shift+S 另存。");
+                if wide_button(ui, "另存为…").clicked() {
+                    action = PanelAction::SaveGame;
+                }
                 // 结束后进入纯复盘浏览：对弈开关保持，但不再自动应手
                 // （决策函数的 two_passes / resigned 守卫兜底）。
             } else if engine_thinking {
@@ -669,7 +731,9 @@ fn card_engine(
         }
         info_line(ui, "权重", &model_name(cfg));
         info_line(ui, "后端", cfg.backend.name());
-        info_line(ui, "思考量", &format!("{} visits", cfg.visits.max(1)));
+        info_line(ui, "思考量", &format!("{} visits", cfg.visits.max(1))).on_hover_text(
+            "visits = 引擎搜索时对每个候选点的模拟访问次数，总和即思考量。             越大越强、越慢：本机实测（b18 权重 + OpenCL）约 60 visits/秒，             300 visits ≈ 5–6 秒，2000 visits ≈ 半分钟。",
+        );
         // 当前生效的规则：用户必须知道数字按哪套规则算（数子 / 数目差
         // 可达约 1 目）。显式指定显示规则名；自动则注明跟随棋谱。
         let rules_line = match cfg.rules.as_deref().and_then(crate::engine::Rules::from_wire) {
@@ -682,7 +746,9 @@ fn card_engine(
                 None => "自动（棋谱未写规则，按中国）".to_owned(),
             },
         };
-        info_line(ui, "规则", &rules_line);
+        info_line(ui, "规则", &rules_line).on_hover_text(
+            "引擎按哪套规则计算胜率与目差（数子 / 数目口径不同，同一局面差             可达约 1 目）。显式指定时按设置；「自动」按棋谱 RU[] 宽容映射，             谱上未写按中国。",
+        );
         if let Some(snapshot) = &analysis.snapshot {
             info_line(
                 ui,
@@ -769,6 +835,30 @@ fn card_game(
         }
         if let Some(event) = &info.event {
             info_line(ui, "赛事", event);
+        }
+        // 以下三项（轮次 RO / 地点 PC / 对局名 GN）与队名（BT/WT）、时限
+        // （TM/OT）此前「解析 + 另存保留但不显示」；统一在此如实列出，
+        // 没有的项不渲染（不留空行 / 占位）。
+        if let Some(round) = &info.round {
+            info_line(ui, "轮次", round);
+        }
+        if let Some(place) = &info.place {
+            info_line(ui, "地点", place);
+        }
+        if let Some(name) = &info.game_name {
+            info_line(ui, "对局名", name);
+        }
+        if let Some(team) = &info.team_black {
+            info_line(ui, "黑方队伍", team);
+        }
+        if let Some(team) = &info.team_white {
+            info_line(ui, "白方队伍", team);
+        }
+        if let Some(limit) = &info.time_limit {
+            info_line(ui, "时限", limit);
+        }
+        if let Some(overtime) = &info.overtime {
+            info_line(ui, "加时", overtime);
         }
         if let Some(rules) = &info.rules {
             info_line(ui, "规则", rules);
@@ -966,7 +1056,10 @@ fn card_limits(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &mu
             .checkbox(&mut region_on, "限定区域（在棋盘上拖框）")
             .changed()
         {
-            *action = PanelAction::SetRegion(region_on.then_some(()).and(None));
+            // 勾选 = 请求开启（Some(())），取消 = 请求关闭（None）。
+            // 原写法 `region_on.then_some(()).and(None)` 恒等于 None，
+            // 导致开关勾选后下一帧回弹、区域框选模式永远进不去。
+            *action = PanelAction::SetRegion(region_on.then_some(()));
         }
         ui.weak("拖框选定区域后，引擎只考虑区域内的空点。");
         if let Some(region) = limits.region {
@@ -980,7 +1073,15 @@ fn card_limits(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &mu
             ));
         }
         ui.separator();
-        ui.weak("排除选点：棋盘右键空点，或候选点行「排除」按钮。");
+        if limits.has_region() {
+            ui.colored_label(
+                theme::colors::WARN,
+                "区域模式下排除停用：引擎只允许区域或排除二者其一。\
+                 如需排除选点，请先关闭「限定区域」。",
+            );
+        } else {
+            ui.weak("排除选点：棋盘右键空点，或候选点行「排除」按钮。");
+        }
         if limits.avoid.is_empty() {
             ui.weak("（无）");
         } else {
@@ -1000,6 +1101,9 @@ fn card_limits(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &mu
             }
         }
         if limits.has_region() && !limits.avoid.is_empty() {
+            // 开区域**之前**已收进的存量排除项仍保留在列表里（关区域后
+            // 恢复生效），但必须提示它们此刻不起作用——新排除入口已停用，
+            // 这行只服务存量项。
             ui.colored_label(theme::colors::WARN, "区域模式下排除列表暂不生效。");
         }
         ui.add_space(2.0);
@@ -1130,14 +1234,14 @@ fn card_candidates(
                 // 幽灵子推导所需的行棋方（主变序列交替推演的起点）。
                 let to_play = snapshot.root.as_ref().map(|root| root.current_player);
                 for info in snapshot.moves.iter().take(MOVE_LIMIT) {
-                    candidate_row(ui, info, overlay, snapshot.size, to_play, action);
+                    candidate_row(ui, analysis, info, overlay, snapshot.size, to_play, action);
                 }
             }
             Some(_) => {
                 ui.weak("引擎未返回候选点。");
             }
             None => {
-                ui.weak("—");
+                ui.weak("还没有分析数据——引擎就绪并分析当前局面后，候选点会显示在这里。");
             }
         }
     });
@@ -1151,6 +1255,7 @@ fn card_candidates(
 #[allow(clippy::too_many_arguments)]
 fn candidate_row(
     ui: &mut Ui,
+    analysis: &AnalysisState,
     info: &crate::engine::MoveInfo,
     overlay: &Overlay,
     size: crate::board::Size,
@@ -1240,14 +1345,20 @@ fn candidate_row(
     }
 
     // 行尾「排除」「前进」按钮：独立交互区（排除另可右键棋盘空点）。
+    // 区域模式下排除入口停用（引擎 allowMoves/avoidMoves 实测互斥，收进
+    // 列表也只会静默失效）：按钮置灰、悬停说明原因，不再派发动作。
     if let Some(at) = info.mv
         && let Some(player) = to_play
     {
         // 两个小钮并排（排除 / 沿主变前进），等宽对齐。
         let btn_w = (tail - 8.0) / 2.0;
-        let (brect, btn) = ui.allocate_exact_size(Vec2::new(btn_w, height - 4.0), Sense::click());
+        let region_on = analysis.limits().has_region();
+        let (brect, btn) = ui.allocate_exact_size(
+            Vec2::new(btn_w, height - 4.0),
+            if region_on { Sense::hover() } else { Sense::click() },
+        );
         let painter = ui.painter_at(brect);
-        let hover = btn.hovered() || btn.is_pointer_button_down_on();
+        let hover = !region_on && (btn.hovered() || btn.is_pointer_button_down_on());
         painter.rect_filled(
             brect,
             4.0,
@@ -1262,14 +1373,23 @@ fn candidate_row(
             Align2::CENTER_CENTER,
             "排除",
             FontId::proportional(10.5),
-            if hover {
+            if region_on {
+                Color32::from_rgb(120, 124, 132)
+            } else if hover {
                 Color32::from_rgb(255, 150, 140)
             } else {
                 Color32::from_rgb(196, 168, 168)
             },
         );
-        let btn = btn.on_hover_text(format!("把 {} 加入排除（avoidMoves）", at.to_gtp(size)));
-        if btn.clicked() {
+        let btn = if region_on {
+            btn.on_disabled_hover_text(
+                "限定区域模式下排除不生效（引擎只允许区域或排除二者其一）；\
+                 如需排除选点，请先关闭「限定区域」",
+            )
+        } else {
+            btn.on_hover_text(format!("把 {} 加入排除（avoidMoves）", at.to_gtp(size)))
+        };
+        if !region_on && btn.clicked() {
             *action = PanelAction::ToggleAvoid { player, at };
         }
 
@@ -1327,7 +1447,14 @@ fn card_mistakes(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
         theme::section_title(ui, "失误");
         let summary = analysis.loss_summary(board);
         if summary.total == 0 {
-            ui.weak("—");
+            ui.weak("还没有棋谱——载入棋谱或开始新对局后，这里汇总各严重程度的失误。");
+        } else if summary.analyzed == 0 {
+            // 有谱但还没算出任何损失（历史点两端不齐）：与「整盘无失误」
+            // 严格区分，指引下一步动作而不是留一个空行。
+            ui.weak(format!(
+                "共 {total} 手，还没有可分析的手——浏览或整谱快扫后逐步积累。",
+                total = summary.total
+            ));
         } else {
             // 「已分析 / 总手数」必须显式给出：数据随浏览逐步积累，
             // 不写清楚会被误认为整盘都算过了。
@@ -1376,16 +1503,31 @@ fn card_summary(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &m
             match_white,
             enough_black,
             enough_white,
+            deep_black,
+            deep_white,
             worst,
         } = summary;
         if total == 0 {
-            ui.weak("—");
+            ui.weak("还没有棋谱——载入棋谱或开始新对局后，这里给出黑白吻合度与差异手排行。");
             return;
         }
         // 吻合度行：黑 / 白并列；样本不足（已分析 < 10 手）不给数字，
         // 显示「样本不足」（LizzieYzy 同门槛，避免少数手的均值冒充整盘）。
+        // 数字下方正文给出**构成**（深度 / 快扫各多少手）——混深度下光看
+        // 百分比分不清是纯快扫、纯交互还是混合（判定线见
+        // [`crate::ui::analysis::DEEP_VISITS_THRESHOLD`]）。
         let black_cell = match_cell(match_black, analyzed_black, enough_black);
         let white_cell = match_cell(match_white, analyzed_white, enough_white);
+        let composition = |deep: usize, analyzed: usize| -> String {
+            let quick = analyzed - deep;
+            if deep == 0 {
+                "（快扫）".to_owned()
+            } else if quick == 0 {
+                "（深度分析）".to_owned()
+            } else {
+                format!("（快扫 {quick} 手 / 深度分析 {deep} 手）")
+            }
+        };
         ui.horizontal(|ui| {
             let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
             let tip = match_tip();
@@ -1393,6 +1535,9 @@ fn card_summary(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &m
                 ui.vertical(|ui| {
                     ui.label(RichText::new("黑吻合度").weak());
                     ui.label(RichText::new(black_cell).strong());
+                    if analyzed_black > 0 {
+                        ui.label(RichText::new(composition(deep_black, analyzed_black)).weak());
+                    }
                 });
             })
             .response
@@ -1401,6 +1546,9 @@ fn card_summary(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &m
                 ui.vertical(|ui| {
                     ui.label(RichText::new("白吻合度").weak());
                     ui.label(RichText::new(white_cell).strong());
+                    if analyzed_white > 0 {
+                        ui.label(RichText::new(composition(deep_white, analyzed_white)).weak());
+                    }
                 });
             })
             .response
@@ -1428,10 +1576,11 @@ fn card_summary(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &m
                 worst_row(ui, *entry, action);
             }
         }
-        ui.weak(
-            "吻合度 ∝ 分析深度：快扫（40 visits）候选表短，数值偏低；\
-             不同深度的数字不可互比。",
-        );
+        ui.weak(format!(
+            "吻合度 ∝ 分析深度：构成按该手搜索量 ≥{} visits 计深度分析，\
+             否则快扫；不同深度的数字不可互比。",
+            crate::ui::analysis::DEEP_VISITS_THRESHOLD,
+        ));
     });
 }
 
@@ -1891,6 +2040,15 @@ fn format_estimate_secs(secs: f64) -> String {
 /// 「消息」卡片：各类用户可见提示（非法落子 / 载入另存 / 引擎错误 /
 /// 引擎字段警告等）。无任何提示时不渲染（原「无提示。」占位行去除，
 /// 语义不变）。
+///
+/// 提示分两类、两个生命周期（见 [`NoticeFeed`] 文档）：
+/// - **状态型**（单槽覆盖，显示"当前状态"）：非法落子、启动提示、引擎
+///   字段警告、瞬时错误、持久化失败——新状态覆盖旧状态本来就是对的；
+/// - **事件型**（`event_notices` 队列，显示"发生过的事"）：载入 / 另存 /
+///   快扫 / 规则解析 / 副本操作等一次性反馈，按时间排队、最多保留
+///   [`MAX_NOTICES`] 条，新消息不顶掉旧消息——此前「另存成功」常被
+///   后到的提示顶掉，用户根本来不及看到。
+///
 /// 引擎字段警告（WARN 色，引擎重启时清除、按字段名去重——去重在
 /// [`AnalysisState`] 侧完成）单独列出：它是「配置可能拼错了」的提醒，
 /// 与瞬时错误（红）语义不同，不能混排，也不能只落无人可见的日志。
@@ -1904,6 +2062,7 @@ fn card_messages(
     startup_notice: Option<&str>,
     load_notice: Option<&LoadNotice>,
     save_notice: Option<&LoadNotice>,
+    event_notices: &NoticeFeed,
     persist_notice: Option<&str>,
     transient_error: &Option<String>,
     engine_warnings: &[super::analysis::EngineWarning],
@@ -1915,7 +2074,8 @@ fn card_messages(
         || save_notice.is_some()
         || persist_notice.is_some()
         || transient_error.is_some()
-        || !engine_warnings.is_empty();
+        || !engine_warnings.is_empty()
+        || !event_notices.is_empty();
     if !has_any {
         return;
     }
@@ -1939,10 +2099,9 @@ fn card_messages(
                 *action = PanelAction::RetryQuery;
             }
         }
-        if let Some(msg) = load_notice {
-            ui.colored_label(msg.color(), msg.text());
-        }
-        if let Some(msg) = save_notice {
+        // 事件型提示按入队先后逐条渲染（最旧在上；与状态型提示并存时
+        // 排在其后，状态型说明"现在怎样"，事件型说明"发生过什么"）。
+        for msg in event_notices.iter() {
             ui.colored_label(msg.color(), msg.text());
         }
         if let Some(text) = persist_notice {

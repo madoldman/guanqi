@@ -100,10 +100,11 @@ pub struct GuanqiApp {
     dialog: Option<(FileDialog, PendingDialog)>,
     /// 已载入棋谱的元信息（`None` = 本次运行尚未打开过棋谱）。
     loaded: Option<GameMeta>,
-    /// 最近一次「打开棋谱」的用户可见提示（成功 / 部分载入 / 失败）。
-    load_notice: Option<LoadNotice>,
-    /// 最近一次「另存为」的用户可见提示（成功 / 失败）。
-    save_notice: Option<LoadNotice>,
+    /// 事件型用户提示队列（载入 / 另存 / 快扫 / 规则解析 / 副本操作等
+    /// 一次性反馈）：按时间排队、保留最近 [`analysis_panel::MAX_NOTICES`]
+    /// 条，新消息不顶掉旧消息（此前单槽设计会让「另存成功」被后到的
+    /// 提示顶掉）。渲染在侧栏「消息」卡。
+    notices: analysis_panel::NoticeFeed,
     /// 人机对弈状态：模式开关、人类执子、认输与无望提示（复盘初始态）。
     play: PlayState,
     /// 人类计时推进的上一帧时刻：每帧 `logic` 用真实墙钟差推进当前
@@ -313,8 +314,7 @@ impl GuanqiApp {
             portal_unavailable,
             dialog: None,
             loaded: None,
-            load_notice: None,
-            save_notice: None,
+            notices: analysis_panel::NoticeFeed::new(),
             play: PlayState::review(),
             last_frame: None,
             active_rules: None,
@@ -413,7 +413,7 @@ impl GuanqiApp {
             return;
         }
         if let Some(notice) = self.dialog_guard() {
-            self.load_notice = Some(notice);
+            self.notices.push(notice);
             return;
         }
         match FileDialog::open_file(
@@ -425,10 +425,10 @@ impl GuanqiApp {
         ) {
             Ok(dialog) => {
                 self.dialog = Some((dialog, PendingDialog::Open));
-                self.load_notice = None;
+                // 队列不清空：先前的事件提示仍保留展示（排队上限挤出）。
             }
             Err(err) => {
-                self.load_notice = Some(LoadNotice::Failed(err.to_string()));
+                self.notices.push(LoadNotice::Failed(err.to_string()));
             }
         }
     }
@@ -446,7 +446,7 @@ impl GuanqiApp {
     ///（[`Self::copy_default_name`]），提示文件尚未真实存盘。
     fn save_file_dialog(&mut self) {
         if let Some(notice) = self.dialog_guard() {
-            self.save_notice = Some(notice);
+            self.notices.push(notice);
             return;
         }
         let default_name = if self.active_from_move.is_some() {
@@ -473,10 +473,10 @@ impl GuanqiApp {
         ) {
             Ok(dialog) => {
                 self.dialog = Some((dialog, PendingDialog::Save));
-                self.save_notice = None;
+                // 队列不清空：先前的事件提示仍保留展示（排队上限挤出）。
             }
             Err(err) => {
-                self.save_notice = Some(LoadNotice::Failed(err.to_string()));
+                self.notices.push(LoadNotice::Failed(err.to_string()));
             }
         }
     }
@@ -502,7 +502,7 @@ impl GuanqiApp {
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(err) => {
-                self.load_notice = Some(LoadNotice::Failed(format!(
+                self.notices.push(LoadNotice::Failed(format!(
                     "读取 {} 失败：{err}",
                     path.display()
                 )));
@@ -511,7 +511,7 @@ impl GuanqiApp {
         };
         match load_from_bytes(&path, &bytes) {
             Err(err) => {
-                self.load_notice = Some(LoadNotice::Failed(format!("打开棋谱失败：{err}")));
+                self.notices.push(LoadNotice::Failed(format!("打开棋谱失败：{err}")));
             }
             Ok(loaded) => {
                 let (warning, partial) = (loaded.warning.clone(), loaded.partial);
@@ -579,7 +579,7 @@ impl GuanqiApp {
                 } else {
                     notice
                 };
-                self.load_notice = Some(notice);
+                self.notices.push(notice);
             }
         }
     }
@@ -596,7 +596,7 @@ impl GuanqiApp {
                 }
                 PortalEvent::Cancelled => {} // 用户取消：静默，界面保持原状
                 PortalEvent::Failed(err) => {
-                    self.load_notice = Some(LoadNotice::Failed(err.to_string()));
+                    self.notices.push(LoadNotice::Failed(err.to_string()));
                 }
             },
             PendingDialog::Save => match event {
@@ -606,7 +606,7 @@ impl GuanqiApp {
                 }
                 PortalEvent::Cancelled => {} // 用户取消：静默，界面保持原状
                 PortalEvent::Failed(err) => {
-                    self.save_notice = Some(LoadNotice::Failed(err.to_string()));
+                    self.notices.push(LoadNotice::Failed(err.to_string()));
                 }
             },
         }
@@ -663,13 +663,13 @@ impl GuanqiApp {
                     .unwrap_or_else(|| {
                         self.loaded = Some(GameMeta::for_path(&path, self.board.size()));
                     });
-                self.save_notice = Some(LoadNotice::Ok(format!(
+                self.notices.push(LoadNotice::Ok(format!(
                     "已另存到 {}（{size}，{branches} 手）。",
                     path.display()
                 )));
             }
             Err(err) => {
-                self.save_notice = Some(LoadNotice::Failed(format!(
+                self.notices.push(LoadNotice::Failed(format!(
                     "保存到 {} 失败：{err}",
                     path.display()
                 )));
@@ -756,7 +756,7 @@ impl GuanqiApp {
         } else {
             size.to_string()
         };
-        self.load_notice = Some(LoadNotice::Ok(format!(
+        self.notices.push(LoadNotice::Ok(format!(
             "新对局已开始：{desc}，你执{}，难度{}（{} visits），时限{}。{}",
             setup.human.name(),
             setup.difficulty.name(),
@@ -812,7 +812,7 @@ impl GuanqiApp {
                     Some(crate::ui::analysis::result_block_text(lead, rules_name.as_deref()));
             }
         }
-        self.load_notice = Some(analysis_panel::LoadNotice::Ok(text));
+        self.notices.push(analysis_panel::LoadNotice::Ok(text));
     }
 
     /// 当前生效规则的中文名（终局判定块的口径标注；取本局锁定规则或
@@ -1020,7 +1020,7 @@ impl GuanqiApp {
             "已创建研究副本 {number}（自第 {from_move} 手起），原谱保持不变；\
              当前在研究副本 {number} 中。"
         ));
-        self.load_notice = Some(notice);
+        self.notices.push(notice);
     }
 
     /// 切换到指定编号的文档：主显示槽位与 `others` 中该项**整体互换**
@@ -1103,7 +1103,7 @@ impl GuanqiApp {
         } else {
             format!("研究副本 {number} 已丢弃。")
         };
-        self.load_notice = Some(LoadNotice::Ok(notice));
+        self.notices.push(LoadNotice::Ok(notice));
     }
 
     /// 指定编号文档的研究成果手数；编号不存在或为原谱时 `None`。
@@ -1333,8 +1333,9 @@ impl eframe::App for GuanqiApp {
                     self.manual_revealed,
                     self.loaded.as_ref(),
                     comment,
-                    self.load_notice.as_ref(),
-                    self.save_notice.as_ref(),
+                    None,
+                    None,
+                    &self.notices,
                     self.persist_notice.as_deref(),
                     &mut self.play,
                     &mut self.new_game_open,
@@ -1463,7 +1464,7 @@ impl eframe::App for GuanqiApp {
                 if let Some(reason) =
                     self.analysis.start_batch(&self.board, self.komi, game_rules)
                 {
-                    self.load_notice = Some(analysis_panel::LoadNotice::Warn(reason));
+                    self.notices.push(analysis_panel::LoadNotice::Warn(reason));
                 }
             }
             // 整谱快扫配置编辑（起止 / visits / 单方 / 含变着 / 加深）：
@@ -1495,6 +1496,9 @@ impl eframe::App for GuanqiApp {
             analysis_panel::PanelAction::SetDisplayView(view) => {
                 self.analysis.set_display_view(view);
             }
+            // 终局提示的「另存为…」：与菜单 / Ctrl+Shift+S 完全同一动作
+            // （同一发起函数，含 portal 不可用 / 等待中守卫）。
+            analysis_panel::PanelAction::SaveGame => self.save_file_dialog(),
         }
 
         // 偏好持久化（子项 1）：面板动作 / 复选框可能改了任何界面开关。
@@ -1797,11 +1801,11 @@ impl eframe::App for GuanqiApp {
         self.refresh_terminal_result();
         // 整谱快扫结束提示（完成 / 取消 / 局面变化自动取消）落位到消息区。
         if let Some(notice) = self.analysis.take_batch_notice() {
-            self.load_notice = Some(analysis_panel::LoadNotice::Ok(notice));
+            self.notices.push(analysis_panel::LoadNotice::Ok(notice));
         }
         // 规则解析提示（未识别的 RU 串已按默认规则分析）落位到消息区。
         if let Some(text) = self.analysis.take_rules_notice() {
-            self.load_notice = Some(analysis_panel::LoadNotice::Warn(text));
+            self.notices.push(analysis_panel::LoadNotice::Warn(text));
         }
         // 局面变化会先作废快照（见 AnalysisState::sync），借此时机清除定位高亮。
         if self.analysis.snapshot.is_none() {

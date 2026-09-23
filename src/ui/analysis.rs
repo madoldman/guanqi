@@ -161,6 +161,14 @@ pub const MATCH_MIN_MOVES: usize = 10;
 /// 最差手排行榜长度：LizzieYzy 取 Top10，侧栏空间小取 Top5。
 pub const WORST_LIMIT: usize = 5;
 
+/// 吻合度「深度分析」的判定线：某手所用候选表对应的局面终态点
+/// `visits >= DEEP_VISITS_THRESHOLD` 时该手按「深度分析」计，否则按
+/// 「快扫」计。取 150 的理由：落在快扫默认 40 与加深/走子常用 300 之间，
+/// 恰好把两档分开；40–100 的点（快扫 / 低难度走子）候选表短、吻合度
+/// 系统性偏低，混进均值里说不清构成。该判定**只用于展示构成说明**，
+/// 不改动吻合度数值本身的任何计算。
+pub const DEEP_VISITS_THRESHOLD: u64 = 150;
+
 /// 局后统计（黑白吻合度 + 最差 N 手，[`AnalysisState::game_summary`]）。
 /// 「未知」与「0」严格区分：`analyzed` 只计有候选表快照的手，
 /// 未分析的手不进吻合度分母；在候选表里的手才有 visits 占比。
@@ -180,6 +188,12 @@ pub struct GameSummary {
     /// 黑白各自已分析手数是否达到样本门槛（[`MATCH_MIN_MOVES`]）。
     pub enough_black: bool,
     pub enough_white: bool,
+    /// 黑方已分析手中来自「深度分析」的手数（判定线见
+    /// [`DEEP_VISITS_THRESHOLD`]；其余即来自快扫）。展示吻合度构成用，
+    /// 黑 + 深度 = analyzed_black，白同理。
+    pub deep_black: usize,
+    /// 白方已分析手中来自「深度分析」的手数。
+    pub deep_white: usize,
     /// 最差 N 手（**按胜率损失降序**，并列按手数升序；LizzieYzy 差异手
     /// `diffWinrate` 口径，见 [`WorstMove`]）。只收走子前后历史点齐全、
     /// 能算出损失的手——未知的不进、不臆造 0。不足 [`WORST_LIMIT`] 条时
@@ -1554,6 +1568,8 @@ impl AnalysisState {
         };
         // 吻合度按方累加；worst 只收「有快照且损失可算」的手再排序截断。
         let mut sum = (0.0f64, 0.0f64);
+        // 深度 / 快扫构成计数（展示口径，见 GameSummary 字段文档）。
+        let mut deep = (0usize, 0usize);
         let mut worst: Vec<WorstMove> = Vec::new();
         // 与 line_points 同款滚动签名：points[i] = 走 i 手前、points[i+1] =
         // 走 i 手后的历史点（None = 缺），损失取相邻两点差（同 loss_summary）。
@@ -1578,14 +1594,23 @@ impl AnalysisState {
                 } else {
                     0.0
                 };
+                // 构成判定：该手候选表同一次写入的历史点 visits 达到
+                // [`DEEP_VISITS_THRESHOLD`] 即按「深度分析」计（历史点与
+                // 候选表同签名同覆盖判定，root.visits 就是这次搜索的量）。
+                let deep_point = points
+                    .get(i + 1)
+                    .and_then(|p| p.as_ref())
+                    .is_some_and(|p| p.visits >= DEEP_VISITS_THRESHOLD);
                 match record.player {
                     Stone::Black => {
                         summary.analyzed_black += 1;
                         sum.0 += ratio;
+                        deep.0 += usize::from(deep_point);
                     }
                     Stone::White => {
                         summary.analyzed_white += 1;
                         sum.1 += ratio;
+                        deep.1 += usize::from(deep_point);
                     }
                 }
                 // 排行榜候选：损失可算才进（任一端历史点缺失 = 未知，不臆造 0）。
@@ -1614,6 +1639,8 @@ impl AnalysisState {
         } else {
             0.0
         };
+        summary.deep_black = deep.0;
+        summary.deep_white = deep.1;
         summary.enough_black = summary.analyzed_black >= MATCH_MIN_MOVES;
         summary.enough_white = summary.analyzed_white >= MATCH_MIN_MOVES;
         // 最差 N 手：胜率损失降序（LizzieYzy diffWinrate 口径），并列按

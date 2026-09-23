@@ -73,6 +73,10 @@ pub enum IllegalReason {
     /// 游标处于历史回看中：只有在最新一手之后才能落子
     /// （变着分支留待阶段 5，见 [`super`] 模块文档）。
     NotAtLatestMove,
+    /// 限定区域模式下尝试排除选点：allowMoves 与 avoidMoves 引擎实测
+    /// 互斥（同时给出会被显式拒绝），排除入口在该模式下整体停用，
+    /// 右键时提示原因（不再静默失效）。
+    RegionBlocksAvoid,
 }
 
 impl std::fmt::Display for IllegalReason {
@@ -83,6 +87,11 @@ impl std::fmt::Display for IllegalReason {
             Self::Ko => write!(f, "打劫：不得立即回提，需先在别处落子"),
             Self::OffBoard => write!(f, "坐标超出棋盘"),
             Self::NotAtLatestMove => write!(f, "正在回看历史，不能在历史局面落子"),
+            Self::RegionBlocksAvoid => write!(
+                f,
+                "限定区域模式下排除不生效（引擎只允许区域或排除二者其一）；\
+                 如需排除选点，请先关闭「限定区域」"
+            ),
         }
     }
 }
