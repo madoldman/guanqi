@@ -57,6 +57,9 @@ pub enum PanelAction {
     HumanPass,
     /// 人类点了「认输」按钮。
     HumanResign,
+    /// 点了「让引擎认输」（无望提示区）：判引擎方认输并结束对局
+    /// （App 复用与人类认输同一条结束路径，认输方 = 引擎一方）。
+    EngineResign,
     /// 从当前手创建研究副本（App 完成实际创建与切换）。
     CreateCopy,
     /// 点击文档列表项：切换到该编号的文档（App 完成整体互换）。
@@ -679,6 +682,9 @@ fn card_play(
         if let Some(text) = hopeless {
             ui.add_space(4.0);
             ui.colored_label(theme::colors::WARN, text);
+            if wide_button(ui, "让引擎认输").clicked() {
+                action = PanelAction::EngineResign;
+            }
             if wide_button(ui, "确认，继续对局").clicked() {
                 action = PanelAction::AckHopeless;
             }

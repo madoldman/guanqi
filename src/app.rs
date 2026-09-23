@@ -145,6 +145,27 @@ pub struct GuanqiApp {
     next_number: usize,
     /// 待确认的破坏性动作（丢弃副本 / 带副本研究载谱 / 带副本研究开新局）。
     pending_confirm: PendingConfirm,
+    /// 当前活动文档「上次保存 / 载入」时的记录修订号（[`Board::record_rev`]）：
+    /// 与活动棋盘的当前值比对即脏判定（见 [`Self::is_dirty`]）。
+    /// 活动文档互换时被**新活动文档的基准**覆盖——每份文档各自判脏，
+    /// 「副本里改过、切回干净的原谱」不会误报。
+    saved_rev: u64,
+    /// 未保存内容的待确认动作（关窗 / 新对局 / 打开棋谱，且当前文档
+    /// 脏时先经确认）。与 [`Self::pending_confirm`]（副本研究确认）
+    /// 分开：二者文案与出口不同，且「打开棋谱」可能先经副本确认、
+    /// 再经脏确认，串联而非合并成一种窗口。
+    unsaved_confirm: Option<UnsavedConfirm>,
+    /// 「先另存再继续」的回调点）：
+    /// [`Self::save_game`] 成功分支检查并消费。
+    post_save: PostSaveAction,
+    /// 已确认退出（脏确认通过或另存后续完成）：下一帧 `ui` 顶部发
+    /// [`egui::ViewportCommand::Close`]。确认流程在 UI 帧内进行，而
+    /// viewport 命令只能在持有 `Ui`/`Context` 时发出——用标志把「确认」
+    /// 与「发命令」解耦到相邻两帧。
+    exit_requested: bool,
+    /// 最近发出的 viewport 命令（e2e 驱动 dump 用；应用路径上只追加，
+    /// 由驱动在 dump 后清空）。
+    last_viewport_commands: std::cell::RefCell<Vec<egui::ViewportCommand>>,
     /// 偏好（界面开关 / 窗口几何）脏标记 + 防抖截止时刻：改动后停稳
     /// [`PREFS_SAVE_DEBOUNCE`] 才落盘，退出时无条件补写（子项 1/2 共用）。
     prefs_dirty_since: Option<Instant>,
@@ -212,6 +233,62 @@ impl PendingConfirm {
         };
         format!("{base}，{copies} 份研究副本将被丢弃，其中 {moves} 手研究成果无法恢复。继续吗？")
     }
+}
+
+/// 未保存内容的待确认动作：当前文档的棋谱记录已改而未另存时，
+/// 「关窗 / 新对局 / 打开棋谱」先经此确认。确认后执行对应原动作。
+/// `PartialEq`（无 `Eq`：`GameSetup` 含 f64 贴目）仅复制性需要。
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum UnsavedConfirm {
+    /// 确认后退出应用（再发一次 `ViewportCommand::Close`）。
+    Exit,
+    /// 确认后开始新对局。
+    NewGame(crate::play::GameSetup),
+    /// 确认后发起「打开棋谱」对话框（路径由用户此后选择，同
+    /// [`PendingConfirm::LoadGame`] 的理由，这里不携带路径）。
+    OpenDialog,
+}
+
+impl UnsavedConfirm {
+    /// 确认框说明文本（三个入口共用同一套语义：当前文档将被替换 /
+    /// 应用将退出）。
+    fn text(self) -> String {
+        match self {
+            Self::Exit => "当前棋谱有未保存的改动，关闭窗口将丢失这些改动。".to_owned(),
+            Self::NewGame(_) => {
+                "开始新对局会替换当前棋谱，未保存的改动将丢失。".to_owned()
+            }
+            Self::OpenDialog => {
+                "打开棋谱会替换当前棋谱，未保存的改动将丢失。".to_owned()
+            }
+        }
+    }
+}
+
+/// 「先另存再继续」的回调动作：另存成功后自动继续的原操作。
+/// 另存失败 / 用户取消另存对话框则丢弃（用户退回编辑态，可重试）。
+/// `PartialEq`（无 `Eq`：`GameSetup` 含 f64 贴目）只用于「是否为
+/// [`PostSaveAction::None`]」的判定。
+#[derive(Default, PartialEq, Debug)]
+enum PostSaveAction {
+    #[default]
+    None,
+    /// 继续开始新对局。
+    NewGame(crate::play::GameSetup),
+    /// 继续发起「打开棋谱」对话框。
+    OpenDialog,
+    /// 继续退出应用。
+    Exit,
+}
+
+/// 未保存确认条的三个出口（绘制期收集，块外执行）。
+enum UnsavedVerdict {
+    /// 先另存再继续：发起另存对话框，成功后自动继续原操作。
+    SaveThenContinue,
+    /// 不保存继续：直接执行原操作（改动丢失）。
+    Discard,
+    /// 取消：回到编辑态。
+    Cancel,
 }
 
 impl GuanqiApp {
@@ -328,6 +405,11 @@ impl GuanqiApp {
             active_number: 0,
             next_number: 1,
             pending_confirm: PendingConfirm::None,
+            saved_rev: 0,
+            unsaved_confirm: None,
+            post_save: PostSaveAction::None,
+            exit_requested: false,
+            last_viewport_commands: std::cell::RefCell::new(Vec::new()),
             prefs_dirty_since: None,
         }
     }
@@ -335,6 +417,58 @@ impl GuanqiApp {
     /// 标记偏好已变（防抖落盘的入口；UI 每次改开关 / 几何时调用）。
     fn mark_prefs_dirty(&mut self) {
         self.prefs_dirty_since.get_or_insert(Instant::now());
+    }
+
+    // ---- 未保存内容保护（脏判定）----
+
+    /// 把「上次保存 / 载入」的基准修订号对齐到当前活动文档：载入棋谱、
+    /// 另存成功、开始新对局（新对局自身是干净的空白内容）后调用。
+    /// 活动文档的棋盘 [`Board::record_rev`] 即基准——修订号记在棋盘
+    /// 对象上，随文档互换（创建 / 切换副本）整体移动，各自独立判脏。
+    fn mark_saved(&mut self) {
+        self.saved_rev = self.board.record_rev();
+    }
+
+    /// 当前活动文档是否有未保存的改动：棋谱记录在「上次保存 / 载入」
+    /// 之后被改过（落子 / 弃着 / 悔棋 / 建变着）。导航、分支切换、
+    /// 回看不改记录，不算脏。对照基准存在 `saved_rev` 里，与棋盘的
+    /// `record_rev` 比对即可，无需拼接内容指纹。
+    fn is_dirty(&self) -> bool {
+        self.board.record_rev() != self.saved_rev
+    }
+
+    /// 关窗流程（每帧 `ui` 顶部调用）：收到 close 请求且内容脏时取消
+    /// 关闭并弹确认；干净（或已确认 / 另存后续完成）则放行。
+    ///
+    /// 全部确认出口都通过后，真正关闭经 [`egui::ViewportCommand::Close`]
+    /// 显式发出——不能只依赖「不 CancelClose」：同一帧的 close 事件
+    /// 若被取消，后续必须由我们主动再请求。`on_exit` 的设置落盘在
+    /// eframe 收到 Close、运行时退出时执行，此流程不拦它。
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        // 上一帧已确认退出（或另存后续完成）：发真正的关闭命令。
+        if self.exit_requested {
+            self.send_viewport(ctx, egui::ViewportCommand::Close);
+            return;
+        }
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if !close_requested {
+            return;
+        }
+        if self.is_dirty() {
+            // 内容脏：取消本次关闭（不发 CancelClose 应用就会直接退出），
+            // 弹「未保存」确认条，由用户选出口。
+            self.send_viewport(ctx, egui::ViewportCommand::CancelClose);
+            if self.unsaved_confirm.is_none() {
+                self.unsaved_confirm = Some(UnsavedConfirm::Exit);
+            }
+        }
+        // 干净：不取消，eframe 按默认流程退出（on_exit 落盘设置）。
+    }
+
+    /// 发 viewport 命令并留档（e2e 驱动断言用；留档不影响应用语义）。
+    fn send_viewport(&mut self, ctx: &egui::Context, command: egui::ViewportCommand) {
+        self.last_viewport_commands.borrow_mut().push(command.clone());
+        ctx.send_viewport_cmd(command);
     }
 
     /// 每帧调用：把界面开关状态快照进 `ui_prefs`，与上一帧比对——
@@ -404,7 +538,11 @@ impl GuanqiApp {
     /// - 已有对话框在等待：**忽略本次请求并提示**。portal 每次调用都会
     ///   真实弹出一个原生对话框并占用一个专职等待线程，叠加调用会让
     ///   多个对话框同时压到用户屏幕上（且先弹的那个仍会投递结果），故必须
-    ///   等当前选择完成后再发起新的。
+    ///   等当前选择完成后再发起新的；
+    /// - 当前文档有未保存改动（脏）：先经「未保存」确认（与丢弃副本研究
+    ///   的确认**合并为一条**：先弹副本确认，确认后按干净态重新走本函数
+    ///   的脏判定，用户至多确认一次——两条守卫的文案不同，不能并成
+    ///   一个窗口，但入口收敛到一次交互）。
     fn open_file_dialog(&mut self) {
         // 载入会替换原谱：所有副本（含活动若是副本）连同研究一起丢弃，
         // 用户选中的棋谱路径在确认前尚未取得，确认即重新发起对话框。
@@ -412,6 +550,17 @@ impl GuanqiApp {
             self.pending_confirm = PendingConfirm::LoadGame;
             return;
         }
+        // 无副本研究成果但当前文档脏：同样先确认再发起对话框。
+        if self.is_dirty() {
+            self.unsaved_confirm = Some(UnsavedConfirm::OpenDialog);
+            return;
+        }
+        self.open_file_dialog_now();
+    }
+
+    /// 直接发起「打开棋谱」对话框（无任何内容守卫；对话框等待中 /
+    /// portal 不可用等运行时守卫仍生效）。守卫通过后的实际发起路径。
+    fn open_file_dialog_now(&mut self) {
         if let Some(notice) = self.dialog_guard() {
             self.notices.push(notice);
             return;
@@ -434,7 +583,9 @@ impl GuanqiApp {
     }
 
     /// 确认「丢弃副本研究后载入」之后重新发起打开对话框。
-    /// 此时研究成果已随确认清除（`drop_copy` 无副作用地放行了守卫）。
+    /// 研究成果已随确认清除（`drop_copy` 无副作用地放行了守卫）；
+    /// 此时再查脏标记——脏则走「未保存」确认（同一入口第二次判定，
+    /// 用户在副本确认时未被告知未保存风险，不能在这里跳过）。
     fn open_file_dialog_after_confirm(&mut self) {
         if self.research_moves() == 0 {
             self.open_file_dialog();
@@ -444,11 +595,21 @@ impl GuanqiApp {
     /// 发起「另存为」对话框（菜单入口与 Ctrl+Shift+S 共用）。
     /// 默认文件名：原谱取档案名；研究副本取「原名-副本N.sgf」
     ///（[`Self::copy_default_name`]），提示文件尚未真实存盘。
+    ///
+    /// `then` 为「先另存再继续」的回调动作：`Some` 时记入
+    /// [`Self::post_save`]，另存成功分支自动继续原操作；普通另存传
+    /// [`PostSaveAction::None`]。
     fn save_file_dialog(&mut self) {
+        self.save_file_dialog_then(PostSaveAction::None);
+    }
+
+    /// 带回调的另存发起（「先另存再继续」出口的落点）。
+    fn save_file_dialog_then(&mut self, then: PostSaveAction) {
         if let Some(notice) = self.dialog_guard() {
             self.notices.push(notice);
             return;
         }
+        self.post_save = then;
         let default_name = if self.active_from_move.is_some() {
             // 活动文档是副本：默认名带编号（来源路径仍是原谱，不能用原名）。
             self.copy_default_name(self.active_number)
@@ -476,6 +637,7 @@ impl GuanqiApp {
                 // 队列不清空：先前的事件提示仍保留展示（排队上限挤出）。
             }
             Err(err) => {
+                self.post_save = PostSaveAction::None;
                 self.notices.push(LoadNotice::Failed(err.to_string()));
             }
         }
@@ -499,16 +661,20 @@ impl GuanqiApp {
     /// 读取或解析失败时**保留原棋盘**，只提示错误。
     /// 副本有研究成果时先替换掉它（确认框在 `open_file_dialog` 前已守卫）。
     fn load_game(&mut self, path: PathBuf) {
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
+        match std::fs::read(&path) {
             Err(err) => {
                 self.notices.push(LoadNotice::Failed(format!(
                     "读取 {} 失败：{err}",
                     path.display()
                 )));
-                return;
             }
-        };
+            Ok(bytes) => self.load_game_from_bytes(path, bytes),
+        }
+    }
+
+    /// 从字节流载入棋谱（[`Self::load_game`] 的读盘后半段；e2e 驱动
+    /// 复用以绕开 portal 对话框）。解析失败时**保留原棋盘**，只提示错误。
+    fn load_game_from_bytes(&mut self, path: PathBuf, bytes: Vec<u8>) {
         match load_from_bytes(&path, &bytes) {
             Err(err) => {
                 self.notices.push(LoadNotice::Failed(format!("打开棋谱失败：{err}")));
@@ -544,6 +710,8 @@ impl GuanqiApp {
                 let size = board.size();
                 let moves = board.move_count();
                 self.board = board;
+                // 新载入的谱是「刚保存过的内容」：对齐基准，脏标记复位。
+                self.mark_saved();
                 self.loaded = Some(meta);
                 // 棋盘整体替换：树布局指纹换代，不复用旧谱布局。
                 self.tree_epoch = self.tree_epoch.wrapping_add(1);
@@ -604,8 +772,14 @@ impl GuanqiApp {
                     self.remember_dir(OpenSaveDir::Save, &path);
                     self.save_game(path);
                 }
-                PortalEvent::Cancelled => {} // 用户取消：静默，界面保持原状
+                PortalEvent::Cancelled => {
+                    // 用户取消另存：若这是「先另存再继续」的那次另存，
+                    // 回调一并丢弃（确认条早已收起；用户重新发起原操作
+                    // 会再次看到确认）。普通另存本就无回调，清空无副作用。
+                    self.post_save = PostSaveAction::None;
+                }
                 PortalEvent::Failed(err) => {
+                    self.post_save = PostSaveAction::None;
                     self.notices.push(LoadNotice::Failed(err.to_string()));
                 }
             },
@@ -638,8 +812,7 @@ impl GuanqiApp {
     /// 同一次计算口径）合成进根节点 `C[]`——界标块幂等替换，用户原有根
     /// 注释不覆盖。未载入棋谱（空盘 / 新对局）不写：新对局的统计属于
     /// 「本盘」，快扫结束后按普通另存自然带出。
-    fn save_game(&mut self, path: PathBuf) {
-        let stats_block = if self.loaded.is_some() {
+    fn save_game(&mut self, path: PathBuf) {        let stats_block = if self.loaded.is_some() {
             crate::ui::analysis::stats_block_text(
                 &self.analysis.game_summary(&self.board),
                 crate::ui::analysis::WORST_LIMIT,
@@ -663,10 +836,28 @@ impl GuanqiApp {
                     .unwrap_or_else(|| {
                         self.loaded = Some(GameMeta::for_path(&path, self.board.size()));
                     });
+                // 另存成功：内容已落盘，对齐基准清脏；若这是「先另存再
+                // 继续」的那次另存，此处同时自动继续被暂挂的原操作。
+                self.mark_saved();
+                let post_save = std::mem::take(&mut self.post_save);
                 self.notices.push(LoadNotice::Ok(format!(
                     "已另存到 {}（{size}，{branches} 手）。",
                     path.display()
                 )));
+                match post_save {
+                    PostSaveAction::None => {}
+                    PostSaveAction::NewGame(setup) => {
+                        self.start_new_game(setup);
+                    }
+                    PostSaveAction::OpenDialog => {
+                        self.open_file_dialog();
+                    }
+                    PostSaveAction::Exit => {
+                        // 落盘后放行退出：下一帧 ui 顶部重新发 Close
+                        // （`request_close`，此时 `is_dirty` 已为 false）。
+                        self.exit_requested = true;
+                    }
+                }
             }
             Err(err) => {
                 self.notices.push(LoadNotice::Failed(format!(
@@ -703,9 +894,12 @@ impl GuanqiApp {
         self.active_from_move = None;
         self.active_number = 0;
         self.pending_confirm = PendingConfirm::None;
+        self.unsaved_confirm = None;
         self.board = board;
         // 棋盘整体替换：树布局指纹换代（与载谱同理）。
         self.tree_epoch = self.tree_epoch.wrapping_add(1);
+        // 新对局自身是干净的空白内容：对齐基准，脏标记复位。
+        self.mark_saved();
         // 元信息同样整体替换：旧棋谱的对局信息（含上一盘的结果 RE[] /
         // 双方 PB[]/PW[]）与逐手注释不能混进新对局的另存文件；让子数
         // 记入 info，「另存」才能写出 HA[n]（普通对局为 0，不写 HA）。
@@ -813,6 +1007,24 @@ impl GuanqiApp {
             }
         }
         self.notices.push(analysis_panel::LoadNotice::Ok(text));
+    }
+
+    /// 引擎认输（无望提示区「让引擎认输」按钮的执行体；认输方恒为
+    /// 引擎一方）：与人类认输共用同一条结束语义（`finish_game` 写 RE /
+    /// 提示，自动应手因 `resigned` 置位自然停止），不新写结束逻辑。
+    /// 结果串按胜方换算：引擎执黑认输 ⇒ `W+R`（人类执白中盘胜）。
+    fn engine_resign(&mut self) {
+        let loser = self.play.human.opposite();
+        self.play.resigned = Some(loser);
+        let winner = loser.opposite();
+        let result = format!("{}+R", result_letter(winner));
+        let text = format!(
+            "{}认输：{}（{}）。对局已结束，可继续复盘浏览。",
+            loser.name(),
+            play::resign_text(loser),
+            result
+        );
+        self.finish_game(result, text, None);
     }
 
     /// 当前生效规则的中文名（终局判定块的口径标注；取本局锁定规则或
@@ -984,12 +1196,19 @@ impl GuanqiApp {
     /// 用户误以为副本已存盘——如实显示来源（另存前显示原谱名，另存后
     /// 由 `save_game` 更新为真实落盘路径）。
     ///
+    /// 创建副本：把当前活动文档（含其未保存状态）推入 `others` 的工作
+    /// 区段；副本文档自身的基准由 [`Self::switch_doc`] / 本函数对
+    /// `saved_rev` 的重置给出（副本树重放自原谱，修订号从 0 起算，
+    /// 「刚从干净内容复制而来」＝干净；此后在副本里落子才变脏）。
+    ///
     /// 前置条件（UI 已守卫，此处 assert 兜底）：已载入棋谱。
     fn create_copy(&mut self) {
         assert!(
             self.loaded.is_some(),
             "创建副本的前置条件不满足（UI 入口应已置灰）"
         );
+        // 对弈中切到副本同样是「切文档」：结束对局（子项 B）。
+        self.end_play_for_doc_switch();
         let number = self.next_number;
         self.next_number += 1;
         let from_move = self.board.cursor();
@@ -1001,7 +1220,6 @@ impl GuanqiApp {
             .as_ref()
             .expect("前置条件已检查 loaded 存在")
             .clone();
-        self.play = PlayState::review();
         // 当前文档退入 others（带上身份），新副本进主槽。
         self.others.push(Doc {
             board: std::mem::replace(&mut self.board, board),
@@ -1012,6 +1230,9 @@ impl GuanqiApp {
         self.loaded = Some(meta);
         self.active_from_move = Some(from_move);
         self.active_number = number;
+        // 新副本进主槽：它的树刚由前缀重放搭出（record_rev 从 0 起算），
+        // 基准同样对齐到 0 —— 副本创建即干净，之后在副本里落子才变脏。
+        self.saved_rev = self.board.record_rev();
         self.tree_epoch = self.tree_epoch.wrapping_add(1);
         self.overlay.focus = None;
         self.branch_notice = None;
@@ -1023,6 +1244,21 @@ impl GuanqiApp {
         self.notices.push(notice);
     }
 
+    /// 切换文档时结束进行中的对局（子项 B：任何文档互切、含切回原谱
+    /// 都算「离开对局现场」）：对弈模式退回复盘、清时钟与认输 / 超时
+    /// 进行态。**不改棋谱内容、不写 RE**——对局没有走完，胜负未判，
+    /// 悄悄补结果等于替用户认输；用户要继续可重新开启人机对弈。
+    fn end_play_for_doc_switch(&mut self) {
+        if self.play.mode {
+            self.play = PlayState::review();
+            self.last_frame = None;
+            let notice = LoadNotice::Warn(
+                "已切换文档，对局结束（未判胜负）；要继续对弈请重新开启人机对弈。".to_owned(),
+            );
+            self.notices.push(notice);
+        }
+    }
+
     /// 切换到指定编号的文档：主显示槽位与 `others` 中该项**整体互换**
     /// （棋盘、元信息、身份四字段一起走，零拷贝）。
     ///
@@ -1031,12 +1267,18 @@ impl GuanqiApp {
     /// 查询。棋盘整体替换 → `tree_epoch` 换代（树布局不复用）；旧文档的
     /// 临时提示与定位高亮一并清除。
     ///
+    /// 未保存基准随文档走：每个 [`Board`] 携带自己的 `record_rev`，切入
+    /// 新文档时基准对齐到它的当前值（`mark_saved` 语义），各文档独立
+    /// 判脏——「副本里改过、切回干净的原谱」不会误报。
+    ///
     /// `swap_remove` 会让 `others` 内部顺序变化，但侧栏列表按编号排序
     /// 显示（见 `doc_entries`），内部顺序不影响任何可见行为。
     fn switch_doc(&mut self, number: usize) {
         let Some(index) = self.other_index(number) else {
             return;
         };
+        // 对弈中切文档（任何互切含切回原谱）即结束对局（子项 B）。
+        self.end_play_for_doc_switch();
         let incoming = self.others.swap_remove(index);
         // 当前活动文档退回列表（带上身份），目标文档换进主槽。
         self.others.push(Doc {
@@ -1048,6 +1290,8 @@ impl GuanqiApp {
         self.loaded = incoming.meta;
         self.active_from_move = incoming.from_move;
         self.active_number = incoming.number;
+        // 基准对齐到新活动文档的当前修订号：每份文档各自判脏。
+        self.saved_rev = self.board.record_rev();
         self.tree_epoch = self.tree_epoch.wrapping_add(1);
         self.overlay.focus = None;
         self.branch_notice = None;
@@ -1189,6 +1433,9 @@ impl eframe::App for GuanqiApp {
     // eframe 0.36 起不再有 `App::update(&mut self, ctx, frame)`，
     // 改为直接发放根 `Ui`；用 CentralPanel 补上背景与边距。
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 关窗保护（未保存内容）：脏时取消关闭弹确认，干净放行。
+        // 必须在每帧 UI 一开始处理，迟了 eframe 已按默认语义退出。
+        self.handle_close_request(ui.ctx());
         // Ctrl+O / Ctrl+Shift+S 与菜单入口共用同一批发起函数
         // （内含等待中 / 不可用守卫）。
         if ui.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.ctrl) {
@@ -1300,7 +1547,7 @@ impl eframe::App for GuanqiApp {
                 .map_or_else(|| "—".to_owned(), |wr| format!("{:.1}%", wr * 100.0));
             format!(
                 "引擎认为{}方已无望（胜率 {wr}）。\
-                 你可以判它认输（点「认输」并选择引擎认输），或继续对局。",
+                 可点「让引擎认输」判它中盘负，或继续对局。",
                 engine.name()
             )
         });
@@ -1391,7 +1638,17 @@ impl eframe::App for GuanqiApp {
                     self.finish_game(result, text, None);
                 }
             }
-            // 确认「引擎无望」提示：只收起提示，不自动替引擎认输。
+            // 引擎认输（无望提示区「让引擎认输」按钮）：兑现无望提示
+            // 「你可以判它认输」的承诺。与人类认输走同一条结束语义
+            // （finish_game 写 RE / 自动应手停止 / 复盘浏览），认输方 =
+            // 引擎一方，结果串按胜方换算（引擎执黑则人类胜 = `W+R`）。
+            analysis_panel::PanelAction::EngineResign => {
+                if self.play.mode && !self.play.finished(&self.board) {
+                    self.engine_resign();
+                }
+            }
+            // 确认「引擎无望」提示：只收起提示，不自动替引擎认输
+            // （是否认输交给同卡片上的「让引擎认输」按钮）。
             analysis_panel::PanelAction::AckHopeless => {}
             // 切换难度：立即生效（下一手应手即按新难度搜索）并持久化；
             // 保存失败只提示，当前运行内仍按新难度对弈。
@@ -1621,9 +1878,14 @@ impl eframe::App for GuanqiApp {
                 self.engine_cfg.new_game_rules,
             );
             if let new_game::NewGameAction::Start(setup) = action {
-                // 副本有研究成果时先确认（中止 = 新对局窗口已关，保持现状）。
+                // 副本有研究成果时先确认（中止 = 新对局窗口已关，保持现状）；
+                // 无副本研究但当前文档脏时走「未保存」确认。确认路径在
+                // 各自的确认框出口续行（此处不动新对局窗口开关——窗口
+                // 已随「开始」按钮关闭，确认后由 start_new_game 建盘）。
                 if self.research_moves() > 0 {
                     self.pending_confirm = PendingConfirm::NewGame(setup);
+                } else if self.is_dirty() {
+                    self.unsaved_confirm = Some(UnsavedConfirm::NewGame(setup));
                 } else {
                     // 面板完成使命即关闭：否则继续浮在棋盘左上角遮挡落子。
                     self.new_game_open = false;
@@ -1700,8 +1962,7 @@ impl eframe::App for GuanqiApp {
                         PendingConfirm::NewGame(setup) => self.start_new_game(setup),
                         PendingConfirm::None => {}
                     }
-                }
-                Some(false) => {
+                }                Some(false) => {
                     // 取消：若是「载入新谱」则连等待中的文件对话框一起收起，
                     // 用户重新点「打开棋谱」即可（对话框结果被忽略）。
                     if matches!(self.pending_confirm, PendingConfirm::LoadGame) {
@@ -1711,6 +1972,79 @@ impl eframe::App for GuanqiApp {
                 }
                 // 点窗口 X（或 ESC）等同取消：确认框不得常驻。
                 None if !confirm_open => self.pending_confirm = PendingConfirm::None,
+                None => {}
+            }
+        }
+
+        // 未保存内容确认条（关窗 / 新对局 / 打开棋谱，同一套出口）：
+        // 「先另存再继续」（另存成功后自动继续原操作）/「不保存继续」/
+        // 「取消」。三处入口共用这一个窗口，出口语义一致。
+        if let Some(confirm) = self.unsaved_confirm {
+            let ctx = ui.ctx().clone();
+            let text = confirm.text();
+            let mut verdict: Option<UnsavedVerdict> = None;
+            let mut confirm_open = true;
+            egui::Window::new("有未保存的改动")
+                .open(&mut confirm_open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(&ctx, |ui| {
+                    ui.label(text);
+                    ui.weak("可先 Ctrl+Shift+S 另存；下面三个出口任选其一。");
+                    ui.add_space(6.0);
+                    ui.vertical(|ui| {
+                        if ui.button("先另存再继续").clicked() {
+                            verdict = Some(UnsavedVerdict::SaveThenContinue);
+                        }
+                        if ui.button("不保存继续").clicked() {
+                            verdict = Some(UnsavedVerdict::Discard);
+                        }
+                        if ui.button("取消").clicked() {
+                            verdict = Some(UnsavedVerdict::Cancel);
+                        }
+                    });
+                });
+            match verdict {
+                Some(UnsavedVerdict::SaveThenContinue) => {
+                    let confirm = self.unsaved_confirm.take().expect("分支内必为 Some");
+                    let then = match confirm {
+                        UnsavedConfirm::Exit => PostSaveAction::Exit,
+                        UnsavedConfirm::NewGame(setup) => PostSaveAction::NewGame(setup),
+                        UnsavedConfirm::OpenDialog => PostSaveAction::OpenDialog,
+                    };
+                    // 另存成功后自动继续 then（save_game 的 Ok 分支）。
+                    // 发起失败（等待中 / portal 不可用）时回调留在
+                    // post_save 上不生效？——不会：save_file_dialog_then
+                    // 失败分支会把 post_save 清回 None 并提示，用户可重试。
+                    self.save_file_dialog_then(then);
+                    // 发起失败（dialog_guard 拦下）时回调已被清空、确认框
+                    // 也已收起：把确认框放回来，用户重新选择出口。
+                    if self.post_save == PostSaveAction::None {
+                        self.unsaved_confirm = Some(confirm);
+                    }
+                }
+                Some(UnsavedVerdict::Discard) => {
+                    let confirm = self.unsaved_confirm.take().expect("分支内必为 Some");
+                    match confirm {
+                        UnsavedConfirm::Exit => self.exit_requested = true,
+                        UnsavedConfirm::NewGame(setup) => self.start_new_game(setup),
+                        UnsavedConfirm::OpenDialog => {
+                            // 对话框发起被运行时守卫（等待中 / portal 不可用）
+                            // 拦下时确认条放回：用户另选出口，原操作没有
+                            // 悄悄丢掉，也没有卡死在已收起的确认框上。
+                            self.open_file_dialog_now();
+                            if self.dialog.is_none() && self.unsaved_confirm.is_none() {
+                                self.unsaved_confirm = Some(confirm);
+                            }
+                        }
+                    }
+                }
+                Some(UnsavedVerdict::Cancel) => {
+                    self.unsaved_confirm = None;
+                }
+                // 点窗口 X（或 ESC）等同取消：确认条不得常驻。
+                None if !confirm_open => self.unsaved_confirm = None,
                 None => {}
             }
         }
@@ -1915,8 +2249,7 @@ impl eframe::App for GuanqiApp {
 /// 时限制式的 SGF 元信息文本（`TM` / `OT`）：包干与读秒的主时间都进
 /// `TM`；读秒描述（每手秒数 × 次数）进 `OT`。无限制不写（`None`，
 /// 与 SGF 惯例一致——未配置时限的谱不落 TM/OT）。
-fn time_meta_text(system: play::TimeSystem) -> (Option<String>, Option<String>) {
-    match system {
+fn time_meta_text(system: play::TimeSystem) -> (Option<String>, Option<String>) {    match system {
         play::TimeSystem::Unlimited => (None, None),
         play::TimeSystem::Absolute { seconds } => {
             (Some(format!("{} 分钟", (seconds / 60.0).round() as u64)), None)
@@ -1933,6 +2266,203 @@ fn result_letter(winner: Stone) -> &'static str {
     match winner {
         Stone::Black => "B",
         Stone::White => "W",
+    }
+}
+
+// ---- 临时 e2e 打洞层（仅供 examples/e2e_driver.rs 驱动验证，交付前与
+// 驱动一并删除；绝不在应用自身路径上调用）。----
+
+impl GuanqiApp {
+    /// 状态 dump（黑盒验证用）：关键内部状态打印到 stdout。
+    #[doc(hidden)]
+    pub fn e2e_dump(&self, label: &str) {
+        let (rev, saved) = (self.board.record_rev(), self.saved_rev);
+        println!("---- {label} ----");
+        println!(
+            "  dirty={} (record_rev={rev}, saved_rev={saved})",
+            self.is_dirty()
+        );
+        println!(
+            "  play.mode={} human={:?} resigned={:?} timeout_loss={:?} clock_system={:?}",
+            self.play.mode,
+            self.play.human,
+            self.play.resigned,
+            self.play.timeout_loss,
+            self.play.clock.system,
+        );
+        println!(
+            "  clock main B/W = {:.1}/{:.1} total B/W = {:.1}/{:.1}",
+            self.play.clock.sides[0].main,
+            self.play.clock.sides[1].main,
+            self.play.clock.total[0],
+            self.play.clock.total[1],
+        );
+        println!(
+            "  exit_requested={exit} unsaved_confirm={unsaved:?} post_save={post:?} new_game_open={ngo} dialog_waiting={dlg}",
+            exit = self.exit_requested,
+            unsaved = self.unsaved_confirm,
+            post = self.post_save,
+            ngo = self.new_game_open,
+            dlg = self.dialog.is_some(),
+        );
+        println!(
+            "  confirm_text = {}",
+            match self.unsaved_confirm {
+                Some(confirm) => confirm.text(),
+                None => "（无确认条）".to_owned(),
+            }
+        );
+        // 最近 2 条消息区提示（确认文案与出口动作的用户可见面）。
+        let texts: Vec<String> =
+            self.notices.iter().map(|n| n.text().to_owned()).collect();
+        println!("  notices(尾 2) = {texts:?}");
+        let commands: Vec<String> = self
+            .last_viewport_commands
+            .borrow()
+            .iter()
+            .map(|c| format!("{c:?}"))
+            .collect();
+        println!("  viewport_cmds_since_last_dump = {commands:?}");
+        self.last_viewport_commands.borrow_mut().clear();
+    }
+
+    /// 直接开始新对局（等价新对局窗口「开始」按钮的最终提交）。
+    #[doc(hidden)]
+    pub fn e2e_new_game(&mut self, setup: crate::play::GameSetup) {
+        // 与窗口入口同一条守卫链：副本研究 → 脏 → 直接执行。
+        if self.research_moves() > 0 {
+            self.pending_confirm = PendingConfirm::NewGame(setup);
+        } else if self.is_dirty() {
+            self.unsaved_confirm = Some(UnsavedConfirm::NewGame(setup));
+        } else {
+            self.start_new_game(setup);
+        }
+    }
+
+    /// 直接落子（绕过绘制几何，等价棋盘点击成功路径）。
+    #[doc(hidden)]
+    pub fn e2e_place(&mut self, at: crate::board::Coord) {
+        let _ = self.board.play(at);
+    }
+
+    /// 直接另存（等价 portal 另存对话框选中路径的落盘段）。
+    #[doc(hidden)]
+    pub fn e2e_save(&mut self, path: std::path::PathBuf) {
+        self.save_game(path);
+    }
+
+    /// 直接载入（等价 portal 打开对话框选中路径的读盘段）。
+    #[doc(hidden)]
+    pub fn e2e_load(&mut self, path: std::path::PathBuf, bytes: Vec<u8>) {
+        self.load_game_from_bytes(path, bytes);
+    }
+
+    /// 触发「打开棋谱」入口（守卫链生效）。
+    #[doc(hidden)]
+    pub fn e2e_open_dialog(&mut self) {
+        self.open_file_dialog();
+    }
+
+    /// 确认条出口：「先另存再继续」。
+    #[doc(hidden)]
+    pub fn e2e_unsaved_verdict_save_then(&mut self) {
+        if self.unsaved_confirm.is_some() {
+            let confirm = self.unsaved_confirm.take().expect("Some");
+            let then = match confirm {
+                UnsavedConfirm::Exit => PostSaveAction::Exit,
+                UnsavedConfirm::NewGame(setup) => PostSaveAction::NewGame(setup),
+                UnsavedConfirm::OpenDialog => PostSaveAction::OpenDialog,
+            };
+            self.save_file_dialog_then(then);
+            if self.post_save == PostSaveAction::None {
+                self.unsaved_confirm = Some(confirm);
+            }
+        }
+    }
+
+    /// 确认条出口：「不保存继续」。
+    #[doc(hidden)]
+    pub fn e2e_unsaved_verdict_discard(&mut self) {
+        if let Some(confirm) = self.unsaved_confirm.take() {
+            match confirm {
+                UnsavedConfirm::Exit => self.exit_requested = true,
+                UnsavedConfirm::NewGame(setup) => self.start_new_game(setup),
+                UnsavedConfirm::OpenDialog => self.open_file_dialog_now(),
+            }
+        }
+    }
+
+    /// 取消退出（驱动续跑用）。
+    #[doc(hidden)]
+    pub fn e2e_cancel_exit(&mut self) {
+        self.exit_requested = false;
+    }
+
+    /// 悔棋（等价 Ctrl+Z 复盘语义）。
+    #[doc(hidden)]
+    pub fn e2e_undo(&mut self) {
+        let _ = self.board.undo();
+    }
+
+    /// 直接注入另存对话框的 portal 事件（等价用户在对话框确认 / 取消）。
+    /// 先清等待槽再分发——与 `logic` 每帧取事件的顺序一致（取出即清槽，
+    /// 事件处理器内的后续发起不会被「已有对话框在等待」守卫拦下）。
+    #[doc(hidden)]
+    pub fn e2e_portal_save_event(&mut self, event: crate::portal::PortalEvent) {
+        self.dialog = None;
+        self.on_portal_event(PendingDialog::Save, event);
+    }
+
+    /// 确认条出口：「取消」。
+    #[doc(hidden)]
+    pub fn e2e_unsaved_verdict_cancel(&mut self) {
+        self.unsaved_confirm = None;
+    }
+
+    /// 在已载入谱上开启对弈（等价侧栏「人机对弈」开关 + 设置时钟）。
+    #[doc(hidden)]
+    pub fn e2e_start_play(&mut self, setup: crate::play::GameSetup) {
+        self.play = PlayState::new_game(&setup);
+        self.active_rules = Some(setup.rules.wire().to_owned());
+        self.komi = setup.komi;
+    }
+
+    /// 从当前手创建研究副本（内部路径直通）。
+    #[doc(hidden)]
+    pub fn e2e_create_copy(&mut self) {
+        self.create_copy();
+    }
+
+    /// 切回原谱（内部路径直通）。
+    #[doc(hidden)]
+    pub fn e2e_switch_to_original(&mut self) {
+        self.switch_to_original();
+    }
+
+    /// 「让引擎认输」（等价无望提示区的按钮动作）。
+    #[doc(hidden)]
+    pub fn e2e_engine_resign(&mut self) {
+        if self.play.mode && !self.play.finished(&self.board) {
+            self.engine_resign();
+        }
+    }
+
+    /// 人类认输（等价侧栏「认输」按钮动作）。
+    #[doc(hidden)]
+    pub fn e2e_human_resign(&mut self) {
+        if self.play.mode && !self.play.finished(&self.board) {
+            let loser = self.play.human;
+            self.play.resigned = Some(loser);
+            let winner = loser.opposite();
+            let result = format!("{}+R", result_letter(winner));
+            let text = format!(
+                "{}认输：{}（{}）。对局已结束，可继续复盘浏览。",
+                loser.name(),
+                play::resign_text(loser),
+                result
+            );
+            self.finish_game(result, text, None);
+        }
     }
 }
 

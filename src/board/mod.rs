@@ -210,6 +210,15 @@ pub struct Board {
     captured_by_black: u32,
     /// 白方累计提走的对方子数（截至游标）。
     captured_by_white: u32,
+    /// 记录修订号：**谱树内容**每被改动一次就递增（新建节点 / 悔棋删节点
+    /// 是仅有的两处树变更入口）。导航类操作（回看 / 切分支 / 跳转）只改
+    /// 游标与选中分支，不改变任何着法记录，**不**递增——「未保存内容」
+    /// 守卫据此区分「记录真的变了」与「只是看了看」。按对象记数而不是
+    /// 在上层比对内容指纹的理由：每份文档（原谱 / 研究副本）各有独立
+    /// 树，各自记数可让「未保存」随文档互换精确移动，无需拼接指纹或
+    /// 维护全局映射；代价是「改了又改回原样」仍算脏，这与通用编辑器的
+    /// 未保存语义一致，可接受。
+    record_rev: u64,
 }
 
 impl Board {
@@ -271,6 +280,7 @@ impl Board {
             line_records: Vec::new(),
             captured_by_black: 0,
             captured_by_white: 0,
+            record_rev: 0,
         })
     }
 
@@ -299,6 +309,9 @@ impl Board {
             line_records: Vec::new(),
             captured_by_black: 0,
             captured_by_white: 0,
+            // 副本重放只搭出前缀树、尚未被用户改动：修订号从 0 起算，
+            // 与「刚从文件载入」同级（干净）。
+            record_rev: 0,
         };
         for (i, record) in self.line_records[..upto].iter().enumerate() {
             match record.action {
@@ -354,6 +367,13 @@ impl Board {
     /// 界面手数分母请用 [`Board::line_len`]。
     pub fn move_count(&self) -> usize {
         self.nodes.len() - 1
+    }
+
+    /// 记录修订号：谱树内容每变更一次（落子 / 弃着建分支 / 悔棋删节点）
+    /// 递增 1；导航与分支切换不改树、不递增。上层「未保存内容」守卫
+    /// 把它与「上次保存 / 载入时刻的值」比对：相等即干净，不等即脏。
+    pub fn record_rev(&self) -> u64 {
+        self.record_rev
     }
 
     /// 当前手数：根到当前节点的路径长度（0 = 预设局面）。
@@ -599,6 +619,8 @@ impl Board {
         children.push(id);
         let last = children.len() - 1;
         self.nodes[parent].selected = last;
+        // 谱树新增了节点：记录内容已变（未保存守卫的事实来源）。
+        self.record_rev += 1;
         self.set_current(id);
     }
 
@@ -675,6 +697,8 @@ impl Board {
             // 末尾节点被搬到 cur 的位置：修正父与子的反向引用。
             self.relocate(last, cur);
         }
+        // 谱树删除了节点（悔棋）：记录内容已变。
+        self.record_rev += 1;
         self.set_current(parent);
         Some(record)
     }
