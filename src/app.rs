@@ -397,8 +397,27 @@ impl GuanqiApp {
 
     /// 把当前棋盘（含用户新建的变着）写到用户确认的位置。
     /// 新对局后未另存过时用默认文件名存；写失败时提示可读原因，原状态不变。
+    ///
+    /// 局后统计写回（LizzieYzy appendAiScoreBlunder 口径）：已载入棋谱时
+    /// 把当前统计（[`AnalysisState::game_summary`]，与侧栏「局后统计」卡片
+    /// 同一次计算口径）合成进根节点 `C[]`——界标块幂等替换，用户原有根
+    /// 注释不覆盖。未载入棋谱（空盘 / 新对局）不写：新对局的统计属于
+    /// 「本盘」，快扫结束后按普通另存自然带出。
     fn save_game(&mut self, path: PathBuf) {
-        match save_to_file(&path, &self.board, self.loaded.as_ref()) {
+        let stats_block = if self.loaded.is_some() {
+            crate::ui::analysis::stats_block_text(
+                &self.analysis.game_summary(&self.board),
+                crate::ui::analysis::WORST_LIMIT,
+            )
+        } else {
+            None
+        };
+        match save_to_file(
+            &path,
+            &self.board,
+            self.loaded.as_ref(),
+            stats_block.as_deref(),
+        ) {
             Ok(()) => {
                 let size = self.board.size();
                 let branches = self.board.nodes().len() - 1;
@@ -980,12 +999,17 @@ impl eframe::App for GuanqiApp {
             analysis_panel::PanelAction::AdvancePv { pv, .. } => {
                 self.handle_advance_pv(pv);
             }
-            // 整谱快扫：对当前线逐手低 visits 批量分析（报告按 turnNumber
-            // 回填逐手历史，曲线自动填满）。发起失败的提示走消息区。
+            // 整谱快扫：按侧栏配置批量分析（报告按 turnNumber 回填逐手
+            // 历史，曲线自动填满）。发起失败的提示走消息区。
             analysis_panel::PanelAction::StartBatch => {
                 if let Some(reason) = self.analysis.start_batch(&self.board, self.komi) {
                     self.load_notice = Some(analysis_panel::LoadNotice::Warn(reason));
                 }
+            }
+            // 整谱快扫配置编辑（起止 / visits / 单方 / 含变着 / 加深）：
+            // 转存进 AnalysisState，发起与预估共用同一份配置。
+            analysis_panel::PanelAction::SetBatchConfig(cfg) => {
+                self.analysis.set_batch_config(cfg);
             }
             // 取消整谱快扫：terminate 在飞块，提示由下一帧 take_batch_notice 落位。
             analysis_panel::PanelAction::CancelBatch => {
@@ -1159,7 +1183,6 @@ impl eframe::App for GuanqiApp {
 
     // 每帧 UI 之前轮询引擎事件（不阻塞）；窗口隐藏时同样被调用。
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-
         // 每帧轮询 portal 对话框结果（结果入队时 waker 已请求立即重绘，
         // 这里的 200ms 兜底刷新覆盖 waker 之外的边界情况）。
         let event = match &mut self.dialog {

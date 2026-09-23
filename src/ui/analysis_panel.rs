@@ -19,7 +19,7 @@ use crate::play::{PlayState, resign_text};
 use crate::sgf::GameMeta;
 
 use super::analysis::{
-    AnalysisState, EngineStatus, GameSummary, Severity, WORST_LIMIT,
+    AnalysisState, BatchSide, EngineStatus, GameSummary, Severity, WORST_LIMIT, batch_estimate,
 };
 use super::explain;
 use super::overlay::{self, Overlay};
@@ -97,9 +97,12 @@ pub enum PanelAction {
         /// 主变序列（首手起，`None` = 弃着），截断到 [`PV_LIMIT`]。
         pv: Vec<Option<Coord>>,
     },
-    /// 点了「整谱快扫」：对当前线逐手低 visits 批量分析（App 转交
+    /// 点了「整谱快扫」：按侧栏配置批量分析（App 转交
     /// [`AnalysisState::start_batch`]，报告按 turnNumber 回填逐手历史）。
     StartBatch,
+    /// 整谱快扫配置有改动：转入 [`AnalysisState::set_batch_config`]
+    /// （预估与发起共用这份配置）。
+    SetBatchConfig(crate::ui::analysis::BatchConfig),
     /// 点了「取消快扫」：terminate 在飞批量查询并结束任务。
     CancelBatch,
     /// 点了「局后统计」排行榜某行：跳转到该手（App 调
@@ -162,7 +165,10 @@ fn status_label(analysis: &AnalysisState) -> (String, Color32) {
                 .snapshot
                 .as_ref()
                 .filter(|snapshot| !snapshot.is_final)
-                .or(analysis.analyzing().then_some(analysis.snapshot.as_ref()).flatten())
+                .or(analysis
+                    .analyzing()
+                    .then_some(analysis.snapshot.as_ref())
+                    .flatten())
             {
                 // 在飞查询的中间报告实时可达（root.visits 随搜索推进递增）。
                 let visits = snapshot.root.as_ref().map_or(0, |root| root.visits);
@@ -434,9 +440,8 @@ fn card_play(
                 // 各段等分整行（预留 4 个段间空隙）。注意不能用
                 // `Layout::with_main_justify` —— 水平布局下它会把每个
                 // 控件都拉伸到整行宽，5 段就会把面板宽度棘轮式撑大。
-                let seg_w =
-                    (ui.available_width() - 4.0 * ui.spacing().item_spacing.x)
-                        / Difficulty::ALL.len() as f32;
+                let seg_w = (ui.available_width() - 4.0 * ui.spacing().item_spacing.x)
+                    / Difficulty::ALL.len() as f32;
                 ui.horizontal(|ui| {
                     for &d in Difficulty::ALL.iter() {
                         let selected = cfg.play_difficulty == d;
@@ -843,7 +848,10 @@ fn card_limits(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &mu
         // 区域开关：开启后棋盘进入框选模式（拖框 / 点两下对角 / 右键清除），
         // 关闭即清除区域。开启时忽略落子，候选点随新查询实时刷新。
         let mut region_on = limits.has_region();
-        if ui.checkbox(&mut region_on, "限定区域（在棋盘上拖框）").changed() {
+        if ui
+            .checkbox(&mut region_on, "限定区域（在棋盘上拖框）")
+            .changed()
+        {
             *action = PanelAction::SetRegion(region_on.then_some(()).and(None));
         }
         ui.weak("拖框选定区域后，引擎只考虑区域内的空点。");
@@ -866,8 +874,7 @@ fn card_limits(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &mu
             for (i, (player, at)) in limits.avoid.iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(format!("{} {}", player.name(), at.to_gtp(size)))
-                            .monospace(),
+                        RichText::new(format!("{} {}", player.name(), at.to_gtp(size))).monospace(),
                     );
                     if ui.small_button("移除").clicked() {
                         *action = PanelAction::RemoveAvoid(i);
@@ -1045,8 +1052,7 @@ fn candidate_row(
     {
         // 两个小钮并排（排除 / 沿主变前进），等宽对齐。
         let btn_w = (tail - 8.0) / 2.0;
-        let (brect, btn) =
-            ui.allocate_exact_size(Vec2::new(btn_w, height - 4.0), Sense::click());
+        let (brect, btn) = ui.allocate_exact_size(Vec2::new(btn_w, height - 4.0), Sense::click());
         let painter = ui.painter_at(brect);
         let hover = btn.hovered() || btn.is_pointer_button_down_on();
         painter.rect_filled(
@@ -1074,8 +1080,7 @@ fn candidate_row(
             *action = PanelAction::ToggleAvoid { player, at };
         }
 
-        let (frect, fwd) =
-            ui.allocate_exact_size(Vec2::new(btn_w, height - 4.0), Sense::click());
+        let (frect, fwd) = ui.allocate_exact_size(Vec2::new(btn_w, height - 4.0), Sense::click());
         let painter = ui.painter_at(frect);
         let hover = fwd.hovered() || fwd.is_pointer_button_down_on();
         painter.rect_filled(
@@ -1098,9 +1103,8 @@ fn candidate_row(
                 Color32::from_rgb(168, 186, 206)
             },
         );
-        let fwd = fwd.on_hover_text(
-            "沿该候选的主变逐手前进（只走谱上已有的着法，缺处即停；不新建分支）",
-        );
+        let fwd =
+            fwd.on_hover_text("沿该候选的主变逐手前进（只走谱上已有的着法，缺处即停；不新建分支）");
         if fwd.clicked() {
             *action = PanelAction::AdvancePv {
                 at,
@@ -1198,14 +1202,16 @@ fn card_summary(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &m
                     ui.label(RichText::new(black_cell).strong());
                 });
             })
-            .response.on_hover_text(format!("黑方 {tip}"));
+            .response
+            .on_hover_text(format!("黑方 {tip}"));
             ui.allocate_ui(Vec2::new(width, 0.0), |ui| {
                 ui.vertical(|ui| {
                     ui.label(RichText::new("白吻合度").weak());
                     ui.label(RichText::new(white_cell).strong());
                 });
             })
-            .response.on_hover_text(format!("白方 {tip}"));
+            .response
+            .on_hover_text(format!("白方 {tip}"));
         });
         // 计数口径如实展示（沿用失误卡片「已分析 N / M 手」写法）：
         // 未分析的手不进吻合度分母，样本门槛 10 手。
@@ -1282,11 +1288,15 @@ fn worst_row(ui: &mut Ui, entry: crate::ui::analysis::WorstMove, action: &mut Pa
         ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
     let painter = ui.painter_at(rect);
     let hover = response.hovered() || response.is_pointer_button_down_on();
-    painter.rect_filled(rect, 5.0, if hover {
-        Color32::from_rgb(52, 57, 70)
-    } else {
-        Color32::from_rgb(39, 43, 53)
-    });
+    painter.rect_filled(
+        rect,
+        5.0,
+        if hover {
+            Color32::from_rgb(52, 57, 70)
+        } else {
+            Color32::from_rgb(39, 43, 53)
+        },
+    );
     // Good / Fine 的 severity_color 兜底灰（140,140,148）在行底色上偏暗、
     // 与 hover 亮字冲突，提亮为中性灰；疑问手及以上用原档位色不动。
     let text_color = match entry.severity {
@@ -1313,7 +1323,11 @@ fn worst_row(ui: &mut Ui, entry: crate::ui::analysis::WorstMove, action: &mut Pa
         entry.winrate_loss * 100.0,
         entry.score_loss,
         entry.severity.name(),
-        if entry.severity.is_marked() { "棋盘有标注" } else { "棋盘不标注" },
+        if entry.severity.is_marked() {
+            "棋盘有标注"
+        } else {
+            "棋盘不标注"
+        },
     ));
     if response.clicked() {
         *action = PanelAction::GotoTurn(entry.turn);
@@ -1335,7 +1349,9 @@ struct OverlayToggles {
 /// 不另写一套条件：否则「热度图关闭 / 候选无 ownership / 向量长度不符」
 /// 这些组合下标注会与棋盘不一致（标注说有层、棋盘上什么也没画）。
 fn heat_source_line(ui: &mut Ui, overlay: &Overlay, analysis: &AnalysisState) {
-    let Some(snapshot) = &analysis.snapshot else { return };
+    let Some(snapshot) = &analysis.snapshot else {
+        return;
+    };
     if !overlay.show_heat {
         return; // 热度图本身关闭：没有层需要标注
     }
@@ -1345,7 +1361,9 @@ fn heat_source_line(ui: &mut Ui, overlay: &Overlay, analysis: &AnalysisState) {
         .show_moves_heat
         .then_some(overlay.focus.as_ref())
         .flatten();
-    let Some((source, _)) = overlay::heat_source(snapshot, focus) else { return };
+    let Some((source, _)) = overlay::heat_source(snapshot, focus) else {
+        return;
+    };
     match source {
         overlay::HeatSource::Candidate(at) => {
             ui.label(
@@ -1424,51 +1442,199 @@ fn card_overlay(
             }
             ui.weak("黑优");
         });
-        ui.weak("圆圈大小 ∝ √visits，白环为主选点；热度深色 = 黑势、浅色 = 白势；\
-                 策略层靛蓝色块 ∝ 先验概率，只铺空点");
+        ui.weak(
+            "圆圈大小 ∝ √visits，白环为主选点；热度深色 = 黑势、浅色 = 白势；\
+                 策略层靛蓝色块 ∝ 先验概率，只铺空点",
+        );
         // 热度图来源行：与棋盘同源判定，说明当前画的是哪路数据。
         heat_source_line(ui, overlay, analysis);
     });
     toggles
 }
 
-/// 「整谱快扫」卡片：对当前线 0..=手数逐手低 visits 批量分析。
-/// 进行中显示进度条 + 已用时长 + 取消按钮；空闲时显示发起入口
-/// （总手数为 0 的空盘无谱可扫，入口置灰）。
+/// 「整谱快扫」卡片：可配置的批量分析（LizzieYzy「闪电分析设置」口径）。
+///
+/// 空闲态：折叠的设置区（起止手数 / 每手 visits / 只扫一方 / 含变着 /
+/// 扫完自动加深）+ 实时预估（局面数 / 预计耗时；含变着时局面数如实外推
+/// 到全树，宁可劝退）+ 发起按钮（空盘置灰）。
+/// 进行中：两阶段进度条（「主扫描 x/y」与「加深 z/N」分开显示）+ 取消。
+/// 配置编辑经 [`PanelAction::SetBatchConfig`] 转存进 [`AnalysisState`]，
+/// 发起与预估共用同一份配置、同一套钳制（`build_plan`）。
 fn card_batch(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &mut PanelAction) {
     card(ui, |ui| {
         theme::section_title(ui, "整谱快扫");
-        if let Some((done, total, elapsed)) = analysis.batch_progress() {
-            // 进度条 + 计数 / 时长：批量的主要反馈（曲线随进度同步填充）。
+        if let Some((deep, done, total, elapsed)) = analysis.batch_progress() {
+            // 进度条 + 阶段标注：主扫描与加深分开计数（批量口径变更后
+            // 总数是「过滤后的局面数」，不再恒等于手数）。
             ui.add(
                 egui::ProgressBar::new(done as f32 / total.max(1) as f32)
                     .show_percentage()
                     .desired_height(14.0),
             );
             ui.weak(format!(
-                "{done} / {total} 手 · 已用 {}",
+                "{} {done} / {total} · 已用 {}",
+                if deep { "加深" } else { "主扫描" },
                 crate::ui::analysis::format_batch_elapsed(elapsed),
             ));
             ui.add_space(2.0);
             if wide_button(ui, "取消快扫").clicked() {
                 *action = PanelAction::CancelBatch;
             }
-        } else {
-            ui.weak(format!(
-                "对当前线 {} 手逐手 {} visits 快扫，填满胜率曲线与失误统计。",
-                board.line_len(),
-                crate::ui::analysis::BATCH_VISITS,
-            ));
-            ui.add_space(2.0);
-            let empty = board.line_len() == 0;
-            let entry = ui.add_enabled(!empty, egui::Button::new("整谱快扫"));
-            if empty {
-                entry.on_disabled_hover_text("空盘无谱可扫");
-            } else if entry.clicked() {
-                *action = PanelAction::StartBatch;
+            return;
+        }
+        // ---- 配置编辑（空闲态；草稿在本地逐项改，帧末一次性转存）----
+        let mut draft = analysis.batch_config().clone();
+        let len = board.line_len();
+        let mut changed = false;
+        ui.collapsing("快扫设置", |ui| {
+            // 起止手数（1 基手数编辑；内部 0 基局面序号）。止手 ≤ 起手时
+            // 由发起端钳制（这里显示时也做同样钳制，保持所见即所扫）。
+            ui.horizontal(|ui| {
+                ui.weak("起手");
+                let from = (draft.from.min(len.saturating_sub(1)) + 1) as i32;
+                let mut from_edit = from;
+                if ui
+                    .add(egui::DragValue::new(&mut from_edit).range(1..=len as i32))
+                    .changed()
+                {
+                    draft.from = (from_edit.max(1) as usize - 1).min(len.saturating_sub(1));
+                    changed = true;
+                }
+                ui.weak("止手");
+                // to = usize::MAX 显示为线尾（编辑后落为具体值）。
+                let to_disp = draft.to.min(len) as i32;
+                let mut to_edit = to_disp;
+                if ui
+                    .add(egui::DragValue::new(&mut to_edit).range(1..=len as i32))
+                    .changed()
+                {
+                    draft.to = (to_edit.max(1) as usize).min(len);
+                    changed = true;
+                }
+            });
+            // 每手 visits：常用档位分段选择（当前值不在档位内则追加一个
+            // 「自定义」段显示真实值）。
+            ui.horizontal(|ui| {
+                ui.weak("每手visits");
+                for &visits in &[20u32, 40, 100, 300] {
+                    let selected = draft.visits == visits;
+                    if ui
+                        .add(egui::Button::selectable(selected, visits.to_string()))
+                        .clicked()
+                    {
+                        draft.visits = visits;
+                        changed = true;
+                    }
+                }
+                // 常用档位之外的可编辑数值：当前值不在档位内时格式化带
+                // 「自定」后缀提示（DragValue 无独立文字着色 API，不再硬造）。
+                let label = egui::DragValue::new(&mut draft.visits)
+                    .range(1..=10_000)
+                    .custom_formatter(|v, _| {
+                        if BATCH_VISITS_PRESETS.contains(&(v as u32)) {
+                            format!("{v}")
+                        } else {
+                            format!("{v} 自定")
+                        }
+                    })
+                    .custom_parser(|s| s.trim().parse::<f64>().ok().map(|v| v as u32 as f64));
+                if ui.add(label).changed() {
+                    draft.visits = draft.visits.max(1);
+                    changed = true;
+                }
+            });
+            // 只扫一方：只分析轮到该方行棋的局面（耗时砍半）。
+            ui.horizontal(|ui| {
+                ui.weak("扫");
+                for side in [BatchSide::All, BatchSide::BlackOnly, BatchSide::WhiteOnly] {
+                    let selected = draft.side == side;
+                    if ui
+                        .add(egui::Button::selectable(selected, side.name()))
+                        .clicked()
+                    {
+                        draft.side = side;
+                        changed = true;
+                    }
+                }
+            });
+            if ui
+                .checkbox(&mut draft.include_variations, "含变着（全树逐节点，慢）")
+                .changed()
+            {
+                changed = true;
             }
+            // 扫完自动加深差异手（默认开）：治 40 visits 下吻合度并列 0、
+            // 差异手排序噪声大的毛病。
+            if ui
+                .checkbox(&mut draft.deepen_enabled, "扫完自动加深差异手")
+                .changed()
+            {
+                changed = true;
+            }
+            if draft.deepen_enabled {
+                ui.horizontal(|ui| {
+                    ui.weak("前");
+                    if ui
+                        .add(egui::DragValue::new(&mut draft.deepen_top).range(1..=50))
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.weak("手，加深到");
+                    if ui
+                        .add(egui::DragValue::new(&mut draft.deepen_visits).range(1..=10_000))
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.weak("visits");
+                });
+            }
+            ui.weak(
+                "含变着时对每个节点分析「到该节点为止 + 该节点深度」，\
+                     局面数随分支线性增长；起止手数同样按节点深度过滤。",
+            );
+        });
+        // 预估（与发起共用同一实现）：局面数按当前配置如实展示，
+        // 「含变着」多分支时数字可能远大于手数，配以劝退提示。
+        let estimate = batch_estimate(board, &draft);
+        ui.weak(format!(
+            "预计 {} 个局面，约 {}",
+            estimate.positions,
+            format_estimate_secs(estimate.secs),
+        ));
+        if estimate.heavy() {
+            ui.colored_label(
+                theme::colors::WARN,
+                "局面较多，建议缩小起止范围或关闭「含变着」。",
+            );
+        }
+        ui.add_space(2.0);
+        if changed {
+            *action = PanelAction::SetBatchConfig(draft);
+        }
+        let empty = len == 0;
+        let entry = ui.add_enabled(!empty, egui::Button::new("开始快扫"));
+        if empty {
+            entry.on_disabled_hover_text("空盘无谱可扫");
+        } else if entry.clicked() {
+            *action = PanelAction::StartBatch;
         }
     });
+}
+
+/// 「每手 visits」的常用档位（侧栏分段选择 + 「自定义」编辑共存）。
+const BATCH_VISITS_PRESETS: [u32; 4] = [20, 40, 100, 300];
+
+/// 预估耗时的人类可读形式（秒级 < 60 直接给秒；超过给分钟 / 小时）。
+fn format_estimate_secs(secs: f64) -> String {
+    if secs < 60.0 {
+        format!("约 {secs:.0} 秒")
+    } else if secs < 3600.0 {
+        format!("约 {} 分", (secs / 60.0).ceil() as u32)
+    } else {
+        format!("约 {:.1} 小时", secs / 3600.0)
+    }
 }
 
 /// 「消息」卡片：各类用户可见提示（非法落子 / 载入另存 / 引擎错误 /

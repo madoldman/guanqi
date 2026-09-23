@@ -23,9 +23,9 @@
 
 use std::path::Path;
 
+use super::GameMeta;
 use super::load::{SIG_INIT, sig_with_record};
 use super::tree::{GameInfo, GameTree, Node as SgfNode, Property};
-use super::GameMeta;
 use crate::board::{Action, Board, Coord, MoveRecord, Stone};
 
 /// 「另存为」失败原因（可直接 `Display` 给用户看）。
@@ -68,23 +68,79 @@ impl std::error::Error for SaveError {
 ///
 /// `meta` 为已载入棋谱的元信息（对局信息 + 逐手注释），可 `None`：
 /// 空盘或未载入棋谱时也能存出合法的 SGF，此时只写通用属性与根摆子。
-pub fn board_to_sgf(board: &Board, meta: Option<&GameMeta>) -> String {
+/// `stats_block` 为「局后统计」根注释块（含首尾界标
+/// 的整段文本，`ui::analysis::stats_block_text` 产出）；`Some` 时按
+/// [`append_stats_block`] 的幂等语义合入根注释（不覆盖用户原有内容）。
+pub fn board_to_sgf(board: &Board, meta: Option<&GameMeta>, stats_block: Option<&str>) -> String {
     let info = meta.map(|m| &m.info);
     let mut tree = GameTree::default();
-    tree.nodes.push(build_root(board, info));
+    let mut root = build_root(board, info);
+    if let Some(block) = stats_block {
+        merge_stats_block(&mut root, block);
+    }
+    tree.nodes.push(root);
     extend_tree(board, 0, SIG_INIT, meta, &mut tree);
     tree.write()
 }
 
 /// 序列化并写入文件（UTF-8 无 BOM；文本由 [`GameTree::write`] 生成）。
 /// 落盘为原子写（见 [`write_atomically`]），失败时已有文件不受影响。
+/// `stats_block` 语义见 [`board_to_sgf`]。
 pub fn save_to_file(
     path: &Path,
     board: &Board,
     meta: Option<&GameMeta>,
+    stats_block: Option<&str>,
 ) -> Result<(), SaveError> {
-    let text = board_to_sgf(board, meta);
+    let text = board_to_sgf(board, meta, stats_block);
     write_atomically(path, &text)
+}
+
+/// 把统计块合入根节点的 `C[]`（幂等）：根注释原有的用户内容**原样保留**，
+/// 统计块以界标（【观棋统计】…【/观棋统计】）定位——
+/// - 根注释不存在 / 为空：新建根注释，只含统计块；
+/// - 根注释里没有块：在原注释与统计块之间以一个空行衔接后**追加**；
+/// - 根注释里已有块（重复另存）：**替换**界标区间内的全部内容（含两个
+///   界标本身），区间外用户内容不动——绝不出现两份统计块。
+///
+/// 根节点可能存在多个 C 属性（罕见但合法）；写入目标取第一个，替换 /
+/// 追加都在它身上进行，其余原样保留，避免重排用户数据。
+fn merge_stats_block(root: &mut SgfNode, block: &str) {
+    let begin = crate::ui::analysis::STATS_BLOCK_BEGIN;
+    let end = crate::ui::analysis::STATS_BLOCK_END;
+    let pos = root.props.iter().position(|prop| prop.ident == "C");
+    let Some(pos) = pos else {
+        root.props.push(prop("C", block));
+        return;
+    };
+    // 解析器保证属性至少有一个值（`parse_node` 对空值集直接报错），这里
+    // 仍用 first_mut 而非直接下标——与全仓其余取值处（tree.rs 一律 first()）
+    // 保持一致，不给未来某条构造路径留 panic 面。
+    let values = &mut root.props[pos].values;
+    if values.is_empty() {
+        values.push(String::new());
+    }
+    let Some(comment) = values.first_mut() else { return };
+    if let Some(start) = comment.find(begin) {
+        // 已有统计块：替换到结束界标为止（结束界标缺失时替换到注释末尾
+        // ——半截块同样按幂等处理，不留下孤儿开头）。
+        let tail_start = comment[start..]
+            .find(end)
+            .map_or(comment.len(), |off| start + off + end.len());
+        let mut merged = String::with_capacity(comment.len() + block.len());
+        merged.push_str(&comment[..start]);
+        merged.push_str(block);
+        merged.push_str(&comment[tail_start..]);
+        *comment = merged;
+    } else {
+        // 没有块：追加（原注释与块之间空一行，保持可读）。
+        comment.push_str(if comment.ends_with('\n') || comment.is_empty() {
+            "\n"
+        } else {
+            "\n\n"
+        });
+        comment.push_str(block);
+    }
 }
 
 /// 原子落盘：先写**同目录**的临时文件（`原名.tmp`），再 `rename` 覆盖
@@ -187,14 +243,19 @@ fn build_root(board: &Board, info: Option<&GameInfo>) -> SgfNode {
         .and_then(|&id| board.nodes()[id].record())
         .map(|record| record.player)
         .or_else(|| info.and_then(|i| i.initial_player))
-        .unwrap_or(if has_setup { Stone::White } else { Stone::Black });
+        .unwrap_or(if has_setup {
+            Stone::White
+        } else {
+            Stone::Black
+        });
 
     let mut node = SgfNode::default();
     // 通用属性：对局类型 / SGF 版本 / 字符集 / 产生程序 / 棋盘尺寸。
     node.props.push(prop("GM", "1"));
     node.props.push(prop("FF", "4"));
     node.props.push(prop("CA", "UTF-8"));
-    node.props.push(prop("AP", concat!("Guanqi:", env!("CARGO_PKG_VERSION"))));
+    node.props
+        .push(prop("AP", concat!("Guanqi:", env!("CARGO_PKG_VERSION"))));
     node.props.push(prop("SZ", &size.n().to_string()));
     if let Some(info) = info {
         // KM / HA / PL 只在语义非缺省时写：贴目 0、无让子、以及与
@@ -206,7 +267,11 @@ fn build_root(board: &Board, info: Option<&GameInfo>) -> SgfNode {
         if info.handicap > 1 {
             node.props.push(prop("HA", &info.handicap.to_string()));
         }
-        let conventional = if has_setup { Stone::White } else { Stone::Black };
+        let conventional = if has_setup {
+            Stone::White
+        } else {
+            Stone::Black
+        };
         if first_player != conventional {
             let letter = match first_player {
                 Stone::Black => "B",
