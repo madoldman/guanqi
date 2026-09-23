@@ -71,6 +71,36 @@ cargo build --release     # 发布构建，产物 target/release/guanqi
 
 Arch 用户可参考 `packaging/arch/PKGBUILD` 自行打包安装。
 
+## Headless 验证工具
+
+`examples/headless.rs` 是不开窗口的交互验证工具：用 `egui::Context`
+逐帧驱动 `logic()` 与 `ui()`，输入全部走 `egui::RawInput`（不用外部注入
+工具），引擎仍是**真实 katago 子进程**。用于验证状态机、时序与控件
+行为，并输出结构化状态快照供断言。
+
+```bash
+cargo run --release --example headless              # 跑内置自证脚本
+cargo run --release --example headless -- 脚本.txt   # 跑自己的脚本
+cargo run --release --example headless -- -          # 从 stdin 读脚本
+```
+
+脚本动作：`wait` / `click` / `click_label` / `rclick` / `drag` / `wheel`
+/ `key` / `keys` / `load` / `save` / `dump` / `probe` / `viewport` /
+`quit`。完整语法、坐标标定方法与边界说明见文件头注释。
+
+要点：
+
+- **优先用 `click_label` 而非坐标**。侧栏是滚动容器，且内容高度随
+  异步引擎结果浮动，同一控件的 y 坐标在两次运行间能差几百 points，
+  硬编码坐标只在单次运行内有效。
+- **滚动与点击前要让滚动停稳**。egui 的滚轮带平滑衰减，控件矩形反映
+  的是上一帧，滚动未停时取到的坐标必然滞后（表现为点击打空）。
+- 帧间真 sleep（默认 30ms），批量推进 / 心跳 / 时限按真实墙钟计算，
+  不伪造时序。
+- 配置隔离：运行期把 `XDG_CONFIG_HOME` 指向 `/tmp` 下的独占目录，
+  **不碰真实的 `~/.config/guanqi/`**。
+- **不做视觉验证**：不覆盖渲染、字体与合成器差异，视觉观感需人工看。
+
 ## 快捷键
 
 | 操作 | 按键 |

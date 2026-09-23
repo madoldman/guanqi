@@ -163,8 +163,11 @@ pub struct GuanqiApp {
     /// viewport 命令只能在持有 `Ui`/`Context` 时发出——用标志把「确认」
     /// 与「发命令」解耦到相邻两帧。
     exit_requested: bool,
-    /// 最近发出的 viewport 命令（e2e 驱动 dump 用；应用路径上只追加，
-    /// 由驱动在 dump 后清空）。
+    /// `Close` 是否已经发出（避免每帧重复发同一条命令，见
+    /// [`Self::handle_close_request`]）。
+    close_sent: bool,
+    /// 最近发出的 viewport 命令（headless 工具 dump 用；应用路径上只追加，
+    /// 由工具在 dump 后清空）。
     last_viewport_commands: std::cell::RefCell<Vec<egui::ViewportCommand>>,
     /// 偏好（界面开关 / 窗口几何）脏标记 + 防抖截止时刻：改动后停稳
     /// [`PREFS_SAVE_DEBOUNCE`] 才落盘，退出时无条件补写（子项 1/2 共用）。
@@ -172,8 +175,10 @@ pub struct GuanqiApp {
 }
 
 /// 等待中的对话框用途：打开与保存各自独立接结果，互不串线。
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PendingDialog {
+/// `PartialEq` 仅供 headless 工具按用途注入 portal 事件。
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PendingDialog {
     /// 等待用户选择要打开的棋谱。
     Open,
     /// 等待用户确认另存位置。
@@ -409,6 +414,7 @@ impl GuanqiApp {
             unsaved_confirm: None,
             post_save: PostSaveAction::None,
             exit_requested: false,
+            close_sent: false,
             last_viewport_commands: std::cell::RefCell::new(Vec::new()),
             prefs_dirty_since: None,
         }
@@ -445,9 +451,18 @@ impl GuanqiApp {
     /// 若被取消，后续必须由我们主动再请求。`on_exit` 的设置落盘在
     /// eframe 收到 Close、运行时退出时执行，此流程不拦它。
     fn handle_close_request(&mut self, ctx: &egui::Context) {
-        // 上一帧已确认退出（或另存后续完成）：发真正的关闭命令。
+        // 已确认退出（或另存后续完成）：发真正的关闭命令。
+        //
+        // **只发一次**：`exit_requested` 是粘性标志，原先每帧都重发一次 Close
+        // ——真机上窗口随即关闭、无害，但这会让后续帧持续产生冗余命令
+        // （headless 工具里观察到一次退出发了 21 条 Close），既脏也干扰该
+        // 字段的观察用途。真正需要重试的是被取消的关闭请求（下方的
+        // CancelClose 分支已覆盖），不是这里。
         if self.exit_requested {
-            self.send_viewport(ctx, egui::ViewportCommand::Close);
+            if !self.close_sent {
+                self.close_sent = true;
+                self.send_viewport(ctx, egui::ViewportCommand::Close);
+            }
             return;
         }
         let close_requested = ctx.input(|i| i.viewport().close_requested());
@@ -465,7 +480,7 @@ impl GuanqiApp {
         // 干净：不取消，eframe 按默认流程退出（on_exit 落盘设置）。
     }
 
-    /// 发 viewport 命令并留档（e2e 驱动断言用；留档不影响应用语义）。
+    /// 发 viewport 命令并留档（headless 工具断言用；留档不影响应用语义）。
     fn send_viewport(&mut self, ctx: &egui::Context, command: egui::ViewportCommand) {
         self.last_viewport_commands.borrow_mut().push(command.clone());
         ctx.send_viewport_cmd(command);
@@ -672,7 +687,7 @@ impl GuanqiApp {
         }
     }
 
-    /// 从字节流载入棋谱（[`Self::load_game`] 的读盘后半段；e2e 驱动
+    /// 从字节流载入棋谱（[`Self::load_game`] 的读盘后半段；headless 工具
     /// 复用以绕开 portal 对话框）。解析失败时**保留原棋盘**，只提示错误。
     fn load_game_from_bytes(&mut self, path: PathBuf, bytes: Vec<u8>) {
         match load_from_bytes(&path, &bytes) {
@@ -2269,200 +2284,278 @@ fn result_letter(winner: Stone) -> &'static str {
     }
 }
 
-// ---- 临时 e2e 打洞层（仅供 examples/e2e_driver.rs 驱动验证，交付前与
-// 驱动一并删除；绝不在应用自身路径上调用）。----
+// ---- headless 工具入口（仅供 examples/headless.rs 驱动验证；应用自身
+// 路径绝不调用）。刻意保持极小：无窗口构造复用 [`Self::new_with_prefs`]，
+// 请求退出与状态快照两个只读/单向操作，不含任何行为捷径——脚本驱动的
+// 落子 / 保存 / 对话框事件一律走真实 UI 事件（RawInput / portal 注入）。----
+
+/// [`GuanqiApp`] 的结构化状态快照（headless 工具的 dump 数据源）。
+///
+/// 库内不做任何打印：格式化 / 汇报由 `examples/` 的工具负责。字段覆盖
+/// 「够用即可」的黑盒验证面：文档与脏标记、引擎状态与最近读数、对弈
+/// 模式与时钟、快扫进度、候选显示门控、消息区文本、面板开关与最近
+/// 发出的 viewport 命令。
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct StateSnapshot {
+    /// 当前文档来源路径（未载入棋谱 / 新对局时为占位或实际存盘路径）。
+    pub source: Option<String>,
+    /// 棋盘尺寸（路数）。
+    pub size: usize,
+    /// 当前线总手数。
+    pub line_len: usize,
+    /// 游标位置（0 基局面序号；== line_len 表示在活子位置）。
+    pub cursor: usize,
+    /// 全树着法数（含变着分支）。
+    pub tree_moves: usize,
+    /// 未保存改动标记（record_rev != saved_rev）。
+    pub dirty: bool,
+    /// 引擎状态机的字符串形态（`unconfigured` / `starting` / `ready` /
+    /// `failed`）。
+    pub engine_status: String,
+    /// 引擎最近读数（展示快照的根信息；流式中间报告也会出现）。
+    pub engine_reads: Option<EngineReads>,
+    /// 当前局面候选点数。
+    pub candidates: usize,
+    /// 引擎瞬时错误（查询被拒 / 超时等；引擎仍可用）。
+    pub transient_error: Option<String>,
+    /// 最近一条引擎日志（诊断用）。
+    pub last_log: Option<String>,
+    /// 对弈模式是否开启。
+    pub play_mode: bool,
+    /// 人类执子（`B` / `W`）。
+    pub human: String,
+    /// 认输方（`B` / `W`）；对局因认输结束时非空。
+    pub resigned: Option<String>,
+    /// 超时判负方；与认输并列的独立终局路径。
+    pub timeout_loss: Option<String>,
+    /// 对局是否已结束（认输 / 超时 / 双方连续弃着）。
+    pub play_finished: bool,
+    /// 双方主时间（黑, 白，秒）。
+    pub clock_main: (f64, f64),
+    /// 双方累计用时（黑, 白，秒）。
+    pub clock_total: (f64, f64),
+    /// 快扫进度：`(加深阶段, 已完成, 总数, 已用时)`；`None` = 空闲。
+    pub batch_progress: Option<(bool, usize, usize, f64)>,
+    /// 候选类显示门控（`immediate` / `delayed` / `manual`）。
+    pub gating: String,
+    /// 手动门控下「已按 F」标志。
+    pub manual_revealed: bool,
+    /// 门控判定：候选类内容当前是否可见（与绘制路径同一判定函数）。
+    pub candidates_visible: bool,
+    /// 消息区文本（按入队先后，最旧在前；上限 [`analysis_panel::MAX_NOTICES`]）。
+    pub notices: Vec<String>,
+    /// 各面板 / 窗口开关。
+    pub toggles: Toggles,
+    /// 当前生效贴目。
+    pub komi: f64,
+    /// 最近发出的 viewport 命令（读取即清空；与驱动「dump 后清」的旧
+    /// 语义一致）。
+    pub viewport_commands: Vec<String>,
+}
+
+/// 引擎最近一次读数（展示快照的根信息）。
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct EngineReads {
+    /// 该快照对应的手数（发起查询时的游标）。
+    pub turn: usize,
+    /// 报告是否为终态（`false` = 流式中间报告，还会更新）。
+    pub is_final: bool,
+    /// 搜索量。
+    pub visits: u64,
+    /// 黑方胜率 [0,1]。
+    pub winrate: f64,
+    /// 黑方目差（正 = 黑领先）。
+    pub score_lead: f64,
+}
+
+/// 面板 / 窗口开关集合（dump 用）。
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct Toggles {
+    /// 叠加层各开关。
+    pub show_candidates: bool,
+    pub show_heat: bool,
+    pub show_policy: bool,
+    pub show_moves_heat: bool,
+    pub show_mistakes: bool,
+    pub show_score_lead: bool,
+    pub show_mini_board: bool,
+    /// 底部面板。
+    pub curve_open: bool,
+    pub tree_open: bool,
+    /// 浮动窗口。
+    pub settings_open: bool,
+    pub new_game_open: bool,
+}
 
 impl GuanqiApp {
-    /// 状态 dump（黑盒验证用）：关键内部状态打印到 stdout。
+    /// 请求退出应用：下一帧 `ui` 顶部经未保存守卫后发出
+    /// [`egui::ViewportCommand::Close`]（脏文档会先被既有确认条拦下，
+    /// 与真实关窗语义一致）。headless 工具的 `quit` 动作落点。
     #[doc(hidden)]
-    pub fn e2e_dump(&self, label: &str) {
-        let (rev, saved) = (self.board.record_rev(), self.saved_rev);
-        println!("---- {label} ----");
-        println!(
-            "  dirty={} (record_rev={rev}, saved_rev={saved})",
-            self.is_dirty()
-        );
-        println!(
-            "  play.mode={} human={:?} resigned={:?} timeout_loss={:?} clock_system={:?}",
-            self.play.mode,
-            self.play.human,
-            self.play.resigned,
-            self.play.timeout_loss,
-            self.play.clock.system,
-        );
-        println!(
-            "  clock main B/W = {:.1}/{:.1} total B/W = {:.1}/{:.1}",
-            self.play.clock.sides[0].main,
-            self.play.clock.sides[1].main,
-            self.play.clock.total[0],
-            self.play.clock.total[1],
-        );
-        println!(
-            "  exit_requested={exit} unsaved_confirm={unsaved:?} post_save={post:?} new_game_open={ngo} dialog_waiting={dlg}",
-            exit = self.exit_requested,
-            unsaved = self.unsaved_confirm,
-            post = self.post_save,
-            ngo = self.new_game_open,
-            dlg = self.dialog.is_some(),
-        );
-        println!(
-            "  confirm_text = {}",
-            match self.unsaved_confirm {
-                Some(confirm) => confirm.text(),
-                None => "（无确认条）".to_owned(),
-            }
-        );
-        // 最近 2 条消息区提示（确认文案与出口动作的用户可见面）。
-        let texts: Vec<String> =
-            self.notices.iter().map(|n| n.text().to_owned()).collect();
-        println!("  notices(尾 2) = {texts:?}");
-        let commands: Vec<String> = self
-            .last_viewport_commands
-            .borrow()
-            .iter()
-            .map(|c| format!("{c:?}"))
-            .collect();
-        println!("  viewport_cmds_since_last_dump = {commands:?}");
-        self.last_viewport_commands.borrow_mut().clear();
+    pub fn request_exit(&mut self) {
+        self.exit_requested = true;
     }
 
-    /// 直接开始新对局（等价新对局窗口「开始」按钮的最终提交）。
+    /// 注入 portal 对话框事件（headless 工具的 load / save 落点）：
+    /// 等价用户在原生对话框选中 / 取消。先清等待槽再分发——与 `logic`
+    /// 每帧取事件的顺序一致（取出即清槽，事件处理器内的后续动作不会
+    /// 被「已有对话框在等待」守卫拦下）。
     #[doc(hidden)]
-    pub fn e2e_new_game(&mut self, setup: crate::play::GameSetup) {
-        // 与窗口入口同一条守卫链：副本研究 → 脏 → 直接执行。
-        if self.research_moves() > 0 {
-            self.pending_confirm = PendingConfirm::NewGame(setup);
-        } else if self.is_dirty() {
-            self.unsaved_confirm = Some(UnsavedConfirm::NewGame(setup));
-        } else {
-            self.start_new_game(setup);
-        }
-    }
-
-    /// 直接落子（绕过绘制几何，等价棋盘点击成功路径）。
-    #[doc(hidden)]
-    pub fn e2e_place(&mut self, at: crate::board::Coord) {
-        let _ = self.board.play(at);
-    }
-
-    /// 直接另存（等价 portal 另存对话框选中路径的落盘段）。
-    #[doc(hidden)]
-    pub fn e2e_save(&mut self, path: std::path::PathBuf) {
-        self.save_game(path);
-    }
-
-    /// 直接载入（等价 portal 打开对话框选中路径的读盘段）。
-    #[doc(hidden)]
-    pub fn e2e_load(&mut self, path: std::path::PathBuf, bytes: Vec<u8>) {
-        self.load_game_from_bytes(path, bytes);
-    }
-
-    /// 触发「打开棋谱」入口（守卫链生效）。
-    #[doc(hidden)]
-    pub fn e2e_open_dialog(&mut self) {
-        self.open_file_dialog();
-    }
-
-    /// 确认条出口：「先另存再继续」。
-    #[doc(hidden)]
-    pub fn e2e_unsaved_verdict_save_then(&mut self) {
-        if self.unsaved_confirm.is_some() {
-            let confirm = self.unsaved_confirm.take().expect("Some");
-            let then = match confirm {
-                UnsavedConfirm::Exit => PostSaveAction::Exit,
-                UnsavedConfirm::NewGame(setup) => PostSaveAction::NewGame(setup),
-                UnsavedConfirm::OpenDialog => PostSaveAction::OpenDialog,
-            };
-            self.save_file_dialog_then(then);
-            if self.post_save == PostSaveAction::None {
-                self.unsaved_confirm = Some(confirm);
-            }
-        }
-    }
-
-    /// 确认条出口：「不保存继续」。
-    #[doc(hidden)]
-    pub fn e2e_unsaved_verdict_discard(&mut self) {
-        if let Some(confirm) = self.unsaved_confirm.take() {
-            match confirm {
-                UnsavedConfirm::Exit => self.exit_requested = true,
-                UnsavedConfirm::NewGame(setup) => self.start_new_game(setup),
-                UnsavedConfirm::OpenDialog => self.open_file_dialog_now(),
-            }
-        }
-    }
-
-    /// 取消退出（驱动续跑用）。
-    #[doc(hidden)]
-    pub fn e2e_cancel_exit(&mut self) {
-        self.exit_requested = false;
-    }
-
-    /// 悔棋（等价 Ctrl+Z 复盘语义）。
-    #[doc(hidden)]
-    pub fn e2e_undo(&mut self) {
-        let _ = self.board.undo();
-    }
-
-    /// 直接注入另存对话框的 portal 事件（等价用户在对话框确认 / 取消）。
-    /// 先清等待槽再分发——与 `logic` 每帧取事件的顺序一致（取出即清槽，
-    /// 事件处理器内的后续发起不会被「已有对话框在等待」守卫拦下）。
-    #[doc(hidden)]
-    pub fn e2e_portal_save_event(&mut self, event: crate::portal::PortalEvent) {
+    pub fn inject_portal_event(&mut self, kind: PendingDialog, event: PortalEvent) {
         self.dialog = None;
-        self.on_portal_event(PendingDialog::Save, event);
+        self.on_portal_event(kind, event);
     }
 
-    /// 确认条出口：「取消」。
+    /// 退出收尾（headless 工具跑完脚本后调用）：与 eframe 运行时退出
+    /// 时同款的偏好补写与引擎进程关闭。
     #[doc(hidden)]
-    pub fn e2e_unsaved_verdict_cancel(&mut self) {
-        self.unsaved_confirm = None;
+    pub fn on_exit_shim(&mut self) {
+        eframe::App::on_exit(self);
     }
 
-    /// 在已载入谱上开启对弈（等价侧栏「人机对弈」开关 + 设置时钟）。
+    /// 取当前状态的结构化快照（headless 工具的 dump 数据源）。
+    /// `viewport_commands` 读取即清空（发送留档只在两次 dump 之间累积）。
     #[doc(hidden)]
-    pub fn e2e_start_play(&mut self, setup: crate::play::GameSetup) {
-        self.play = PlayState::new_game(&setup);
-        self.active_rules = Some(setup.rules.wire().to_owned());
-        self.komi = setup.komi;
-    }
-
-    /// 从当前手创建研究副本（内部路径直通）。
-    #[doc(hidden)]
-    pub fn e2e_create_copy(&mut self) {
-        self.create_copy();
-    }
-
-    /// 切回原谱（内部路径直通）。
-    #[doc(hidden)]
-    pub fn e2e_switch_to_original(&mut self) {
-        self.switch_to_original();
-    }
-
-    /// 「让引擎认输」（等价无望提示区的按钮动作）。
-    #[doc(hidden)]
-    pub fn e2e_engine_resign(&mut self) {
-        if self.play.mode && !self.play.finished(&self.board) {
-            self.engine_resign();
+    pub fn state_snapshot(&self) -> StateSnapshot {
+        use crate::ui::analysis::CandidateGating;
+        let gating = self.analysis.gating();
+        StateSnapshot {
+            source: self
+                .loaded
+                .as_ref()
+                .map(|meta| meta.source.display().to_string()),
+            size: usize::from(self.board.size().n()),
+            line_len: self.board.line_len(),
+            cursor: self.board.cursor(),
+            tree_moves: self.board.move_count(),
+            dirty: self.is_dirty(),
+            engine_status: match self.analysis.engine {
+                crate::ui::analysis::EngineStatus::Unconfigured => "unconfigured",
+                crate::ui::analysis::EngineStatus::Starting => "starting",
+                crate::ui::analysis::EngineStatus::Ready => "ready",
+                crate::ui::analysis::EngineStatus::Failed(_) => "failed",
+            }
+            .to_owned(),
+            engine_reads: self.analysis.snapshot.as_ref().map(|snap| EngineReads {
+                turn: snap.turn,
+                is_final: snap.is_final,
+                visits: snap.root.as_ref().map_or(0, |r| r.visits),
+                winrate: snap.root.as_ref().map_or(0.0, |r| r.winrate),
+                score_lead: snap.root.as_ref().map_or(0.0, |r| r.score_lead),
+            }),
+            candidates: self
+                .analysis
+                .snapshot
+                .as_ref()
+                .map_or(0, |snap| snap.moves.len()),
+            transient_error: self.analysis.transient_error.clone(),
+            last_log: self.analysis.last_log.clone(),
+            play_mode: self.play.mode,
+            human: self.play.human.name().to_owned(),
+            resigned: self.play.resigned.map(|s| s.name().to_owned()),
+            timeout_loss: self.play.timeout_loss.map(|s| s.name().to_owned()),
+            play_finished: self.play.finished(&self.board),
+            clock_main: (
+                self.play.clock.sides[0].main,
+                self.play.clock.sides[1].main,
+            ),
+            clock_total: (self.play.clock.total[0], self.play.clock.total[1]),
+            batch_progress: self
+                .analysis
+                .batch_progress()
+                .map(|(deep, done, total, elapsed)| (deep, done, total, elapsed.as_secs_f64())),
+            gating: match gating {
+                CandidateGating::Immediate => "immediate",
+                CandidateGating::Delayed { .. } => "delayed",
+                CandidateGating::Manual => "manual",
+            }
+            .to_owned(),
+            manual_revealed: self.manual_revealed,
+            candidates_visible: self.analysis.candidates_visible(self.manual_revealed),
+            notices: self.notices.iter().map(|n| n.text().to_owned()).collect(),
+            toggles: Toggles {
+                show_candidates: self.overlay.show_candidates,
+                show_heat: self.overlay.show_heat,
+                show_policy: self.overlay.show_policy,
+                show_moves_heat: self.overlay.show_moves_heat,
+                show_mistakes: self.overlay.show_mistakes,
+                show_score_lead: self.overlay.show_score_lead,
+                show_mini_board: self.overlay.show_mini_board,
+                curve_open: self.curve_open,
+                tree_open: self.tree_open,
+                settings_open: self.settings_open,
+                new_game_open: self.new_game_open,
+            },
+            komi: self.komi,
+            viewport_commands: std::mem::take(
+                &mut *self.last_viewport_commands.borrow_mut(),
+            )
+            .into_iter()
+            .map(|c| format!("{c:?}"))
+            .collect(),
         }
     }
+}
 
-    /// 人类认输（等价侧栏「认输」按钮动作）。
-    #[doc(hidden)]
-    pub fn e2e_human_resign(&mut self) {
-        if self.play.mode && !self.play.finished(&self.board) {
-            let loser = self.play.human;
-            self.play.resigned = Some(loser);
-            let winner = loser.opposite();
-            let result = format!("{}+R", result_letter(winner));
-            let text = format!(
-                "{}认输：{}（{}）。对局已结束，可继续复盘浏览。",
-                loser.name(),
-                play::resign_text(loser),
-                result
-            );
-            self.finish_game(result, text, None);
-        }
+impl StateSnapshot {
+    /// 单行 JSON 序列化（`serde_json` 已在依赖树内；库类型本身不派生
+    /// serde，序列化面集中在这里，格式化与展示仍归 examples 工具）。
+    pub fn to_json(&self) -> String {
+        serde_json::json!({
+            "source": self.source,
+            "size": self.size,
+            "line_len": self.line_len,
+            "cursor": self.cursor,
+            "tree_moves": self.tree_moves,
+            "dirty": self.dirty,
+            "engine_status": self.engine_status,
+            "engine_reads": self.engine_reads.map(|r| serde_json::json!({
+                "turn": r.turn,
+                "is_final": r.is_final,
+                "visits": r.visits,
+                "winrate": r.winrate,
+                "score_lead": r.score_lead,
+            })),
+            "candidates": self.candidates,
+            "transient_error": self.transient_error,
+            "last_log": self.last_log,
+            "play_mode": self.play_mode,
+            "human": self.human,
+            "resigned": self.resigned,
+            "timeout_loss": self.timeout_loss,
+            "play_finished": self.play_finished,
+            "clock_main": self.clock_main,
+            "clock_total": self.clock_total,
+            "batch_progress": self
+                .batch_progress
+                .map(|(deep, done, total, secs)| serde_json::json!({
+                    "deepening": deep, "done": done, "total": total,
+                    "elapsed_secs": secs,
+                })),
+            "gating": self.gating,
+            "manual_revealed": self.manual_revealed,
+            "candidates_visible": self.candidates_visible,
+            "notices": self.notices,
+            "toggles": {
+                "show_candidates": self.toggles.show_candidates,
+                "show_heat": self.toggles.show_heat,
+                "show_policy": self.toggles.show_policy,
+                "show_moves_heat": self.toggles.show_moves_heat,
+                "show_mistakes": self.toggles.show_mistakes,
+                "show_score_lead": self.toggles.show_score_lead,
+                "show_mini_board": self.toggles.show_mini_board,
+                "curve_open": self.toggles.curve_open,
+                "tree_open": self.toggles.tree_open,
+                "settings_open": self.toggles.settings_open,
+                "new_game_open": self.toggles.new_game_open,
+            },
+            "komi": self.komi,
+            "viewport_commands": self.viewport_commands,
+        })
+        .to_string()
     }
 }
 
