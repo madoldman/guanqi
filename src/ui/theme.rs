@@ -82,10 +82,17 @@ pub fn visuals() -> Visuals {
     visuals.weak_text_alpha = 0.65;
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(198, 203, 213));
 
-    // 选中态（selectable_label / 文本选择）：琥珀半透明底 + 琥珀文字。
+    // 选中态（selectable_label / 文本选择）：琥珀薄底 + 浅琥珀文字。
+    //
+    // ⚠️ 底色必须用 `from_rgba_unmultiplied`：早先写成
+    // `from_rgba_premultiplied(255, 170, 40, 60)` —— 该 API 要求 RGB **已按 alpha 预乘**，
+    // 这里却传了未预乘的琥珀值，合成时亮度被再放大一遍 ⇒ 渲染成**高饱和亮黄底**，
+    // 再叠琥珀色选中文字就是「黄底黄字」。egui 的输入框聚焦即全选内容，
+    // 于是表现为「填数字时整格看不清」（作者 2026-09-23 报的 bug）。
+    // 文字同时改浅琥珀，保证在琥珀薄底上依然清晰。
     visuals.selection = Selection {
-        bg_fill: Color32::from_rgba_premultiplied(255, 170, 40, 60),
-        stroke: Stroke::new(1.0, Color32::from_rgb(255, 196, 96)),
+        bg_fill: Color32::from_rgba_unmultiplied(255, 170, 40, 70),
+        stroke: Stroke::new(1.0, Color32::from_rgb(255, 236, 200)),
     };
 
     // 控件三态：底色渐亮 + 琥珀描边浮现（hover 起）。
