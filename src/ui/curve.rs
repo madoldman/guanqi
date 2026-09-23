@@ -10,8 +10,11 @@
 //!   （与棋盘候选点同一胜率映射）；
 //! - 失误联动：损失达到疑问手及以上的手数，曲线点改用
 //!   [`overlay::severity_color`] 并稍加大，一眼看出曲线在哪一段跳水；
-//! - 胜率一律**黑方视角**（`reportAnalysisWinratesAs = BLACK`），不翻转，
-//!   标题与提示文案均注明；
+//! - 胜率按**当前显示视角**逐点换算（[`AnalysisState::display_view`]）：
+//!   黑视角恒按存储值画；「黑白交替」时轮白的点显示 `1−w`（目差取负），
+//!   轮黑的点原样——换算经 [`analysis::display_values`]（全仓唯一入口），
+//!   点的行棋方取 [`HistoryPoint::to_play`]。悬停读数同步换算；
+//!   **损失类数字不换算**（损失是「行棋方亏损多少」，与显示视角无关）；
 //! - 目差折线（可开关）：与胜率线同一数据源（`HistoryPoint::score_lead`，
 //!   黑方视角），**虚线 + 暖色**与胜率实线肉眼可分；纵轴按**对称于 0 的
 //!   目差刻度**独立换算（见 [`score_scale`]），右侧标注刻度值，左侧仍是
@@ -25,7 +28,7 @@ use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Response, Sense, Stroke
 
 use crate::board::Board;
 
-use super::analysis::{loss_from_points, AnalysisState, HistoryPoint, MoveLoss};
+use super::analysis::{display_values, loss_from_points, AnalysisState, HistoryPoint, MoveLoss};
 use super::overlay;
 
 /// 曲线区四周留白：轴标注与标题占用（右侧加宽给目差刻度）。
@@ -64,11 +67,11 @@ const DASH_GAP: f32 = 4.0;
 /// 取整只会**放大**跨度，数据永不因取整出界。返回值恒 > 0。
 /// 目差 y 换算：`y = plot.center().y - v / span * plot.height() / 2`
 /// （正目差 = 黑优 = 上方，与胜率「高 = 黑优」方向一致）。
-pub fn score_scale(points: &[HistoryPoint]) -> f64 {
-    let raw = points
-        .iter()
-        .map(|p| p.score_lead.abs())
-        .fold(SCORE_SPAN_MIN, f64::max);
+///
+/// 输入为**显示值**（黑视角或按点换算后的目差），与折线同一口径；
+/// 黑视角下 `HistoryPoint` 数组可直接传入。
+pub fn score_scale(values: &[f64]) -> f64 {
+    let raw = values.iter().map(|v| v.abs()).fold(SCORE_SPAN_MIN, f64::max);
     nice_ceiling(raw)
 }
 
@@ -107,15 +110,25 @@ fn nice_decimals(span: f64) -> usize {
 /// 面板隐藏时不进入本函数，零额外计算。`show_score_lead` 为目差折线
 /// 开关（关闭时不计算刻度、零绘制开销）。
 pub fn show(ui: &mut Ui, analysis: &AnalysisState, board: &Board, show_score_lead: bool) {
+    // 显示视角：黑视角（默认）按存储值画；「黑白交替」时轮白的点换算
+    // （轮黑点原样）。换算只发生在绘制与悬停读数，数据本身不动。
+    let view = analysis.display_view();
     // 横轴取**当前线**长度（棋谱树里变着分支各成一条线，与棋盘显示口径一致）。
     let total = board.line_len();
     // 当前线上的历史点（下标 = 手数，0 = 初始空盘）：历史缓冲按局面签名
     // 存储，这里只取当前线各局面各自的数据，同手数的分支互不掺混。
+    // 每点先按显示视角换算成 (winrate, score_lead) 显示值（原值仅在
+    // 悬停 visits / 损失派生处仍按存储口径使用）。
     let slots = analysis.line_points(board);
-    // 已知点（按手数升序）。
+    // 已知点（按手数升序）与对应的显示值（同下标平行）。
     let known: Vec<HistoryPoint> = slots.iter().filter_map(|p| *p).collect();
+    let shown: Vec<(f64, f64)> = known
+        .iter()
+        .map(|p| display_values(view, p.to_play, p.winrate, p.score_lead))
+        .collect();
     // 每手损失（与 known 按下标平行；第 0 手或两端数据不全为 `None`），
     // 曲线着色与悬停提示共用，避免同一手重复派生。
+    // 损失是「行棋方亏损多少」，不随显示视角换算（与原始数据差分等价）。
     let losses: Vec<Option<MoveLoss>> = known
         .iter()
         .map(|p| {
@@ -153,18 +166,24 @@ pub fn show(ui: &mut Ui, analysis: &AnalysisState, board: &Board, show_score_lea
         return; // 面板被拖得过窄：整体跳过，不画半截坐标系
     }
 
-    // 坐标换算：X = 手数 [0, total]，Y = 黑方胜率 [0,1]（上高下低）。
+    // 坐标换算：X = 手数 [0, total]，Y = 胜率 [0,1]（上高下低）。
     let x = |turn: f32| plot.left() + turn / total as f32 * plot.width();
     let y = |winrate: f32| plot.bottom() - winrate.clamp(0.0, 1.0) * plot.height();
 
     // 目差刻度（对称于 0 的半幅）：只在开关开启时计算与绘制。
-    let span = show_score_lead.then(|| score_scale(&known));
+    // 刻度按显示值算（交替视角下目差显示值已按点换算，刻度必须与线同口径）。
+    let span = show_score_lead
+        .then(|| shown.iter().map(|(_, lead)| *lead).collect::<Vec<_>>())
+        .map(|leads| score_scale(&leads));
 
     draw_axes(&painter, plot, total, span);
     painter.text(
         Pos2::new(plot.left(), avail.min.y + 5.0),
         Align2::LEFT_TOP,
-        "黑方胜率",
+        match view {
+            crate::ui::analysis::DisplayView::Black => "黑方胜率",
+            crate::ui::analysis::DisplayView::Alternating => "胜率（轮到谁算谁）",
+        },
         FontId::proportional(12.0),
         LABEL,
     );
@@ -180,13 +199,13 @@ pub fn show(ui: &mut Ui, analysis: &AnalysisState, board: &Board, show_score_lea
     }
 
     // 折线：仅相邻两手都有数据才连线，缺口留空。
-    for pair in known.windows(2) {
+    for (pair, spair) in known.windows(2).zip(shown.windows(2)) {
         let (t0, t1) = (pair[0].turn, pair[1].turn);
         if t1 - t0 == 1 {
             painter.line_segment(
                 [
-                    Pos2::new(x(t0 as f32), y(pair[0].winrate as f32)),
-                    Pos2::new(x(t1 as f32), y(pair[1].winrate as f32)),
+                    Pos2::new(x(t0 as f32), y(spair[0].0 as f32)),
+                    Pos2::new(x(t1 as f32), y(spair[1].0 as f32)),
                 ],
                 Stroke::new(1.8, LINE),
             );
@@ -197,22 +216,22 @@ pub fn show(ui: &mut Ui, analysis: &AnalysisState, board: &Board, show_score_lea
     // 刻度 span 恒 > 0（score_scale 保证），除法安全。
     if let Some(span) = span {
         let sy = |v: f64| score_y(plot, v, span);
-        for pair in known.windows(2) {
+        for (pair, spair) in known.windows(2).zip(shown.windows(2)) {
             let (t0, t1) = (pair[0].turn, pair[1].turn);
             if t1 - t0 == 1 {
                 draw_dashed(
                     &painter,
                     [
-                        Pos2::new(x(t0 as f32), sy(pair[0].score_lead)),
-                        Pos2::new(x(t1 as f32), sy(pair[1].score_lead)),
+                        Pos2::new(x(t0 as f32), sy(spair[0].1)),
+                        Pos2::new(x(t1 as f32), sy(spair[1].1)),
                     ],
                     Stroke::new(1.6, SCORE_LEAD_LINE),
                 );
             }
         }
         // 目差已知点：小空心方点（与胜率实心圆点区分），同色系。
-        for p in &known {
-            let center = Pos2::new(x(p.turn as f32), sy(p.score_lead));
+        for (p, (_, lead)) in known.iter().zip(&shown) {
+            let center = Pos2::new(x(p.turn as f32), sy(*lead));
             painter.rect_stroke(
                 Rect::from_center_size(center, Vec2::splat(DOT_RADIUS * 1.8)),
                 1.0,
@@ -222,9 +241,9 @@ pub fn show(ui: &mut Ui, analysis: &AnalysisState, board: &Board, show_score_lea
         }
     }
     // 已知点标记：失误手（疑问手及以上）用严重程度色并稍加大，
-    // 让「曲线跳水段」一眼可辨；其余用胜率色。
-    for (p, loss) in known.iter().zip(&losses) {
-        let center = Pos2::new(x(p.turn as f32), y(p.winrate as f32));
+    // 让「曲线跳水段」一眼可辨；其余用胜率色（按显示值着色）。
+    for ((p, (wr, _)), loss) in known.iter().zip(&shown).zip(&losses) {
+        let center = Pos2::new(x(p.turn as f32), y(*wr as f32));
         match loss.filter(|l| l.severity.is_marked()) {
             Some(l) => {
                 let radius = DOT_RADIUS + 1.5;
@@ -236,13 +255,23 @@ pub fn show(ui: &mut Ui, analysis: &AnalysisState, board: &Board, show_score_lea
                 );
             }
             None => {
-                painter.circle_filled(center, DOT_RADIUS, overlay::winrate_color(p.winrate));
+                painter.circle_filled(center, DOT_RADIUS, overlay::winrate_color(*wr));
             }
         }
     }
 
-    draw_cursor(&painter, plot, &x, &y, board.cursor(), &known);
-    draw_hover(&painter, plot, &x, &y, total, response, &known, &losses);
+    draw_cursor(&painter, plot, &x, &y, board.cursor(), &known, &shown);
+    draw_hover(
+        &painter,
+        plot,
+        &x,
+        &y,
+        total,
+        response,
+        &known,
+        &shown,
+        &losses,
+    );
 }
 
 /// 虚线线段：把整段按「实 DASH_LEN + 空 DASH_GAP」交替切成小段绘制。
@@ -337,6 +366,7 @@ fn draw_axes(painter: &Painter, plot: Rect, total: usize, span: Option<f64>) {
 }
 
 /// 当前手指示：琥珀色竖线贯穿曲线区；该手有数据时再画大圆点。
+/// `shown` 与 `known` 按下标平行（各点的显示值，见 `show`）。
 fn draw_cursor(
     painter: &Painter,
     plot: Rect,
@@ -344,14 +374,15 @@ fn draw_cursor(
     y: &impl Fn(f32) -> f32,
     cursor: usize,
     known: &[HistoryPoint],
+    shown: &[(f64, f64)],
 ) {
     let cx = x(cursor as f32);
     painter.line_segment(
         [Pos2::new(cx, plot.top()), Pos2::new(cx, plot.bottom())],
         Stroke::new(1.5, CURSOR),
     );
-    if let Some(p) = known.iter().find(|p| p.turn == cursor) {
-        let center = Pos2::new(cx, y(p.winrate as f32));
+    if let Some(index) = known.iter().position(|p| p.turn == cursor) {
+        let center = Pos2::new(cx, y(shown[index].0 as f32));
         painter.circle_filled(center, CURSOR_RADIUS, CURSOR);
         painter.circle_stroke(
             center,
@@ -363,7 +394,9 @@ fn draw_cursor(
 
 /// 悬停反馈：磁吸到最近已知手数，画淡竖线 + 白环高亮，并弹原生指针提示。
 /// 按值收 `Response`：`on_hover_ui_at_pointer` 需要 ownership，
-/// 且此后调用方不再使用它。`losses` 与 `known` 按下标平行（每手损失）。
+/// 且此后调用方不再使用它。`losses` / `shown` 与 `known` 按下标平行
+/// （每手损失 / 各点显示值）。读数按当前显示视角标注行棋方；
+/// 损失数字是「行棋方亏损多少」，与视角无关。
 #[allow(clippy::too_many_arguments)]
 fn draw_hover(
     painter: &Painter,
@@ -373,6 +406,7 @@ fn draw_hover(
     total: usize,
     response: Response,
     known: &[HistoryPoint],
+    shown: &[(f64, f64)],
     losses: &[Option<MoveLoss>],
 ) {
     let Some(pos) = response.hover_pos().filter(|p| plot.contains(*p)) else {
@@ -389,13 +423,14 @@ fn draw_hover(
     else {
         return;
     };
+    let (wr, lead) = shown[index];
     let hx = x(p.turn as f32);
     painter.line_segment(
         [Pos2::new(hx, plot.top()), Pos2::new(hx, plot.bottom())],
         Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 60)),
     );
     painter.circle_stroke(
-        Pos2::new(hx, y(p.winrate as f32)),
+        Pos2::new(hx, y(wr as f32)),
         CURSOR_RADIUS + 2.0,
         Stroke::new(1.5, Color32::WHITE),
     );
@@ -404,10 +439,15 @@ fn draw_hover(
         format!("第 {} 手损失 {:+.1} 目 · {:+.0}%（{}）",
             l.turn, l.score_loss, l.winrate_loss * 100.0, l.severity.name())
     });
+    // 读数按显示视角标注行棋方（黑白交替时该点数值即行棋方视角）。
+    let side = match p.to_play {
+        crate::board::Stone::Black => "黑方",
+        crate::board::Stone::White => "白方",
+    };
     response.on_hover_ui_at_pointer(|ui| {
         ui.weak(format!("最近已知：第 {} 手", p.turn));
-        ui.label(format!("黑方胜率 {:.1}%", p.winrate * 100.0));
-        ui.label(format!("目差 {:+.1}（黑方视角）", p.score_lead));
+        ui.label(format!("{}胜率 {:.1}%", side, wr * 100.0));
+        ui.label(format!("目差 {:+.1}（{}视角）", lead, side));
         ui.label(format!("visits {}", p.visits));
         if let Some(text) = loss_text {
             ui.label(text);

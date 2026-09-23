@@ -23,14 +23,16 @@ pub struct SettingsUi {
     message: Option<(bool, String)>,
 }
 
-/// 界面编辑态（路径以字符串编辑，保存时转换）。
-struct Draft {
-    engine_path: String,
-    model_path: Option<PathBuf>,
-    weights_dir: String,
-    backend: EngineBackend,
-    visits: u32,
-}
+    /// 界面编辑态（路径以字符串编辑，保存时转换）。
+    struct Draft {
+        engine_path: String,
+        model_path: Option<PathBuf>,
+        weights_dir: String,
+        backend: EngineBackend,
+        visits: u32,
+        /// 规则草稿：`None` = 自动（跟随棋谱）；`Some(规则)` = 显式指定。
+        rules: Option<crate::engine::Rules>,
+    }
 
 impl SettingsUi {
     pub fn new(cfg: &EngineConfig) -> Self {
@@ -41,6 +43,7 @@ impl SettingsUi {
                 weights_dir: cfg.weights_dir.display().to_string(),
                 backend: cfg.backend,
                 visits: cfg.visits,
+                rules: cfg.rules.as_deref().and_then(crate::engine::Rules::from_wire),
             },
             weights: Vec::new(),
             message: None,
@@ -65,6 +68,8 @@ impl SettingsUi {
             analysis_cfg: base.analysis_cfg.clone(),
             // 对弈难度不在本窗口编辑（侧栏 / 新对局窗口改），原值保留。
             play_difficulty: base.play_difficulty,
+            // 规则存规范名（下拉只产规范名，防自由文本进 settings.json）。
+            rules: self.draft.rules.map(|r| r.wire().to_owned()),
         }
     }
 
@@ -158,6 +163,25 @@ fn body(ui: &mut Ui, state: &mut SettingsUi, cfg: &mut EngineConfig, action: &mu
                     .range(1..=1_000_000)
                     .suffix(" visits"),
             );
+            ui.end_row();
+
+            // 规则下拉：自动（跟随棋谱 RU[]）/ 六种规范规则。改动后随
+            // 「保存」持久化；分析层（AnalysisState）检测到规则变化会
+            // 自动重发查询并清空旧规则下的历史数据。
+            ui.label("规则");
+            let auto = "自动（跟随棋谱）";
+            let selected = state
+                .draft
+                .rules
+                .map_or(auto, |r| r.name());
+            egui::ComboBox::from_id_salt("analysis_rules")
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut state.draft.rules, None, auto);
+                    for rule in crate::engine::Rules::ALL {
+                        ui.selectable_value(&mut state.draft.rules, Some(rule), rule.name());
+                    }
+                });
             ui.end_row();
         });
 

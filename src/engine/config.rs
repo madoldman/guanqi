@@ -120,6 +120,10 @@ pub struct EngineConfig {
     /// 人机对弈难度（引擎走子的 visits 档位）。旧配置文件缺此键时
     /// 回退中等档（struct 级 `#[serde(default)]`）。
     pub play_difficulty: Difficulty,
+    /// 分析规则：`None` = 自动跟随棋谱 `RU[]`（默认）；`Some(规范名)` =
+    /// 用户在设置面板显式指定（优先级最高）。规范名即 KataGo 规则串
+    /// （`chinese` / `japanese` / …），由 [`resolve_rules`] 产出。
+    pub rules: Option<String>,
 }
 
 impl Default for EngineConfig {
@@ -133,8 +137,154 @@ impl Default for EngineConfig {
             search_threads: default_search_threads(),
             analysis_cfg: None,
             play_difficulty: Difficulty::default(),
+            rules: None,
         }
     }
+}
+
+// ---- 规则串解析（SGF 自由文本 → KataGo 规范名） ----
+
+/// 规则解析的完整结果：发给引擎的规范名 + 未识别时的提示。
+#[derive(Clone, Debug, PartialEq)]
+pub struct RulesResolution {
+    /// 发给引擎的 KataGo 规则串（规范名，绝不是 SGF 原始串）。
+    pub rules: String,
+    /// 「未识别的规则串」提示（`Some` 时消息区如实展示已按何规则分析）。
+    /// 显式设置 / 成功映射 / 无规则串时为 `None`。
+    pub notice: Option<String>,
+}
+
+/// 解析本次分析应使用的规则（优先级：设置显式指定 > 棋谱 `RU[]` 宽容
+/// 映射 > 默认 `chinese`）。
+///
+/// **绝不把 SGF 原始字符串发给引擎**：`RU[]` 是自由文本（实测名局中
+/// 存在 `"Japanese (1989)"`、`"中国规则"`、`"GOE"` 等写法），直接透传会
+/// 被引擎拒绝（查询级错误，见 `EngineError::QueryRejected`）。本函数
+/// 只产出 [`Rules::ALL`] 里的规范名。
+pub fn resolve_rules(cfg_rule: Option<&str>, sgf_rule: Option<&str>) -> RulesResolution {
+    if let Some(rule) = cfg_rule
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .and_then(canonical_rules)
+    {
+        return RulesResolution { rules: rule.to_owned(), notice: None };
+    }
+    if let Some(raw) = sgf_rule.map(str::trim).filter(|v| !v.is_empty()) {
+        return match lenient_rules(raw) {
+            Some(rule) => RulesResolution { rules: rule.to_owned(), notice: None },
+            None => RulesResolution {
+                rules: Rules::DEFAULT.to_owned(),
+                notice: Some(format!(
+                    "未识别的规则串「{raw}」，已按 中国规则 分析。"
+                )),
+            },
+        };
+    }
+    RulesResolution { rules: Rules::DEFAULT.to_owned(), notice: None }
+}
+
+/// 规则的下拉选项与宽容映射的目标（KataGo 规则串规范名）。
+///
+/// 项目只用这一份列表：设置面板的下拉与 `lenient_rules` 的关键词映射
+/// 都以 [`Rules::ALL`] 为界，映射结果绝不逃出引擎可接受的集合。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Rules {
+    /// 中国规则（数子）。
+    Chinese,
+    /// 日本规则（数目）。
+    Japanese,
+    /// 韩国规则（数目，与日本规则同串族）。
+    Korean,
+    /// 美国规则（AGA）。
+    Aga,
+    /// 新西兰规则。
+    NewZealand,
+    /// Tromp-Taylor 规则。
+    TrompTaylor,
+}
+
+impl Rules {
+    /// 全部可选规则（设置下拉按此顺序罗列）。
+    pub const ALL: [Rules; 6] = [
+        Self::Chinese,
+        Self::Japanese,
+        Self::Korean,
+        Self::Aga,
+        Self::NewZealand,
+        Self::TrompTaylor,
+    ];
+
+    /// 未配置且棋谱无 `RU` 时的默认规则。
+    pub const DEFAULT: &'static str = "chinese";
+
+    /// KataGo 规则串（查询 `rules` 字段用）。
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Chinese => "chinese",
+            Self::Japanese => "japanese",
+            Self::Korean => "korean",
+            Self::Aga => "aga",
+            Self::NewZealand => "new-zealand",
+            Self::TrompTaylor => "tromp-taylor",
+        }
+    }
+
+    /// 中文名（界面显示）。
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Chinese => "中国",
+            Self::Japanese => "日本",
+            Self::Korean => "韩国",
+            Self::Aga => "AGA",
+            Self::NewZealand => "新西兰",
+            Self::TrompTaylor => "Tromp-Taylor",
+        }
+    }
+
+    /// 由 KataGo 规范名反查（宽容大小写 / 连字符-空格），设置面板持久化
+    /// 值的回收路径；映射不出返回 `None`（例如用户手改了 settings.json）。
+    pub fn from_wire(s: &str) -> Option<Self> {
+        let norm = s.trim().to_ascii_lowercase().replace(['-', '_', ' '], "");
+        Self::ALL.into_iter().find(|r| r.wire().replace('-', "") == norm)
+    }
+}
+
+/// 规范名回收：设置里的显式值必须也是规范名（防用户手改 settings.json
+/// 塞进任意串）。只认 [`Rules::ALL`] 的规范名。
+fn canonical_rules(s: &str) -> Option<&'static str> {
+    Rules::from_wire(s).map(Rules::wire)
+}
+
+/// SGF `RU[]` 自由文本的宽容映射：大小写无关 + 关键词（中英文）。
+///
+/// 关键词表覆盖实测与常见写法：`"Japanese (1989)"`（japan）、
+/// `"中国规则"`（中国）、`"GOE"`（无关键词 → 未识别）、`"jpn"`、
+/// `"tt"`（Tromp-Taylor 社区缩写）等。映射不出返回 `None`，由
+/// [`resolve_rules`] 落默认值并出提示。
+fn lenient_rules(raw: &str) -> Option<&'static str> {
+    let lower = raw.to_lowercase();
+    let has = |needle: &str| lower.contains(needle);
+    // 中日韩按日语/韩国、中国等关键词；英文按国名/缩写。
+    if has("japan") || has("日本") || has("jpn") || has("日韩") {
+        return Some(Rules::Japanese.wire());
+    }
+    if has("korea") || has("韩国") || has("kor") {
+        return Some(Rules::Korean.wire());
+    }
+    if has("china") || has("中国") || has("数子") || has("chn") {
+        return Some(Rules::Chinese.wire());
+    }
+    if has("aga") {
+        return Some(Rules::Aga.wire());
+    }
+    if has("new zealand") || has("new-zealand") || has("新西兰") || has("newzealand") {
+        return Some(Rules::NewZealand.wire());
+    }
+    if has("tromp") || has("tt") {
+        return Some(Rules::TrompTaylor.wire());
+    }
+    // 全部关键词落空：有些谱直接写规范名本身（"japanese" 等），先试规范名。
+    canonical_rules(&lower)
 }
 
 /// 配置目录 `~/.config/guanqi`（尊重 `XDG_CONFIG_HOME`）。
@@ -310,7 +460,9 @@ fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
 
 /// 生成的默认引擎配置正文。键值取舍以实测为准：
 /// - `numAnalysisThreads` / `nnMaxBatchSize`：无默认值的必填键；
-/// - `reportAnalysisWinratesAs = BLACK`：胜率固定黑方视角，前端不翻转；
+/// - `reportAnalysisWinratesAs = BLACK`：胜率固定黑方视角；查询级
+///   `overrideSettings` 会逐查询覆盖它（本项目每条查询都显式发送该
+///   字段，cfg 值只是兜底），前端不翻转；
 /// - `logToStderr/stdout = false`：stdout 保留给 JSON 行协议；
 /// - `reportDuringSearchEvery` 等 GTP `kata-analyze` 专用键不写入
 ///   （实测对 analysis 引擎无效）；

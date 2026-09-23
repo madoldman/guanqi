@@ -191,6 +191,8 @@ impl GuanqiApp {
 
         let (engine_cfg, startup_notice) = load_settings();
         let mut analysis = AnalysisState::new();
+        // 设置里的规则偏好（含旧 settings.json 的存量值）进分析状态机。
+        analysis.set_want_rules(engine_cfg.rules.clone());
         analysis.start_engine(&engine_cfg, &waker);
         let settings = settings::SettingsUi::new(&engine_cfg);
 
@@ -1035,9 +1037,14 @@ impl eframe::App for GuanqiApp {
                 self.handle_advance_pv(pv);
             }
             // 整谱快扫：按侧栏配置批量分析（报告按 turnNumber 回填逐手
-            // 历史，曲线自动填满）。发起失败的提示走消息区。
+            // 历史，曲线自动填满）。发起失败的提示走消息区。棋谱 RU 随
+            // 发起传入（快扫与交互分析的规则口径一致）。
             analysis_panel::PanelAction::StartBatch => {
-                if let Some(reason) = self.analysis.start_batch(&self.board, self.komi) {
+                let game_rules =
+                    self.loaded.as_ref().and_then(|meta| meta.info.rules.as_deref());
+                if let Some(reason) =
+                    self.analysis.start_batch(&self.board, self.komi, game_rules)
+                {
                     self.load_notice = Some(analysis_panel::LoadNotice::Warn(reason));
                 }
             }
@@ -1064,6 +1071,11 @@ impl eframe::App for GuanqiApp {
                     self.manual_revealed = false;
                     self.manual_sig = None;
                 }
+            }
+            // 目数视角切换：转入 AnalysisState（作废快照 + want/sent 比对
+            // 重发查询；历史数据存储恒黑视角，两用不清空）。
+            analysis_panel::PanelAction::SetDisplayView(view) => {
+                self.analysis.set_display_view(view);
             }
         }
 
@@ -1118,10 +1130,9 @@ impl eframe::App for GuanqiApp {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            // 顶部一行标识 + 主操作按钮：主按钮（新对局）用琥珀填充强调，
-            // 设置为普通按钮；标题与按钮之间保持层次。
+            // 顶部一行主操作按钮：主按钮（新对局）用琥珀填充强调，设置为普通按钮。
+            // 不再在这里重复应用名——窗口标题栏已经有「观棋」。
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("观棋").size(20.0).strong());
                 if !self.fonts_ok {
                     ui.colored_label(
                         egui::Color32::from_rgb(255, 190, 90),
@@ -1184,6 +1195,11 @@ impl eframe::App for GuanqiApp {
                 &mut self.settings,
                 &mut self.engine_cfg,
             );
+            // 规则偏好可能随「保存」变化：同步进 AnalysisState。变化会
+            // 清空逐手历史 / 候选表（两种规则的数字不可混在一条曲线），
+            // 并经 want/sent 比对自动重发查询（无需重启引擎——规则是
+            // 查询级字段）。
+            self.analysis.set_want_rules(self.engine_cfg.rules.clone());
             if matches!(action, settings::SettingsAction::ApplyRestart) {
                 // 已保存的配置不会再有损坏提示。
                 self.startup_notice = None;
@@ -1270,11 +1286,24 @@ impl eframe::App for GuanqiApp {
             && !play::two_passes(&self.board)
             && self.board.to_play() != self.play.human
             && self.board.cursor() == self.board.line_len();
-        self.analysis
-            .sync(&self.board, &self.engine_cfg, self.komi, want_play_query);
+        // 规则来源：已载入棋谱的 `RU[]` 原始串（None = 无棋谱 / 谱上未写）。
+        // 与设置偏好一起在 AnalysisState.sync 内按「显式 > 棋谱（宽容映射）
+        // > 默认」解析；未识别串的提示由 take_rules_notice 取走进消息区。
+        let game_rules = self.loaded.as_ref().and_then(|meta| meta.info.rules.as_deref());
+        self.analysis.sync(
+            &self.board,
+            &self.engine_cfg,
+            self.komi,
+            game_rules,
+            want_play_query,
+        );
         // 整谱快扫结束提示（完成 / 取消 / 局面变化自动取消）落位到消息区。
         if let Some(notice) = self.analysis.take_batch_notice() {
             self.load_notice = Some(analysis_panel::LoadNotice::Ok(notice));
+        }
+        // 规则解析提示（未识别的 RU 串已按默认规则分析）落位到消息区。
+        if let Some(text) = self.analysis.take_rules_notice() {
+            self.load_notice = Some(analysis_panel::LoadNotice::Warn(text));
         }
         // 局面变化会先作废快照（见 AnalysisState::sync），借此时机清除定位高亮。
         if self.analysis.snapshot.is_none() {

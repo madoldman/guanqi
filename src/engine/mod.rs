@@ -25,10 +25,13 @@ mod protocol;
 // 面向 UI 接线任务的门面 re-export。
 pub use config::{
     config_dir, default_analysis_cfg_path, default_weights_dir, effective_analysis_cfg,
-    ensure_analysis_cfg, find_katago_in_path, load_settings, save_settings, scan_weights,
-    settings_path, Difficulty, EngineBackend, EngineConfig, LoadedSettings,
+    ensure_analysis_cfg, find_katago_in_path, load_settings, resolve_rules, save_settings,
+    scan_weights, settings_path, Difficulty, EngineBackend, EngineConfig, LoadedSettings, Rules,
+    RulesResolution,
 };
-pub use protocol::{AnalysisQuery, AnalysisReport, MoveInfo, MoveRule, MoveRules, QueryId, RootInfo};
+pub use protocol::{
+    AnalysisQuery, AnalysisReport, MoveInfo, MoveRule, MoveRules, QueryId, RootInfo, WinrateView,
+};
 
 use crate::board::Size;
 use process::{PipeEvent, Process, Waker};
@@ -125,9 +128,13 @@ pub enum EngineEvent {
     Exited(std::process::ExitStatus),
 }
 
-/// 在飞的查询信息：棋盘尺寸（坐标解码用）与超时线。
+/// 在飞的查询信息：棋盘尺寸（坐标解码用）、视角（SIDETOMOVE 报告归一化
+/// 用）与超时线。
 struct Pending {
     size: Size,
+    /// 该查询请求的报告视角：`SideToMove` 时报告在 Engine 出口按行棋方
+    /// 归一化回黑视角（口径见 `protocol::WinrateView` 实测文档）。
+    view: WinrateView,
     deadline: Instant,
 }
 
@@ -198,6 +205,7 @@ impl Engine {
         self.last_size = Some(query.board_size);
         self.pending.insert(id, Pending {
             size: query.board_size,
+            view: query.view,
             deadline: Instant::now() + QUERY_TIMEOUT,
         });
         if let Err(e) = self.process.write_line(&query.encode(id)) {
@@ -302,11 +310,28 @@ impl Engine {
 
     fn handle_incoming(&mut self, incoming: Incoming) -> Option<EngineEvent> {
         match incoming {
-            Incoming::Report { id, report: raw } => {
+            Incoming::Report { id, report: mut raw } => {
                 let Some(id) = id else {
                     return Some(EngineEvent::Log("收到无 id 的报告，已忽略".to_owned()));
                 };
                 let is_final = raw.is_final();
+                // 视角归一化在**解码前**完成：查询带 SIDETOMOVE 时按行棋方
+                // 把 winrate / scoreLead / raw* / moveInfos 换算回黑视角
+                // （口径与公式见 protocol::WinrateView 的实测文档）。换算
+                // 只依赖报告自带 current_player，全仓读取路径因此恒拿黑
+                // 视角值、零改动。
+                //
+                // 判据只能查 **pending 里记录的查询视角**：报文本身不带视角。
+                // 早先这里查的是报文自带的 view 字段，而它恒为 Black ⇒ 判据
+                // 恒假、归一化从不执行（作者用真实引擎探针复现：交替视角取回
+                // 的 winrate 仍是 1−w）。该字段已删除，判据只剩 pending 一处。
+                if self
+                    .pending
+                    .get(&id)
+                    .is_some_and(|p| p.view == WinrateView::SideToMove)
+                {
+                    raw.normalize();
+                }
                 let size = self
                     .pending
                     .get(&id)
@@ -318,10 +343,19 @@ impl Engine {
                 }
                 Some(EngineEvent::Report { id, report: raw.decode(size), is_final })
             }
-            Incoming::Error { id, message, .. } => {
+            Incoming::Error { id, message, field: _ } => {
                 if let Some(id) = id {
                     self.pending.remove(&id);
                 }
+                // 非法规则串会被引擎直接拒绝（规则是查询必填字段）：
+                // 错误原文里几乎总带 "rules" 字样，翻成中文后按字段提示。
+                let message = if message.contains("rules") {
+                    format!(
+                        "查询被拒绝（规则串问题，请检查规则设置）：{message}"
+                    )
+                } else {
+                    message
+                };
                 Some(EngineEvent::Failed(EngineError::QueryRejected { id, message }))
             }
             Incoming::Warning { id, field, message } => {

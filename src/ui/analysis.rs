@@ -26,6 +26,26 @@
 //! 同局面后到且 visits 更多的终态覆盖先到的。
 //! 每手损失（[`loss_from_points`]，TASKS 4.4）不另存状态：读取时由当前线
 //! 相邻两个已知历史点现场派生，引擎零额外查询。
+//!
+//! # 规则口径（`RU[]` 透传）
+//!
+//! 查询的 `rules` 不再写死 `chinese`：按「设置显式指定 > 棋谱 `RU[]`
+//! 宽容映射 > 默认 `chinese`」解析（[`crate::engine::resolve_rules`]），
+//! 三条查询路径（交互展示 / 走子口径 / 整谱快扫）都带解析后的规范名。
+//! 规则变化会**清空逐手历史与候选表**——历史点按局面签名键控，签名里
+//! 不含规则，两种规则的数据混在同一条曲线是错的（数子差 = 数目差 +
+//! 盘面双方子数之差，目差系统性偏差可达约 1 目；v1.18.2 实测同一局面
+//! chinese +1.12 目 / japanese +0.60 目）；清空比把规则并进哈希更简单、
+//! 语义也更诚实。want/sent 两值比对复刻 `want_policy` 机制。
+//!
+//! # 目数视角口径（`reportAnalysisWinratesAs`）
+//!
+//! 存储**一律黑视角**：查询可请求 `SIDETOMOVE`（验证过引擎口径），报告
+//! 在引擎桥接层按行棋方换算回黑视角落库，全仓读取路径因此零改动；
+//! 显示层只在绘制 / 悬停处按 [`DisplayView`] 现场换算（[`HistoryPoint`]
+//! 记住了该局面的行棋方）。损失类数字（[`loss_from_points`]）本就是
+//! 「行棋方视角的亏损量」，与显示视角无关，不翻转。视角切换作废快照并
+//! 重发查询（黑视角归一化后同一份数据两用，历史与候选表不清空）。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,8 +53,8 @@ use std::time::Instant;
 
 use crate::board::{Action, Board, Coord, MoveRecord, Size, Stone};
 use crate::engine::{
-    AnalysisQuery, AnalysisReport, Difficulty, Engine, EngineConfig, EngineError, EngineEvent,
-    MoveInfo, MoveRules, QueryId, RootInfo,
+    resolve_rules, AnalysisQuery, AnalysisReport, Difficulty, Engine, EngineConfig, EngineError,
+    EngineEvent, MoveInfo, MoveRules, QueryId, RootInfo, WinrateView,
 };
 /// 引擎事件唤醒回调：与 `engine::process::Waker` 同构（类型别名未公开，
 /// 此处按相同定义书写，透明等价）。
@@ -105,6 +125,11 @@ pub struct HistoryPoint {
     pub score_lead: f64,
     /// 产出该结果的搜索量（覆盖判定依据：visits 更多的后到覆盖先到的）。
     pub visits: u64,
+    /// 该局面的行棋方（第 `turn` 手之后的局面轮到谁）：目数视角「黑白
+    /// 交替」显示时按点换算的依据（[`display_values`]）。空盘（turn 0）
+    /// 恒黑（与开局黑先一致；该局面本身从不按行棋方换算显示的场景
+    /// 不受影响——换算只发生在轮白的点上）。
+    pub to_play: Stone,
 }
 
 /// 一个局面的**候选表快照**（局后统计的吻合度数据源）：与
@@ -242,6 +267,52 @@ impl CandidateGating {
     }
 }
 
+/// 显示视角（LizzieYzy「目数视角」的移植）：**永远黑视角**（默认）/
+/// **黑白交替**（轮到谁就显示谁的胜率 / 目差）。
+///
+/// 只作用于**显示层**；数据存储恒为黑视角（见模块文档「目数视角口径」）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DisplayView {
+    /// 永远黑视角（默认，与全部历史数据同口径）。
+    #[default]
+    Black,
+    /// 黑白交替：轮到黑显示黑视角，轮到白显示白视角。
+    Alternating,
+}
+
+impl DisplayView {
+    /// 界面显示名。
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Black => "永远黑视角",
+            Self::Alternating => "黑白交替",
+        }
+    }
+}
+
+/// 显示换算（共用小函数）：黑视角值 + 该局面行棋方 + 当前显示视角 →
+/// 显示值。**本仓唯一的视角换算入口**，胜率与目差共用（目差取负，
+/// 胜率取 1−）。
+///
+/// - 轮黑 / 黑视角：原样；
+/// - 轮白 + 交替视角：`winrate ← 1 − winrate`、`score_lead ← −score_lead`
+///   （v1.18.2 实测 SIDETOMOVE 报文满足的同一组恒等式，见
+///   `protocol::WinrateView`）；
+/// - **损失类数字不经过本函数**：损失（`loss_from_points` 等）本来就是
+///   「行棋方亏损多少」，与显示视角无关。
+pub(crate) fn display_values(
+    view: DisplayView,
+    player: Stone,
+    winrate: f64,
+    score_lead: f64,
+) -> (f64, f64) {
+    match view {
+        DisplayView::Black => (winrate, score_lead),
+        DisplayView::Alternating if player == Stone::White => (1.0 - winrate, -score_lead),
+        DisplayView::Alternating => (winrate, score_lead),
+    }
+}
+
 impl Severity {
     /// 由目差损失定档。
     fn from_score_loss(loss: f64) -> Self {
@@ -344,6 +415,17 @@ pub struct Snapshot {
     /// 未开启或引擎过旧，上层回落根局面 `ownership`）。
     /// 与 `moves` 同下标对齐（按 `order` 排序后的候选列表）。
     pub moves_have_ownership: bool,
+}
+
+impl Snapshot {
+    /// 策略网络的**未搜索直觉**（原始网络输出，v1.18.2 实测 rootInfo
+    /// 无条件携带 `rawWinrate` / `rawLead`，已随报告归一化为黑视角）。
+    /// 返回 `(黑方胜率, 黑方目差)`；任一字段缺失（引擎过旧等）返回
+    /// `None`，调用方**隐藏整行**而非显示 0。
+    pub fn raw_eval(&self) -> Option<(f64, f64)> {
+        let root = self.root.as_ref()?;
+        Some((root.raw_winrate?, root.raw_lead?))
+    }
 }
 
 /// 局面签名：对手数记录前缀逐字节做 FNV-1a（行棋方 / 着法 / 提子）。
@@ -907,6 +989,10 @@ struct BatchJob {
     /// 发起时的棋盘尺寸与贴目（块间跨帧，随查询重发）。
     size: Size,
     komi: f64,
+    /// 发起时解析生效的规则规范名（整谱快扫与交互分析同口径）。
+    rules: String,
+    /// 发起时的目数视角（随查询发给引擎）。
+    view: DisplayView,
     /// 发起时的快扫配置（加深参数从中取）。
     config: BatchConfig,
     /// 阶段：`false` = 主扫描，`true` = 加深（主扫描全部收齐后进入）。
@@ -1003,6 +1089,33 @@ pub struct AnalysisState {
     /// 候选类显示的门控模式（第 5 项）。只影响绘制路径的取数判定，
     /// 不影响任何数据接收与走子决策（见 [`CandidateGating`] 文档）。
     gating: CandidateGating,
+    /// 期望的分析规则（`None` = 自动跟随棋谱，由 `App` 从引擎配置写入）。
+    /// 与解析生效值（want/sent 比对）共同驱动重发；历史清空绑定在
+    /// **实际生效规则的变化**上（`data_rules`，见其文档），而非设置值
+    /// 变化本身——设置改动可能并不改变解析结果（如自动跟随下换谱）。
+    want_rules: Option<String>,
+    /// 上次发起查询时实际发给引擎的规则（含自动解析结果，规范名）。
+    sent_rules: Option<String>,
+    /// 历史与候选表当前**数据的规则口径**（`None` = 无数据）。request
+    /// 时刻与解析结果比对：实际变化才清空历史 + 提示（两种规则的
+    /// 胜率 / 目差不可混在同一条曲线，见模块文档「规则口径」）。
+    data_rules: Option<String>,
+    /// 目数视角（显示口径）：变化即作废快照并重发查询（`sent_view`
+    /// 两值比对，复刻 `want_policy` 机制）。历史数据不必清空——存储
+    /// 恒黑视角，同一份数据两种显示视角两用。
+    want_view: DisplayView,
+    /// 上次发起查询时请求的视角。
+    sent_view: DisplayView,
+    /// 最近一次规则解析的「未识别规则串」提示（消息区显示，由 App
+    /// 取走转用户可见消息；每帧同步一次，规则未变时保持 `None`）。
+    /// 读取方（`take_rules_notice`）走 Cell 之外的直接访问；写入方
+    /// `effective_rules` 需要 `&self`（见其文档），故额外持一枚写入
+    /// 开关的 Cell。**同帧至多写一次**（sync 与 request 各调一次解析，
+    /// 第二次只在开关为真时写入），无覆盖竞态。
+    rules_notice: Option<String>,
+    /// `effective_rules` 本次 sync 已产生新提示的标记（`&self` 写入
+    /// `rules_notice` 的中介，见该函数文档）。
+    rules_notice_slot: std::cell::Cell<Option<String>>,
 }
 
 impl AnalysisState {
@@ -1031,6 +1144,13 @@ impl AnalysisState {
             batch_config: BatchConfig::default(),
             batch_notice: None,
             gating: CandidateGating::Immediate,
+            want_rules: None,
+            sent_rules: None,
+            data_rules: None,
+            want_view: DisplayView::Black,
+            sent_view: DisplayView::Black,
+            rules_notice: None,
+            rules_notice_slot: std::cell::Cell::new(None),
         }
     }
 
@@ -1195,6 +1315,76 @@ impl AnalysisState {
         &self.engine_warnings
     }
 
+    // ---- 规则 / 目数视角（口径变更：重发 + 清历史）----
+
+    /// 当前期望的分析规则设置（`None` = 自动跟随棋谱；侧栏引擎卡片显示用）。
+    pub fn want_rules(&self) -> Option<&str> {
+        self.want_rules.as_deref()
+    }
+
+    /// 设置规则偏好（App 随设置面板保存写入）。**只记偏好**：不清历史、
+    /// 不作废快照——若解析后的生效规则没变（如自动跟随下换谱、或设置值
+    /// 与解析结果本就相同），既有数据仍然同口径可用；生效规则真的变了
+    /// 时，`request` 时刻的比对会清空历史并出提示（见 `data_rules`）。
+    pub fn set_want_rules(&mut self, rules: Option<String>) {
+        self.want_rules = rules;
+    }
+
+    /// 目数视角（显示口径）。
+    pub fn display_view(&self) -> DisplayView {
+        self.want_view
+    }
+
+    /// 设置目数视角（App 随设置面板 / 侧栏切换写入）。变化即作废快照，
+    /// `sync` 比对 `want/sent` 后重发查询；历史数据不清空——存储恒黑
+    /// 视角（SIDETOMOVE 报文在引擎桥接层已归一化），同一份数据两种
+    /// 显示视角两用。
+    pub fn set_display_view(&mut self, view: DisplayView) {
+        if self.want_view == view {
+            return;
+        }
+        self.want_view = view;
+        // 旧快照的显示数字按旧视角读出，作废后由重发查询刷新
+        // （与 set_want_policy 同一机制）。
+        self.snapshot = None;
+    }
+
+    /// 取走规则解析提示（「未识别规则串」「规则已切换，历史数据已清空」
+    /// 等；App 转入消息区显示）。先收 `effective_rules` / `clear_rule_history`
+    /// 经 slot 落下的新提示，再整体取走。
+    pub fn take_rules_notice(&mut self) -> Option<String> {
+        if let Some(pending) = self.rules_notice_slot.take() {
+            self.rules_notice = Some(pending);
+        }
+        self.rules_notice.take()
+    }
+
+    /// 规则变化 / 版本递增时的历史清空：逐手历史 + 候选表 + 当前快照
+    /// 一并作废（快照的数字也是按旧规则算的）。只在**实际生效规则**
+    /// 变化时调用（见 `data_rules` 与 `request` 内比对）。
+    fn clear_rule_history(&mut self) {
+        self.history.clear();
+        self.candidates.clear();
+        self.snapshot = None;
+        self.rules_notice_slot
+            .set(Some("规则已切换，历史数据已清空。".to_owned()));
+    }
+
+    /// 解析本帧生效的规则（设置显式指定 > 棋谱 `RU[]` 宽容映射 > 默认），
+    /// 并把「未识别」提示落进 `rules_notice`（已有提示时保留，等 App 取走
+    /// 后再落新的）。返回发给引擎的规范名。
+    ///
+    /// 借用设计：提示槽走 `Cell`（`&self` 内部可变），让本函数能在
+    /// `request()` 已持有引擎句柄可变借用（`self.handle.as_mut()`）时
+    /// 被调用——规则串必须在查询组装点解析，而句柄借用要活到
+    /// `handle.analyze(query)`。AnalysisState 只在 UI 线程使用，无并发。
+    fn effective_rules(&self, game_rules: Option<&str>) -> String {
+        let resolution = resolve_rules(self.want_rules.as_deref(), game_rules);
+        if resolution.notice.is_some() {
+            self.rules_notice_slot.set(resolution.notice);
+        }
+        resolution.rules
+    }
     /// 用当前配置（重）启动引擎；设置面板「应用并重启」与错误重试共用。
     /// 任何失败都进入可显示的状态，不 panic。
     pub fn start_engine(&mut self, cfg: &EngineConfig, waker: &Waker) {
@@ -1233,11 +1423,23 @@ impl AnalysisState {
     pub fn line_points(&self, board: &Board) -> Vec<Option<HistoryPoint>> {
         let records = board.line_records();
         let mut points = Vec::with_capacity(records.len() + 1);
+        // 第 0 手局面（空盘）的行棋方：恒黑（开局黑先口径）。
+        points.push(
+            self.history
+                .get(&0xcbf2_9ce4_8422_2325)
+                .copied()
+                .map(|p| HistoryPoint { to_play: Stone::Black, ..p }),
+        );
         let mut sig = 0xcbf2_9ce4_8422_2325;
-        points.push(self.history.get(&sig).copied());
         for record in records {
             hash_record(&mut sig, record);
-            points.push(self.history.get(&sig).copied());
+            // 「走了该手之后」的行棋方 = 该手行棋方的对方。
+            points.push(
+                self.history
+                    .get(&sig)
+                    .copied()
+                    .map(|p| HistoryPoint { to_play: record.player.opposite(), ..p }),
+            );
         }
         points
     }
@@ -1371,15 +1573,25 @@ impl AnalysisState {
     /// 每帧调用（`App::logic`）：轮询引擎事件并按局面推进分析。
     ///
     /// `komi` 为当前对局的贴目（随查询发给引擎；复盘无贴目信息时用 7.5）。
-    /// `want_play_query`：是否需要为本局面准备**走子口径**的依据
-    /// （对弈模式开启、未结束、轮到引擎且在活子位置时为 `true`，
-    /// 由 `app` 判定——本层不感知对弈状态，避免复盘时白烧走子预算）。
+    /// `game_rules` 为当前棋谱的 `RU[]` 原始串（`None` = 无棋谱或谱上未写）；
+    /// 与设置里的规则偏好一起按「显式 > 棋谱（宽容映射）> 默认」解析成
+    /// 引擎规范名（绝不透传原始串）。`want_play_query`：是否需要为本局面
+    /// 准备**走子口径**的依据（对弈模式开启、未结束、轮到引擎且在活子
+    /// 位置时为 `true`，由 `app` 判定——本层不感知对弈状态，避免复盘时
+    /// 白烧走子预算）。
     ///
     /// 查询顺序：轮到引擎应手的局面**先发 Play（难度值）再补展示查询**——
     /// 引擎的搜索树跨查询存活，若展示查询先按配置值跑过，随后按更低难度值
     /// 的查询会立刻用满缓存返回，难度形同虚设（见任务实测）。展示查询开启
     /// 流式中间报告，边搜边刷新界面。
-    pub fn sync(&mut self, board: &Board, cfg: &EngineConfig, komi: f64, want_play_query: bool) {
+    pub fn sync(
+        &mut self,
+        board: &Board,
+        cfg: &EngineConfig,
+        komi: f64,
+        game_rules: Option<&str>,
+        want_play_query: bool,
+    ) {
         // 局面签名 = 根到当前节点的着法序列：落子 / 导航 / 悔棋 / 改着都会使其变化。
         let sig = board.records();
         // 整谱快扫期间局面一变（切分支 / 落子 / 切副本 / 载谱 / 导航）即
@@ -1423,13 +1635,23 @@ impl AnalysisState {
         // 限制是查询级字段，引擎不感知「用户改了限制」这一事件。
         // policy 与候选点级 ownership 开关同理：查询级 opt-in 字段，
         // 开关切换必须重发才生效。
+        // 规则与视角同为查询级口径：want/sent 两值比对（复刻 policy 机制），
+        // 不一致即重发（局面未变也重发）。
         let limits_changed = self.limits_epoch != self.sent_epoch;
         let policy_changed = self.want_policy != self.sent_policy;
         let moves_ownership_changed = self.want_moves_ownership != self.sent_moves_ownership;
+        let view_changed = self.want_view != self.sent_view;
+        // 每帧解析一次生效规则（设置的显式值 > 棋谱 RU 的宽容映射 > 默认）：
+        // 换谱 / 改设置后解析结果变化即重发查询。开销可忽略（短串上几次
+        // 大小写归一与关键词匹配）。
+        let resolved_rules = self.effective_rules(game_rules);
+        let rules_changed = self.sent_rules.as_deref() != Some(resolved_rules.as_str());
         if Some(sig) != self.analyzed_sig.as_deref()
             || limits_changed
             || policy_changed
             || moves_ownership_changed
+            || view_changed
+            || rules_changed
         {
             self.snapshot = None;
             self.transient_error = None;
@@ -1444,11 +1666,11 @@ impl AnalysisState {
                 } else {
                     Stage::Analysis
                 };
-                self.request(board, cfg, stage, komi);
+                self.request(board, cfg, stage, komi, game_rules);
             }
         }
         while let Some(event) = self.handle.as_mut().and_then(Engine::try_recv) {
-            self.on_event(event, board, cfg, komi);
+            self.on_event(event, board, cfg, komi, game_rules);
         }
         // 走子口径补发（同一局面、引擎空闲时）：难度刚改 / 对弈模式后开
         // / 上一份走子报告被丢弃。展示已按配置值搜过的局面受树缓存影响，
@@ -1462,7 +1684,7 @@ impl AnalysisState {
             && play_stale
             && self.inflight.is_none()
         {
-            self.request(board, cfg, Stage::Play, komi);
+            self.request(board, cfg, Stage::Play, komi, game_rules);
         }
     }
 
@@ -1481,8 +1703,9 @@ impl AnalysisState {
     /// 发起整谱快扫（两阶段：主扫描 → 差异手加深）。计划按当前配置与
     /// 当前线 / 全树现场构造（[`build_plan`]，与侧栏预估共用同一实现，
     /// 「承诺扫什么 = 实际派发什么」）；配置的起止手数在此按当前线钳制。
+    /// `game_rules` 为棋谱 `RU[]` 原始串（规则解析与交互查询同一入口）。
     /// 已在批量中时幂等忽略；引擎未就绪 / 无局面可扫时返回提示不发起。
-    pub fn start_batch(&mut self, board: &Board, komi: f64) -> Option<String> {
+    pub fn start_batch(&mut self, board: &Board, komi: f64, game_rules: Option<&str>) -> Option<String> {
         if self.batch.is_some() {
             return Some("整谱快扫已在进行中。".to_owned());
         }
@@ -1506,6 +1729,10 @@ impl AnalysisState {
             watch: board.records().to_vec(),
             size: board.size(),
             komi,
+            // 规则 / 视角在发起时刻定格：任务存续期间口径不变（局面一变
+            // 即取消，不存在口径漂移窗口）。
+            rules: self.effective_rules(game_rules),
+            view: self.want_view,
             config: self.batch_config.clone(),
             deepening: false,
             deepen_turns: Vec::new(),
@@ -1595,6 +1822,8 @@ impl AnalysisState {
                         &path,
                         &turns,
                         job.config.visits,
+                        &job.rules,
+                        job.view,
                     );
                     job.active = Some(BatchChunk {
                         id,
@@ -1638,6 +1867,8 @@ impl AnalysisState {
             &path,
             &turns,
             job.config.deepen_visits,
+            &job.rules,
+            job.view,
         );
         job.active = Some(BatchChunk {
             id,
@@ -1651,7 +1882,9 @@ impl AnalysisState {
 
     /// 发送一条批量查询（共用组装：路径 → moves，analyzeTurns，批量
     /// 优先级，不开流式、不要 ownership/policy——批量只填曲线与吻合度
-    /// 候选表，省 60%+ 报告体积）。
+    /// 候选表，省 60%+ 报告体积）。规则 / 视角随查询带上（口径与交互
+    /// 查询一致，快扫曲线才能与交互分析的曲线同源比较）。
+    #[allow(clippy::too_many_arguments)]
     fn send_batch_query(
         handle: &mut Engine,
         size: Size,
@@ -1659,6 +1892,8 @@ impl AnalysisState {
         path: &[MoveRecord],
         turns: &[usize],
         visits: u32,
+        rules: &str,
+        view: DisplayView,
     ) -> QueryId {
         let moves: Vec<(Stone, Action)> = path
             .iter()
@@ -1669,6 +1904,11 @@ impl AnalysisState {
         query.max_visits = Some(visits);
         query.analyze_turns = Some(turns.to_vec());
         query.priority = BATCH_PRIORITY;
+        query.rules = rules.to_owned();
+        query.view = match view {
+            DisplayView::Black => WinrateView::Black,
+            DisplayView::Alternating => WinrateView::SideToMove,
+        };
         handle.analyze(query)
     }
 
@@ -1727,7 +1967,7 @@ impl AnalysisState {
             let sig = position_sig(&path[..report.turn_number.min(path.len())]);
             // 候选表随 root 同一次写入（口径一致，见 record_history 文档）。
             let (moves, total) = Self::candidates_from(&report.move_infos);
-            self.record_history(report.turn_number, root, sig, &moves, total);
+            self.record_history(report.turn_number, root, sig, &moves, total, None);
             if job.active.as_ref().is_some_and(|chunk| chunk.deep) {
                 job.deep_done += 1;
             } else {
@@ -1834,12 +2074,12 @@ impl AnalysisState {
 
     // ---- 内部 ----
 
-    fn on_event(&mut self, event: EngineEvent, board: &Board, cfg: &EngineConfig, komi: f64) {
+    fn on_event(&mut self, event: EngineEvent, board: &Board, cfg: &EngineConfig, komi: f64, game_rules: Option<&str>) {
         match event {
             EngineEvent::Ready => {
                 self.engine = EngineStatus::Ready;
                 self.transient_error = None;
-                self.request(board, cfg, Stage::Analysis, komi);
+                self.request(board, cfg, Stage::Analysis, komi, game_rules);
             }
             EngineEvent::Report {
                 id,
@@ -1890,7 +2130,7 @@ impl AnalysisState {
                     }
                     return;
                 }
-                self.on_report(id, report, is_final, board, cfg);
+                self.on_report(id, report, is_final, board, cfg, game_rules);
             }
             EngineEvent::Log(line) => self.last_log = Some(line),
             EngineEvent::Warning { id, field, message } => {
@@ -1946,6 +2186,7 @@ impl AnalysisState {
         is_final: bool,
         board: &Board,
         cfg: &EngineConfig,
+        game_rules: Option<&str>,
     ) {
         let Some(inflight) = self.inflight.as_ref() else {
             return;
@@ -1999,7 +2240,7 @@ impl AnalysisState {
             let sig = position_sig(board.records());
             // 候选表随 root 同一次写入（口径一致，见 record_history 文档）；
             // moves 已按 order 排序，快照顺序即引擎序。
-            self.record_history(turn, root, sig, &candidates, candidates_total);
+            self.record_history(turn, root, sig, &candidates, candidates_total, game_rules);
         }
         if !report.no_results {
             self.transient_error = None;
@@ -2038,11 +2279,16 @@ impl AnalysisState {
     /// 不同局面各占一个键，同手数的分支互不覆盖。无根节点数据或
     /// 容量已满时跳过。
     ///
+    /// **规则守卫**：报告的规则口径以在飞查询发起时记下的 `sent_rules`
+    /// 为准（`game_rules` 参数只是签名可读性）；规则已在发起前经
+    /// `sync` 的 want/sent 比对统一，这里无需再判。
+    ///
     /// **候选表与 root 数据同一次报告写入**（同一覆盖判定、同进退）：
     /// 历史点的 visits 与候选表的 visits 必须是同一次搜索的产物，否则会
     /// 出现「root 是 300 visits 的、候选表是 40 visits 的」混合口径，
     /// 吻合度分母随之失真。`moves` 为该报告的候选点（丢弃弃着后取
     /// 落点与 visits），`total` 为候选表 visits 总和（分母）。
+    #[allow(clippy::too_many_arguments)]
     fn record_history(
         &mut self,
         turn: usize,
@@ -2050,17 +2296,22 @@ impl AnalysisState {
         sig: u64,
         moves: &[(Coord, u64)],
         total_visits: u64,
+        game_rules: Option<&str>,
     ) {
+        let _ = game_rules;
         if turn > HISTORY_CAP
             || self.history.len() >= HISTORY_CAP && !self.history.contains_key(&sig)
         {
             return;
         }
+        // 行棋方随点存储：目数视角「黑白交替」显示时按点换算的依据
+        // （根报告自带 current_player，与局面行棋方一致）。
         let point = HistoryPoint {
             turn,
             winrate: root.winrate,
             score_lead: root.score_lead,
             visits: root.visits,
+            to_play: root.current_player,
         };
         let overwrite = match self.history.get(&sig) {
             Some(old) => root.visits >= old.visits,
@@ -2092,11 +2343,37 @@ impl AnalysisState {
         (moves, total)
     }
 
-    /// 对当前局面发起查询（就绪且无在飞时才生效）。`komi` 随查询发给引擎。
-    fn request(&mut self, board: &Board, cfg: &EngineConfig, stage: Stage, komi: f64) {
+    /// 对当前局面发起查询（就绪且无在飞时才生效）。`komi` 与解析后的
+    /// 规则随查询发给引擎；视角按当前显示口径随 `overrideSettings`
+    /// 显式发送（报告在引擎桥接层归一化回黑视角入库）。
+    fn request(
+        &mut self,
+        board: &Board,
+        cfg: &EngineConfig,
+        stage: Stage,
+        komi: f64,
+        game_rules: Option<&str>,
+    ) {
         if self.inflight.is_some() {
             return;
         }
+        // 规则先在取句柄之前解析（借用分离）：`effective_rules` 只读
+        // `want_rules`，与引擎句柄的可变借用互斥。
+        let rules = self.effective_rules(game_rules);
+        // 生效规则相对**数据口径**变化 ⇒ 旧历史（曲线 / 候选表）是别的
+        // 规则算的，必须清空并提示。比对放这里（查询组装点）而非设置
+        // 写入点：设置变化不必然改变生效规则（自动跟随下换谱同理）。
+        if self.data_rules.as_deref() != Some(rules.as_str()) {
+            if self.data_rules.is_some() {
+                // 首次产生数据口径（程序刚启动 / 载谱后首查）不算「切换」。
+                self.clear_rule_history();
+            }
+            self.data_rules = Some(rules.clone());
+        }
+        let view = match self.want_view {
+            DisplayView::Black => WinrateView::Black,
+            DisplayView::Alternating => WinrateView::SideToMove,
+        };
         let Some(handle) = self.handle.as_mut() else {
             return;
         };
@@ -2107,6 +2384,13 @@ impl AnalysisState {
             .collect();
         let mut query = AnalysisQuery::new(board.size(), moves);
         query.komi = komi;
+        // 规则：设置显式指定 > 棋谱 RU 宽容映射 > 默认 chinese。解析出的
+        // 恒为规范名（绝不把 SGF 原始串发给引擎）；解析提示已由
+        // `effective_rules` 落进消息区。
+        query.rules = rules;
+        // 视角：显示口径（黑视角时显式发 BLACK，钉死「一律黑视角入库」
+        // 的解析前提，不依赖用户 cfg 里的值）。
+        query.view = view;
         query.max_visits = Some(stage.cap(cfg));
         // 热度图需要 ownership（opt-in，引擎缺省不返回该字段）：协议实测
         // 中间报告同样携带（每条约 7–9 KB，0.5s 键下 300 visits 共约 11 条，
@@ -2132,11 +2416,16 @@ impl AnalysisState {
         // 交互查询会被无限期阻塞（90 秒无响应），带 10 可数秒内插队返回
         // （/tmp/batch-notes.md §3/§7）。
         query.priority = INTERACTIVE_PRIORITY;
+        let query_rules_after = query.rules.clone();
         let id = handle.analyze(query);
         self.analyzed_sig = Some(board.records().to_vec());
         self.sent_epoch = self.limits_epoch;
         self.sent_policy = self.want_policy;
         self.sent_moves_ownership = self.want_moves_ownership;
+        // 规则 / 视角随查询定格：want/sent 比对的基准（规则变化在下次
+        // sync 比对中触发重发；视角同理）。
+        self.sent_rules = Some(query_rules_after);
+        self.sent_view = self.want_view;
         self.inflight = Some(Inflight {
             id,
             turn: board.cursor(),

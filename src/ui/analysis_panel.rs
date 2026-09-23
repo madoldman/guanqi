@@ -19,7 +19,8 @@ use crate::play::{PlayState, resign_text};
 use crate::sgf::GameMeta;
 
 use super::analysis::{
-    AnalysisState, BatchSide, EngineStatus, GameSummary, Severity, WORST_LIMIT, batch_estimate,
+    display_values, AnalysisState, BatchSide, DisplayView, EngineStatus, GameSummary, Severity,
+    WORST_LIMIT, batch_estimate,
 };
 use super::explain;
 use super::overlay::{self, Overlay};
@@ -112,6 +113,11 @@ pub enum PanelAction {
     /// [`crate::ui::analysis::AnalysisState::set_gating`]。只改显示判定，
     /// 不重发查询、不影响走子决策。
     SetGating(crate::ui::analysis::CandidateGating),
+    /// 目数视角切换（永远黑视角 / 黑白交替）：转入
+    /// [`crate::ui::analysis::AnalysisState::set_display_view`]。变化会
+    /// 作废快照并重发查询（视角是查询级 overrideSettings 字段）；历史
+    /// 数据两用，不清空。
+    SetDisplayView(crate::ui::analysis::DisplayView),
 }
 
 /// 从当前门控模式提取延迟秒数（分段选择器构造「延迟」段时沿用当前值，
@@ -208,6 +214,10 @@ fn model_name(cfg: &EngineConfig) -> String {
 }
 
 /// 胜率 / 目差文本（黑方视角）。
+///
+/// 显示换算统一走 `card_winrate` 内的 [`display_values`]（按当前视角）；
+/// 本函数保留给不按视角换算的黑视角文本场景。
+#[allow(dead_code)]
 fn eval_lines(root: &RootInfo) -> (String, String) {
     (
         format!("黑方胜率 {:.1}%", root.winrate * 100.0),
@@ -374,15 +384,15 @@ fn panel_body(
     );
 
     // ---- 引擎状态 ----
-    card_engine(ui, analysis, cfg, settings_open, &mut action);
+    card_engine(ui, analysis, cfg, game, settings_open, &mut action);
 
     // ---- 棋谱信息（打开棋谱后显示；属性存在才显示对应行）----
     if let Some(game) = game {
         card_game(ui, game, comment, docs, &mut action);
     }
 
-    // ---- 胜率 / 目差 ----
-    card_winrate(ui, analysis);
+    // ---- 胜率 / 目差（含视角切换与网络直觉行）----
+    card_winrate(ui, analysis, &mut action);
 
     // ---- 讲解（中文自动解说；终态数据驱动，流式期间只占位）----
     card_explain(ui, analysis, board);
@@ -560,11 +570,12 @@ fn card_play(
     action
 }
 
-/// 「引擎」卡片：状态点 + 权重 / 后端 / 思考量信息与设置入口。
+/// 「引擎」卡片：状态点 + 权重 / 后端 / 思考量 / 规则信息与设置入口。
 fn card_engine(
     ui: &mut Ui,
     analysis: &AnalysisState,
     cfg: &EngineConfig,
+    game: Option<&GameMeta>,
     settings_open: &mut bool,
     action: &mut PanelAction,
 ) {
@@ -599,6 +610,19 @@ fn card_engine(
         info_line(ui, "权重", &model_name(cfg));
         info_line(ui, "后端", cfg.backend.name());
         info_line(ui, "思考量", &format!("{} visits", cfg.visits.max(1)));
+        // 当前生效的规则：用户必须知道数字按哪套规则算（数子 / 数目差
+        // 可达约 1 目）。显式指定显示规则名；自动则注明跟随棋谱。
+        let rules_line = match cfg.rules.as_deref().and_then(crate::engine::Rules::from_wire) {
+            Some(rule) => rule.name().to_owned(),
+            None => match game.and_then(|meta| meta.info.rules.as_deref()) {
+                Some(raw) => {
+                    let mapped = crate::engine::resolve_rules(None, Some(raw));
+                    format!("自动（棋谱「{raw}」→ {}）", mapped.rules)
+                }
+                None => "自动（棋谱未写规则，按中国）".to_owned(),
+            },
+        };
+        info_line(ui, "规则", &rules_line);
         if let Some(snapshot) = &analysis.snapshot {
             info_line(
                 ui,
@@ -913,16 +937,71 @@ fn card_limits(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &mu
     });
 }
 
-/// 「胜率」卡片：大字号黑方胜率与目差。
-fn card_winrate(ui: &mut Ui, analysis: &AnalysisState) {
+/// 「胜率」卡片：大字号胜率与目差（按当前显示视角换算）+ 网络直觉行。
+///
+/// 显示口径：存储恒黑视角；显示按 [`AnalysisState::display_view`] 现场换算
+/// （[`display_values`] 全仓唯一入口）——黑视角恒按存储值显示，黑白交替时
+/// 轮白显示 `1−w` / 目差取负（v1.18.2 实测 SIDETOMOVE 报文的换算恒等式，
+/// 见 `engine::protocol::WinrateView` 文档）。
+/// 「网络直觉」行 = `rootInfo.rawWinrate` / `rawLead`（策略网络未搜索输出，
+/// v1.18.2 实测无条件携带、同样归一化为黑视角后按视角显示）；字段缺失时
+/// 整行隐藏（不显示 0、不臆造）。
+fn card_winrate(ui: &mut Ui, analysis: &AnalysisState, action: &mut PanelAction) {
+    let view = analysis.display_view();
     card(ui, |ui| {
         theme::section_title(ui, "胜率");
+        // 视角切换入口（LizzieYzy「目数视角」）：两枚分段按钮。切换经
+        // App 转入 AnalysisState（作废快照 + 重发查询），历史数据两用
+        // 不清空（存储恒黑视角）。
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("视角").weak());
+            for mode in [DisplayView::Black, DisplayView::Alternating] {
+                if ui
+                    .add(egui::Button::selectable(view == mode, mode.name()))
+                    .clicked()
+                {
+                    *action = PanelAction::SetDisplayView(mode);
+                }
+            }
+        });
         match &analysis.snapshot {
             Some(snapshot) => match &snapshot.root {
                 Some(root) => {
-                    let (winrate, lead) = eval_lines(root);
-                    ui.label(RichText::new(winrate).size(24.0).strong());
-                    ui.label(RichText::new(lead).size(15.0).weak());
+                    let (wr, lead) = display_values(
+                        view,
+                        root.current_player,
+                        root.winrate,
+                        root.score_lead,
+                    );
+                    let side = match view {
+                        DisplayView::Black => "黑方",
+                        DisplayView::Alternating => root.current_player.name(),
+                    };
+                    ui.label(RichText::new(format!("{}胜率 {:.1}%", side, wr * 100.0)).size(24.0).strong());
+                    ui.label(RichText::new(format!("目差 {:+.1}", lead)).size(15.0).weak());
+                    // 网络直觉：原始网络输出的胜率 / 目差（未搜索），与
+                    // 搜索后结论并列，用户可直接看出搜索修正了多少。
+                    // raw 值与 winrate 同视角口径，同一函数换算显示。
+                    if let Some((raw_wr, raw_lead)) = snapshot.raw_eval() {
+                        let (raw_wr, raw_lead) = display_values(
+                            view,
+                            root.current_player,
+                            raw_wr,
+                            raw_lead,
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "网络直觉（未搜索）：{:.1}%，{raw_lead:+.1}",
+                                raw_wr * 100.0
+                            ))
+                            .size(12.0)
+                            .color(Color32::from_rgb(150, 156, 166)),
+                        )
+                        .on_hover_text(
+                            "策略网络对当前局面的第一直觉（原始网络输出，未搜索），\
+                             与上面的搜索结论对比可以看出搜索修正了多少。",
+                        );
+                    }
                 }
                 None => {
                     ui.weak("引擎未返回数据（空报告）。");

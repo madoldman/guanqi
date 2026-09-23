@@ -18,6 +18,25 @@
 //!   会立刻返回（实测 <0.1s），上层据此避免重复查询。
 //! - `ownership` 为 opt-in；排列与 [`crate::board::Coord::index`] 一致
 //!   （`y*size + x`，`y=0` 为顶行），正值 = 黑势。
+//! - **视角字段 `overrideSettings.reportAnalysisWinratesAs`**（查询级，
+//!   v1.18.2 实测有效，对照报文见 [`WinrateView`]）：
+//!   - cfg 的 `reportAnalysisWinratesAs = BLACK` 可被它逐查询覆盖；
+//!   - `SIDETOMOVE` 下的口径（同局面同 symHash、同 visits 对照实测）：
+//!     轮白时 `winrate = 1 − winrate_black`、`scoreLead = −scoreLead_black`；
+//!     轮黑时与黑视角**完全相等**（不翻转）；`moveInfos[]` 的
+//!     winrate / scoreLead 与 `rootInfo` 的 `rawWinrate` / `rawLead` /
+//!     `scoreSelfplay` 同口径翻转；**`ownership` 不受视角影响**（不翻转）。
+//!     上层因此在 [`super::Engine`] 读线程出口把 SIDETOMOVE 报文**归一化回
+//!     黑视角**（[`normalize_report_to_black`]），全仓读取路径恒拿黑视角值；
+//!   - 本项目**每条查询都显式发送**该字段（BLACK 或 SIDETOMOVE），不依赖
+//!     用户 cfg 里的值——否则「一律黑视角」的解析前提会被用户改 cfg 破坏。
+//! - **原始网络输出 `raw*` 系列**（v1.18.2 实测：`rootInfo` 里**无条件**
+//!   出现，无需任何 overrideSettings）：`rawWinrate` / `rawLead` /
+//!   `rawScoreSelfplay` / `rawScoreSelfplayStdev` / `rawStWrError` /
+//!   `rawStScoreError` / `rawVarTimeLeft` / `rawNoResultProb`。其中
+//!   `rawWinrate` / `rawLead` 是策略网络对当前局面的「未搜索直觉」，
+//!   视角与 `winrate` / `scoreLead` 相同（随 `reportAnalysisWinratesAs`
+//!   一起翻转，实测同一查询内两者口径一致），归一化处理同上。
 //! - `policy` 为 opt-in（`includePolicy: true`）：长度 = `size² + 1`，
 //!   前 `size²` 项排列与 [`crate::board::Coord::index`] 一致（v1.18.2 b18
 //!   下标标定实测：空盘 4 重对称 + 提子/布局局面的 argmax 与 moveInfos
@@ -44,6 +63,36 @@
 
 use crate::board::{Action, Coord, Size, Stone};
 use serde::{Deserialize, Serialize};
+
+/// 胜率 / 目差的报告视角（查询级 `overrideSettings.
+/// reportAnalysisWinratesAs` 的取值）。
+///
+/// **v1.18.2 实测依据**（19 路 5 手局面轮白，BLACK 与 SIDETOMOVE 两次
+/// 查询同 symHash、同 visits = 12，原始报文对照）：
+/// - BLACK：`winrate = 0.3286`、`scoreLead = −1.5035`；
+/// - SIDETOMOVE：`winrate = 0.6714 ≈ 1 − 0.3286`、`scoreLead =
+///   +1.5035 = −(−1.5035)`（轮白翻转）；`moveInfos[0]` 的
+///   winrate / scoreLead 同口径翻转（0.3282 ↔ 0.6718）；
+/// - 补测轮黑局面（6 手）：两种视角下 `winrate` / `scoreLead` **相等**
+///   （不翻转）；`rawWinrate` / `rawLead` 同样按行棋方口径翻转 / 相等；
+/// - `ownership` 两种视角下**都不翻转**（视角字段不作用于领地图）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WinrateView {
+    /// 恒黑方视角（本项目存储口径）。
+    Black,
+    /// 行棋方视角（轮到谁显示谁的胜率 / 目差；显示口径用）。
+    SideToMove,
+}
+
+impl WinrateView {
+    /// 线上取值（KataGo 枚举串）。
+    pub(crate) fn wire(self) -> &'static str {
+        match self {
+            Self::Black => "BLACK",
+            Self::SideToMove => "SIDETOMOVE",
+        }
+    }
+}
 
 /// 一次分析查询的 id（引擎侧原样回传）。
 ///
@@ -116,6 +165,12 @@ pub struct AnalysisQuery {
     /// 实测二者同时给出会被引擎拒绝（`Cannot specify both allowMoves and
     /// avoidMoves`），上层必须互斥。
     pub move_rules: Option<MoveRules>,
+    /// 胜率 / 目差的报告视角（`overrideSettings.
+    /// reportAnalysisWinratesAs`）。**每条查询都显式发送**（见
+    /// [`WireOverrideSettings`] 文档）：`Black` = 存储口径；`SideToMove`
+    /// = 显示口径（报告在 [`super::Engine`] 出口被归一化回黑视角，
+    /// 上层读取恒为黑视角值）。
+    pub view: WinrateView,
 }
 
 /// 一组选点限制。`allow` 与 `avoid` 不可同时非空（引擎实测显式报错）。
@@ -166,7 +221,7 @@ impl MoveRule {
 }
 
 impl AnalysisQuery {
-    /// 构造查询：默认贴目 7.5、中国规则、只分析最终局面。
+    /// 构造查询：默认贴目 7.5、中国规则、黑视角、只分析最终局面。
     pub fn new(board_size: Size, moves: Vec<(Stone, Action)>) -> Self {
         Self {
             board_size,
@@ -181,6 +236,7 @@ impl AnalysisQuery {
             analyze_turns: None,
             priority: 0,
             move_rules: None,
+            view: WinrateView::Black,
         }
     }
 }
@@ -230,6 +286,24 @@ struct WireQuery<'a> {
     allow_moves: Option<Vec<WireMoveRule<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     avoid_moves: Option<Vec<WireMoveRule<'a>>>,
+    /// 视角等查询级覆盖项。**永远发送**（恒 `Some`）：本项目不依赖用户
+    /// cfg 里的 `reportAnalysisWinratesAs`——cfg 可被用户手改成任意值，
+    /// 而「报告一律归一化回黑视角」的解析前提必须由本字段逐查询钉死。
+    /// 现在只有视角一项；将来其它 overrideSettings 一律并入本对象，
+    /// 绝不发两个 overrideSettings（后者会顶掉前者）。
+    override_settings: WireOverrideSettings<'a>,
+}
+
+/// `overrideSettings` 的线上形态（目前只有视角一项）。
+///
+/// v1.18.2 实测：嵌套 overrideSettings 内的键值引擎认识即生效；对照
+/// 报文见 [`WinrateView`]。注意模块文档的教训：**嵌套**字段拼错是
+/// 完全静默的，这里用显式 `rename` 锁定引擎字段名（camelCase，
+/// 与外层查询字段同名），不经 rename_all 间接生成。
+#[derive(Serialize)]
+struct WireOverrideSettings<'a> {
+    #[serde(rename = "reportAnalysisWinratesAs")]
+    report_analysis_winrates_as: &'a str,
 }
 
 /// 线上规则条目：坐标串借自 [`AnalysisQuery::move_rules`] 的字符串。
@@ -316,6 +390,9 @@ impl AnalysisQuery {
             priority: self.priority,
             allow_moves,
             avoid_moves,
+            override_settings: WireOverrideSettings {
+                report_analysis_winrates_as: self.view.wire(),
+            },
         };
         serde_json::to_string(&wire).unwrap_or_else(|_| {
             // 全部字段均为可序列化类型，理论上不可达；兜底避免 panic。
@@ -404,12 +481,18 @@ struct WireRootInfo {
     winrate: Option<f64>,
     score_lead: Option<f64>,
     score_stdev: Option<f64>,
+    /// 策略网络对当前局面的「未搜索直觉」胜率（v1.18.2 实测无条件出现，
+    /// 视角与 `winrate` 相同）。缺省 = 引擎版本过旧等，上层按无数据隐藏。
+    raw_winrate: Option<f64>,
+    /// 策略网络的未搜索目差直觉（与 `rawWinrate` 同条件出现，同视角）。
+    raw_lead: Option<f64>,
 }
 
 // ---- 上层使用的解析后类型 ----
 
-/// 根节点统计。**`winrate` / `score_lead` 一律为黑方视角**（cfg
-/// `reportAnalysisWinratesAs = BLACK` 已实测对 `rootInfo` 与 `moveInfos` 同时生效）。
+/// 根节点统计。**`winrate` / `score_lead` 一律为黑方视角**：查询带
+/// `SIDETOMOVE` 时由 [`normalize_root_to_black`] 按行棋方换算回黑视角
+/// （v1.18.2 实测口径见 [`WinrateView`]），读取路径恒拿黑视角值。
 #[derive(Clone, Debug, PartialEq)]
 pub struct RootInfo {
     /// 被分析局面的行棋方。
@@ -422,6 +505,12 @@ pub struct RootInfo {
     pub score_lead: f64,
     /// 目数波动估计（终局目差的标准差）。
     pub score_stdev: f64,
+    /// 策略网络的**未搜索**直觉：黑方胜率 [0,1]（与 `winrate` 同视角
+    /// 口径，已归一化）。`None` = 报文缺该字段（引擎过旧等），上层
+    /// 隐藏对应显示行，绝不显示 0。
+    pub raw_winrate: Option<f64>,
+    /// 策略网络的未搜索直觉目差（黑方视角，正 = 黑领先）。`None` 同上。
+    pub raw_lead: Option<f64>,
 }
 
 /// 一条候选点信息。`winrate` / `score_lead` 同样为黑方视角。
@@ -502,6 +591,43 @@ impl RawReport {
         !self.is_during_search
     }
 
+    /// 把 SIDETOMOVE 报告归一化回黑视角（存储口径）。
+    ///
+    /// 换算公式（v1.18.2 实测，见 [`WinrateView`] 文档）：轮白时
+    /// `winrate ← 1 − winrate`、`scoreLead ← −scoreLead`；轮黑时不变。
+    /// `moveInfos[]` 与 `raw*` 同口径换算；`ownership` / `policy` 不动
+    /// （前者实测不随视角翻转，后者本来就是行棋方的选点先验、无视角）。
+    pub(crate) fn normalize(&mut self) {
+        // 边界（本项目踩过的坑，改动前务必读）：**不能**靠报文自带的视角字段
+        // 判断是否换算——报文根本不含视角，早先那个「恒为 Black 的 view 字段」
+        // 既让调用方判据恒假，又让本方法开头 `if view == Black { return; }`
+        // 直接返回，两处叠加使归一化彻底形同虚设（作者用真实引擎探针复现：
+        // 交替视角取回的 winrate 仍是 1−w）。那个字段已删除；是否换算**只由
+        // 调用方**（Engine 出口，按 pending 里记录的查询视角）决定，本方法只
+        // 负责换算，并保证每份报文对象只过一次。
+        //
+        // 翻转与否**只取决于行棋方**（轮白翻、轮黑不翻）——SIDETOMOVE 在
+        // 轮黑时与 BLACK 完全等价。`moveInfos` 与 `rootInfo` 是同一次搜索的
+        // 同一口径（实测），因此必须与 root 用**同一个**判据：早先无条件
+        // 翻转 moveInfos，轮黑局面下会把本来就正确的候选值翻错。
+        // rootInfo 缺失（noResults 等空报告）时无从判断行棋方，候选表也是
+        // 空的，不做任何翻转。
+        let flip = self
+            .root_info
+            .as_ref()
+            .is_some_and(|root| root.current_player == Stone::White);
+        if let Some(root) = &mut self.root_info {
+            normalize_root_to_black(root);
+        }
+        if flip {
+            for info in &mut self.move_infos {
+                normalize_pair(&mut info.winrate, &mut info.score_lead);
+            }
+        }
+        // 换算完成：本对象此后即为黑视角口径（无需额外标记——是否换算由
+        // 调用方按查询视角决定，每份报文只过一次）。
+    }
+
     /// 按查询时的棋盘尺寸解码 GTP 坐标。
     pub(crate) fn decode(self, size: Size) -> AnalysisReport {
         AnalysisReport {
@@ -527,6 +653,28 @@ impl RawReport {
             ownership: self.ownership,
             policy: self.policy,
         }
+    }
+}
+
+/// 单个「行棋方视角 → 黑视角」的胜率 / 目差换算。
+fn normalize_pair(winrate: &mut f64, score_lead: &mut f64) {
+    *winrate = 1.0 - *winrate;
+    *score_lead = -*score_lead;
+}
+
+/// 把 rootInfo 的 winrate / scoreLead / raw* 从行棋方视角换算回黑视角。
+/// 换算只取决于**行棋方**（轮白翻转、轮黑不变），与查询视角字段无关——
+/// SIDETOMOVE 报文的值即行棋方视角，BLACK 报文无需处理。
+pub(crate) fn normalize_root_to_black(root: &mut RootInfo) {
+    if root.current_player == Stone::Black {
+        return;
+    }
+    normalize_pair(&mut root.winrate, &mut root.score_lead);
+    if let Some(raw) = &mut root.raw_winrate {
+        *raw = 1.0 - *raw;
+    }
+    if let Some(raw) = &mut root.raw_lead {
+        *raw = -*raw;
     }
 }
 
@@ -612,6 +760,9 @@ impl WireMessage {
                     winrate: root.winrate.unwrap_or(0.5),
                     score_lead: root.score_lead.unwrap_or(0.0),
                     score_stdev: root.score_stdev.unwrap_or(0.0),
+                    // raw* 缺省 None：上层按「无数据」隐藏显示行，不臆造 0。
+                    raw_winrate: root.raw_winrate,
+                    raw_lead: root.raw_lead,
                 })
             }),
             move_infos: self
