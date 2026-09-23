@@ -18,6 +18,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::play::TimeSystem;
+
 /// 推理后端。这是对**引擎二进制**的描述（OpenCL 版 / Eigen 版），
 /// 不影响命令行参数；供界面展示与降级提示用。可配置项。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -124,6 +126,16 @@ pub struct EngineConfig {
     /// 用户在设置面板显式指定（优先级最高）。规范名即 KataGo 规则串
     /// （`chinese` / `japanese` / …），由 [`resolve_rules`] 产出。
     pub rules: Option<String>,
+    /// 人机对弈的时限制式（新对局窗口编辑；「上次设置持久化，下次新
+    /// 对局默认带出」的载体）。旧配置缺此键时回退缺省制式
+    /// （struct 级 `#[serde(default)]`）。
+    pub time_system: TimeSystem,
+    /// 新对局的规则（新对局窗口六选一，总是具体值；serde 默认中国）。
+    /// 与设置面板的 [`EngineConfig::rules`]（`None` = 自动跟随棋谱）
+    /// **语义独立**：本字段只决定「新开的对局是什么规则」并随另存写进
+    /// `RU[]`；复盘 / 载谱的规则口径仍由设置面板字段管（自动跟随 /
+    /// 显式指定），互不覆盖。旧配置缺此键回退中国规则。
+    pub new_game_rules: Rules,
 }
 
 impl Default for EngineConfig {
@@ -138,6 +150,8 @@ impl Default for EngineConfig {
             analysis_cfg: None,
             play_difficulty: Difficulty::default(),
             rules: None,
+            time_system: TimeSystem::default(),
+            new_game_rules: Rules::Chinese,
         }
     }
 }
@@ -187,7 +201,8 @@ pub fn resolve_rules(cfg_rule: Option<&str>, sgf_rule: Option<&str>) -> RulesRes
 ///
 /// 项目只用这一份列表：设置面板的下拉与 `lenient_rules` 的关键词映射
 /// 都以 [`Rules::ALL`] 为界，映射结果绝不逃出引擎可接受的集合。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Rules {
     /// 中国规则（数子）。
     Chinese,
@@ -239,6 +254,12 @@ impl Rules {
             Self::NewZealand => "新西兰",
             Self::TrompTaylor => "Tromp-Taylor",
         }
+    }
+
+    /// 由 KataGo 规范名反查中文名（映射不出返回规范名原文——防御
+    /// 手改 settings.json 塞进未知串时的显示兜底）。
+    pub fn rules_name(wire: &str) -> String {
+        Self::from_wire(wire).map_or_else(|| wire.to_owned(), |r| r.name().to_owned())
     }
 
     /// 由 KataGo 规范名反查（宽容大小写 / 连字符-空格），设置面板持久化

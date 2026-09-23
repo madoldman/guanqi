@@ -18,6 +18,9 @@
 use crate::board::{Action, Board, Coord, Size, Stone};
 use crate::ui::analysis::Snapshot;
 
+pub mod timer;
+pub use timer::{Clock, SideClock, TimeBudget, TimeSystem, clock_text, engine_budget, side_index_of};
+
 /// 让子摆子坐标：按 KataGo `PlayUtils::placeFixedHandicap`（对弈软件
 /// 事实标准，master 分支 playutils.cpp）的惯例逐让子数给出：
 ///
@@ -78,6 +81,14 @@ pub struct GameSetup {
     /// 人机对弈难度（引擎走子的 visits 档位）。落位到
     /// [`crate::engine::EngineConfig::play_difficulty`] 持久化。
     pub difficulty: crate::engine::Difficulty,
+    /// 对局时限制式（对局开始时确定，对局中只读）。落位到
+    /// [`crate::engine::EngineConfig::time_system`] 持久化，下次
+    /// 新对局默认带出。
+    pub time_system: TimeSystem,
+    /// 新对局的规则（对话框六选一）。落位到
+    /// [`crate::engine::EngineConfig::new_game_rules`] 持久化，并随
+    /// 另存写进 SGF `RU[]`（棋谱不再丢规则）。
+    pub rules: crate::engine::Rules,
 }
 
 impl Default for GameSetup {
@@ -88,6 +99,8 @@ impl Default for GameSetup {
             handicap: 0,
             human: Stone::Black,
             difficulty: crate::engine::Difficulty::default(),
+            time_system: TimeSystem::default(),
+            rules: crate::engine::Rules::Chinese,
         }
     }
 }
@@ -111,7 +124,15 @@ pub struct PlayState {
     /// 对弈模式开启时人类执哪方。
     pub human: Stone,
     /// 认输方；`Some` = 对局已因认输结束（含人类认输与判定引擎认输）。
+    /// **超时判负不走这里**：超时落 [`timeout_loss`]，与认输并列的
+    /// 独立终局路径（SGF 结果 `B+T` / `W+T`，与认输的 `+R` 区分）。
     pub resigned: Option<Stone>,
+    /// 超时判负方；`Some` = 对局已因超时结束（包干用尽 / 读秒次数用尽）。
+    /// 结束语义与认输同一条路径（自动应手停止、复盘浏览），仅结果串
+    /// 与 SGF 标记不同。
+    pub timeout_loss: Option<Stone>,
+    /// 对局时钟（含制式）。对局中只读推进；复盘态为无限制空钟。
+    pub clock: Clock,
     /// 引擎「无望」提示是否已给过（每次对局至多提示一次，确认后不再打扰）。
     hopeless_shown: bool,
 }
@@ -119,22 +140,31 @@ pub struct PlayState {
 impl PlayState {
     /// 复盘初始态（对弈模式关闭）。
     pub fn review() -> Self {
-        Self { mode: false, human: Stone::Black, resigned: None, hopeless_shown: true }
+        Self {
+            mode: false,
+            human: Stone::Black,
+            resigned: None,
+            timeout_loss: None,
+            clock: Clock::new(TimeSystem::Unlimited),
+            hopeless_shown: true,
+        }
     }
 
-    /// 开始新对局：模式开启、无人认输、无望提示复位。
+    /// 开始新对局：模式开启、无人认输、时钟按制式初始化、无望提示复位。
     pub fn new_game(setup: &GameSetup) -> Self {
         Self {
             mode: true,
             human: setup.human,
             resigned: None,
+            timeout_loss: None,
+            clock: Clock::new(setup.time_system),
             hopeless_shown: false,
         }
     }
 
-    /// 对局是否已结束（认输，或棋盘上出现双方连续弃着）。
+    /// 对局是否已结束（认输 / 超时判负，或棋盘上出现双方连续弃着）。
     pub fn finished(&self, board: &Board) -> bool {
-        self.resigned.is_some() || two_passes(board)
+        self.resigned.is_some() || self.timeout_loss.is_some() || two_passes(board)
     }
 }
 

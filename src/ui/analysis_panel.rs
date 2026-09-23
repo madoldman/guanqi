@@ -377,6 +377,7 @@ fn panel_body(
         analysis,
         board,
         cfg,
+        game,
         play,
         new_game_open,
         hopeless,
@@ -437,13 +438,54 @@ fn panel_body(
     action
 }
 
-/// 「对局」卡片：人机对弈开关、难度分段选择器、对局状态与操作按钮。
+/// 时钟行（对弈卡片）：双方各一行——执子 + 读数 + 「正在计时」标记。
+/// 无限制制式显示累计用时；包干显示剩余主时间；读秒制显示主时间 /
+/// 读秒剩余 × 剩余次数。剩余不多（包干 < 1 分钟；读秒期内一律）用
+/// 醒目色但**不闪烁**（一次性换色，不随帧变化）。终局后不再标注
+/// 「正在计时」。
+fn clock_rows(ui: &mut Ui, play: &PlayState, to_play: Stone, finished: bool) {
+    let system = play.clock.system;
+    let engine = play.human.opposite();
+    for (stone, label) in [(play.human, "你"), (engine, "引擎")] {
+        let clock = play.clock.side(stone);
+        let spending = !finished && to_play == stone;
+        let text = crate::play::clock_text(
+            system,
+            clock,
+            play.clock.total[crate::play::side_index_of(stone)],
+        );
+        // 醒目判定：无限制永不醒目；包干剩余 < 1 分钟；读秒期一律醒目
+        // （读秒期本身就是贴着时限下棋的状态）。
+        let urgent = match system {
+            crate::play::TimeSystem::Unlimited => false,
+            crate::play::TimeSystem::Absolute { .. } => clock.main < 60.0,
+            crate::play::TimeSystem::Byoyomi { .. } => clock.in_byoyomi(),
+        };
+        let color = if urgent { theme::colors::WARN } else { Color32::from_rgb(214, 218, 226) };
+        ui.horizontal_wrapped(|ui| {
+            let mark = if spending { "▶" } else { "" };
+            ui.label(RichText::new(format!(
+                "{mark} {label}（执{}）：{text}",
+                stone.name()
+            ))
+            .color(color)
+            .size(12.0));
+        });
+    }
+    // AI 最近一手实际思考时长（引擎实际思考时间口径的可见证据）。
+    if let Some(think) = play.clock.last_engine_think {
+        ui.weak(format!("引擎上一手用时 {:.1} 秒", think.as_secs_f64()));
+    }
+}
+
+/// 「对局」卡片：人机对弈开关、难度分段选择器、对局状态与操作按钮。#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn card_play(
     ui: &mut Ui,
     analysis: &AnalysisState,
     board: &Board,
     cfg: &EngineConfig,
+    game: Option<&GameMeta>,
     play: &mut PlayState,
     new_game_open: &mut bool,
     hopeless: Option<&str>,
@@ -512,10 +554,31 @@ fn card_play(
                 && engine_ready
                 && (analysis.analyzing() || analysis.play_pending(board, cfg.play_difficulty));
             ui.label(format!("你执{}", play.human.name()));
+            // 本局规则与时限（对局开始时确定，对局中只读——界面可见
+            // 的口径声明）。规则名取棋谱 RU 的解析结果（新对局开局时
+            // 已写进 meta.rules，天然一致）。
+            let rules_line = match game.and_then(|meta| meta.info.rules.as_deref()) {
+                Some(raw) => {
+                    crate::engine::Rules::rules_name(
+                        &crate::engine::resolve_rules(None, Some(raw)).rules,
+                    )
+                }
+                None => "中国".to_owned(),
+            };
+            ui.weak(format!(
+                "本局规则：{rules_line} · 时限：{}（开局确定）",
+                play.clock.system.name()
+            ));
+            // ---- 时钟（无限制也显示累计用时；剩余不多用醒目色但
+            // 不闪烁——按剩余比例换一次性配色，不随帧变化）----
+            clock_rows(ui, play, board.to_play(), finished);
             if finished {
-                let reason = match play.resigned {
-                    Some(side) => format!("{}认输：{}", side.name(), resign_text(side)),
-                    None => "对局结束：双方连续弃着".to_owned(),
+                let reason = if let Some(side) = play.resigned {
+                    format!("{}认输：{}", side.name(), resign_text(side))
+                } else if let Some(side) = play.timeout_loss {
+                    format!("{}超时，{}方胜", side.name(), side.opposite().name())
+                } else {
+                    "对局结束：双方连续弃着".to_owned()
                 };
                 ui.colored_label(theme::colors::WARN, reason);
                 // 结束后进入纯复盘浏览：对弈开关保持，但不再自动应手

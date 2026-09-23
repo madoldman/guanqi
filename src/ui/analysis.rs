@@ -1116,6 +1116,23 @@ pub struct AnalysisState {
     /// `effective_rules` 本次 sync 已产生新提示的标记（`&self` 写入
     /// `rules_notice` 的中介，见该函数文档）。
     rules_notice_slot: std::cell::Cell<Option<String>>,
+    /// 终局评估任务（双方弃着终局后由 App 请求）：按目标 visits 对
+    /// **终局面**做一次加深分析，取当时可用的最深终态 scoreLead 作为
+    /// RE 的依据（口径：引擎评估即结果，见 App 的终局路径）。
+    /// `None` = 无任务。局面变化（用户浏览）不取消任务——终局后棋盘
+    /// 不再变化，签名恒匹配；换谱 / 新对局随 `reset()` 清除。
+    terminal_eval: Option<TerminalEval>,
+}
+
+/// 终局评估任务的状态（见 [`AnalysisState::terminal_eval`]）。
+struct TerminalEval {
+    /// 终局面的签名（局面变了任务即失效，防旧局面评估串到新盘面）。
+    sig: Vec<MoveRecord>,
+    /// 目标 visits（加深线，建议 800–1000；取 800 与默认展示档的
+    /// 4 倍量级，收敛噪声远低于半目）。
+    target_visits: u32,
+    /// 迄今收到的最深终态评估（黑方视角 scoreLead，visits 更高者胜出）。
+    best: Option<(u64, f64)>,
 }
 
 impl AnalysisState {
@@ -1151,6 +1168,7 @@ impl AnalysisState {
             sent_view: DisplayView::Black,
             rules_notice: None,
             rules_notice_slot: std::cell::Cell::new(None),
+            terminal_eval: None,
         }
     }
 
@@ -1591,6 +1609,7 @@ impl AnalysisState {
         komi: f64,
         game_rules: Option<&str>,
         want_play_query: bool,
+        play_budget: Option<crate::play::TimeBudget>,
     ) {
         // 局面签名 = 根到当前节点的着法序列：落子 / 导航 / 悔棋 / 改着都会使其变化。
         let sig = board.records();
@@ -1666,7 +1685,14 @@ impl AnalysisState {
                 } else {
                     Stage::Analysis
                 };
-                self.request(board, cfg, stage, komi, game_rules);
+                self.request(
+                    board,
+                    cfg,
+                    stage,
+                    komi,
+                    game_rules,
+                    play_budget.map(|b| b.max_time),
+                );
             }
         }
         while let Some(event) = self.handle.as_mut().and_then(Engine::try_recv) {
@@ -1684,8 +1710,84 @@ impl AnalysisState {
             && play_stale
             && self.inflight.is_none()
         {
-            self.request(board, cfg, Stage::Play, komi, game_rules);
+            self.request(
+                board,
+                cfg,
+                Stage::Play,
+                komi,
+                game_rules,
+                play_budget.map(|b| b.max_time),
+            );
         }
+        // 终局评估派发：有任务、签名匹配、引擎空闲，且「当前签名的最深
+        // 终态评估」尚未达到目标 visits 时，以目标 visits 发起一次展示
+        // 口径查询（复用既有管线，无新机制；终态落 history 后由
+        // `on_report` 回填 best）。签名不匹配（换谱 / 新对局）即丢任务。
+        if let Some(job) = self.terminal_eval.as_ref() {
+            if !job.sig.eq(sig) {
+                self.terminal_eval = None;
+            } else if matches!(self.engine, EngineStatus::Ready)
+                && self.inflight.is_none()
+                && job.best.is_none_or(|(visits, _)| visits < u64::from(job.target_visits))
+            {
+                self.request(
+                    board,
+                    cfg,
+                    Stage::Analysis,
+                    komi,
+                    game_rules,
+                    None,
+                );
+            }
+        }
+    }
+
+    // ---- 终局评估（双方弃着终局的 RE 依据）----
+
+    /// 请求对当前局面做终局评估（App 在双方弃着终局时调用）：现有终态
+    /// 快照 visits 低于 `target` 时以 `target` 发起加深查询，到达后
+    /// [`Self::deepest_terminal_eval`] 给出更深的值；已达标则原值直接
+    /// 可用，不发查询。
+    pub fn request_terminal_eval(&mut self, board: &Board, target: u32) {
+        // 手上终态已够深：直接记录为结果，无需查询。
+        let have = self
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.is_final && snapshot.turn == board.cursor())
+            .and_then(|snapshot| snapshot.root.as_ref())
+            .map(|root| (root.visits, root.score_lead));
+        self.terminal_eval = Some(TerminalEval {
+            sig: board.records().to_vec(),
+            target_visits: target,
+            best: have,
+        });
+    }
+
+    /// 当时可用的最深终局评估（黑方视角 scoreLead）：优先取任务记录
+    /// 的最深终态（可能比展示快照深），否则回落当前终态快照；都没有
+    /// 返回 `None`（RE 写 `?`，不猜）。`Some((visits, lead))` 的
+    /// visits 供验证日志与界面口径标注。
+    pub fn deepest_terminal_eval(&self, board: &Board) -> Option<(u64, f64)> {
+        // 任务存在且签名匹配 ⇒ 用任务的最深记录；任务不存在（未请求）
+        // 时回落快照。
+        if let Some(job) = self.terminal_eval.as_ref() {
+            if !job.sig.eq(board.records()) {
+                return None;
+            }
+            return job.best;
+        }
+        self.snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.is_final && snapshot.turn == board.cursor())
+            .and_then(|snapshot| snapshot.root.as_ref())
+            .map(|root| (root.visits, root.score_lead))
+    }
+
+    /// 终局评估是否仍在加深（界面「终局评估中…」的判定）。
+    pub fn terminal_eval_pending(&self, board: &Board) -> bool {
+        self.terminal_eval
+            .as_ref()
+            .is_some_and(|job| job.sig.eq(board.records()) && job.best.is_none_or(|(visits, _)| visits < u64::from(job.target_visits)))
     }
 
     // ---- 整谱快扫（批量分析当前线）----
@@ -2063,6 +2165,7 @@ impl AnalysisState {
         self.candidates.clear();
         self.play_snapshot = None;
         self.play_sig = None;
+        self.terminal_eval = None;
     }
 
     /// 退出时优雅关闭引擎进程（`App::on_exit` 调用）。
@@ -2079,7 +2182,7 @@ impl AnalysisState {
             EngineEvent::Ready => {
                 self.engine = EngineStatus::Ready;
                 self.transient_error = None;
-                self.request(board, cfg, Stage::Analysis, komi, game_rules);
+                self.request(board, cfg, Stage::Analysis, komi, game_rules, None);
             }
             EngineEvent::Report {
                 id,
@@ -2241,6 +2344,15 @@ impl AnalysisState {
             // 候选表随 root 同一次写入（口径一致，见 record_history 文档）；
             // moves 已按 order 排序，快照顺序即引擎序。
             self.record_history(turn, root, sig, &candidates, candidates_total, game_rules);
+            // 终局评估回填：任务在、局面匹配、visits 不低于已记录值才
+            // 覆盖（与 history 同一覆盖规则；评估任务是纯读方，不改
+            // 展示 / 走子口径的任何状态）。
+            if let Some(job) = self.terminal_eval.as_mut()
+                && job.sig.eq(board.records())
+                && job.best.as_ref().is_none_or(|(visits, _)| root.visits >= *visits)
+            {
+                job.best = Some((root.visits, root.score_lead));
+            }
         }
         if !report.no_results {
             self.transient_error = None;
@@ -2345,7 +2457,11 @@ impl AnalysisState {
 
     /// 对当前局面发起查询（就绪且无在飞时才生效）。`komi` 与解析后的
     /// 规则随查询发给引擎；视角按当前显示口径随 `overrideSettings`
-    /// 显式发送（报告在引擎桥接层归一化回黑视角入库）。
+    /// 显式发送（报告在引擎桥接层归一化回黑视角入库）。`max_time` 为
+    /// 给引擎的时间预算（秒；`None` = 不限时）：**只用于走子口径**——
+    /// 对局制式下的 AI 应手截止线（`overrideSettings.maxTime`，与难度
+    /// 档 maxVisits 先到为准）；展示 / 批量查询绝不携带，时限概念不
+    /// 泄漏进复盘分析。
     fn request(
         &mut self,
         board: &Board,
@@ -2353,6 +2469,7 @@ impl AnalysisState {
         stage: Stage,
         komi: f64,
         game_rules: Option<&str>,
+        max_time: Option<f64>,
     ) {
         if self.inflight.is_some() {
             return;
@@ -2391,7 +2508,16 @@ impl AnalysisState {
         // 视角：显示口径（黑视角时显式发 BLACK，钉死「一律黑视角入库」
         // 的解析前提，不依赖用户 cfg 里的值）。
         query.view = view;
-        query.max_visits = Some(stage.cap(cfg));
+        query.max_visits = Some(
+            // 终局评估查询的 visits 覆盖：任务在、局面匹配、目标高于
+            // 展示配置时按目标发（目标必 ≥800，展示档默认 500；不达标
+            // 的任务在 sync 派发处已被 visits 判定拦住，这里是执行点）。
+            self.terminal_eval
+                .as_ref()
+                .filter(|job| job.sig.eq(board.records()) && stage == Stage::Analysis)
+                .map(|job| job.target_visits.max(stage.cap(cfg)))
+                .unwrap_or_else(|| stage.cap(cfg)),
+        );
         // 热度图需要 ownership（opt-in，引擎缺省不返回该字段）：协议实测
         // 中间报告同样携带（每条约 7–9 KB，0.5s 键下 300 visits 共约 11 条，
         // 见 /tmp/stream-notes.md），开销可忽略，热度图因此也能边搜边显示。
@@ -2416,6 +2542,11 @@ impl AnalysisState {
         // 交互查询会被无限期阻塞（90 秒无响应），带 10 可数秒内插队返回
         // （/tmp/batch-notes.md §3/§7）。
         query.priority = INTERACTIVE_PRIORITY;
+        // 时间预算只进走子口径（对局制式下的 AI 应手截止线）：与视角同在
+        // 唯一的 overrideSettings 对象里发送（见 protocol 模块文档）。
+        if stage == Stage::Play {
+            query.max_time = max_time;
+        }
         let query_rules_after = query.rules.clone();
         let id = handle.analyze(query);
         self.analyzed_sig = Some(board.records().to_vec());
@@ -2449,6 +2580,52 @@ impl Default for AnalysisState {
 pub const STATS_BLOCK_BEGIN: &str = "【观棋统计】";
 /// 根注释统计块的结束界标（见 [`STATS_BLOCK_BEGIN`]）。
 pub const STATS_BLOCK_END: &str = "【/观棋统计】";
+
+/// 根注释「终局估计」块的起始界标（与统计块同一界标幂等机制，见
+/// `save::merge_delimited_block`）：双方弃着终局时写引擎对最后局面的
+/// 目差估计——**估计值不是点目结果**，绝不冒充胜负（SGF `RE` 照实写
+/// `?`）。独立成块而非并入统计块：终局可能没做过任何分析（统计块在
+/// 无数据时不生成），估计行不能因此丢失。
+pub const RESULT_BLOCK_BEGIN: &str = "【观棋终局】";
+/// 根注释「终局估计」块的结束界标（见 [`RESULT_BLOCK_BEGIN`]）。
+pub const RESULT_BLOCK_END: &str = "【/观棋终局】";
+
+/// 由最深终局评估构造「终局判定」块正文（含首尾界标）。弃着终局的
+/// `RE` 与本块**同源**（同一份最深终态 scoreLead）：`score_lead` 为
+/// **黑方视角**原始值（存储口径），规则名随行标注（评估按棋谱 RU 的
+/// 规则算，口径随档案落盘）。`None` 规则名 = 未记录（罕见，防御分支）。
+///
+/// 文案自证口径：明确标注「引擎判定，非点目结果」——本项目不做点目，
+/// 评估按当前规则网络给出，误差概率低但不是数子；其它软件与未来的
+/// 自己不得把它当成数子结果读。
+pub fn result_block_text(score_lead: f64, rules_name: Option<&str>) -> String {
+    let lead_text = if score_lead.abs() < 0.5 {
+        "形势接近（0）".to_owned()
+    } else if score_lead > 0.0 {
+        format!("黑胜 约{score_lead:.1} 目")
+    } else {
+        format!("白胜 约{:.1} 目", -score_lead)
+    };
+    let rules = rules_name.unwrap_or("（未记录）");
+    format!(
+        "{RESULT_BLOCK_BEGIN}\n\
+         终局判定（引擎）：{lead_text} · 按规则「{rules}」评估，非点目结果\n\
+         {RESULT_BLOCK_END}"
+    )
+}
+
+/// 弃着终局的 SGF 结果串：由最深终态评估的黑方视角 scoreLead 给出。
+/// `|lead| ≤ 0.05` 判和（`RE[0]`）；无评估返回 `None`（RE 写 `?`）。
+/// 一位小数直接取引擎值（不凑半目——评估不是数子，伪造精度没有意义）。
+pub fn terminal_result_string(lead: f64) -> String {
+    if lead.abs() <= 0.05 {
+        "0".to_owned()
+    } else if lead > 0.0 {
+        format!("B+{lead:.1}")
+    } else {
+        format!("W+{:.1}", -lead)
+    }
+}
 
 /// 构造「局后统计」根注释块的内容（含首尾界标，作为整段插入或替换根
 /// 注释中的对应区间）。数字**必须**与侧栏「局后统计」卡片一致：全部取自

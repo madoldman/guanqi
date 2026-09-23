@@ -22,7 +22,7 @@
 //! 载入新谱 / 新对局都先经 [`PendingConfirm`] 确认。
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::board::{Board, IllegalReason, MoveRecord, Size, Stone};
 use crate::engine::{Difficulty, EngineConfig, load_settings, save_settings};
@@ -35,6 +35,11 @@ use crate::ui::{
     analysis_panel::{self, LoadNotice},
     curve, mini_board, new_game, overlay, settings, tree,
 };
+
+/// 弃着终局加深评估的目标 visits：手上终态低于此值时自动发起加深
+/// （800 ≈ 默认展示档 500 的 1.6 倍、40 visits 快扫的 20 倍，目差
+/// 噪声收敛到远低于半目；一局已终，多花几秒把结果定稳值得）。
+const TERMINAL_EVAL_TARGET_VISITS: u32 = 800;
 
 /// 另存对话框的默认文件名：取档案路径的文件名，无法取得时退回
 /// `guanqi.sgf`（新对局的档案路径为占位符，走此默认）。
@@ -94,6 +99,17 @@ pub struct GuanqiApp {
     save_notice: Option<LoadNotice>,
     /// 人机对弈状态：模式开关、人类执子、认输与无望提示（复盘初始态）。
     play: PlayState,
+    /// 人类计时推进的上一帧时刻：每帧 `logic` 用真实墙钟差推进当前
+    /// 计时方（轮到人类且在活子位置时才推进，见 `logic` 的守卫）。
+    /// 仅对局进行中有效；帧间隔极端大（挂起恢复）时按实际差值扣。
+    last_frame: Option<Instant>,
+    /// 本局生效规则（新对局时锁定为对话框所选，`Some(规范名)`）；
+    /// `None` = 复盘 / 载谱态，规则走既有「设置显式 > 棋谱 RU > 默认」
+    /// 解析。**本局规则在对局开始时确定**（与时限同一精神，对局中不可
+    /// 改）：设置面板的规则偏好只作用于载入的棋谱，不作用于自己开的
+    /// 对局——否则「对话框选日本、设置面板显式中国」会把查询口径与
+    /// 棋谱 RU 拧开。
+    active_rules: Option<String>,
     /// 新对局设置窗口是否打开。
     new_game_open: bool,
     /// 新对局设置窗口状态（编辑草稿跨窗口开关保留）。
@@ -233,6 +249,8 @@ impl GuanqiApp {
             load_notice: None,
             save_notice: None,
             play: PlayState::review(),
+            last_frame: None,
+            active_rules: None,
             new_game_open: false,
             new_game: new_game::NewGameUi::new(),
             komi: 7.5,
@@ -342,6 +360,9 @@ impl GuanqiApp {
             Ok(loaded) => {
                 let (warning, partial) = (loaded.warning.clone(), loaded.partial);
                 let (board, meta) = loaded.into_parts();
+                // 载入棋谱：退出「新对局锁定规则」态，规则恢复走
+                // 「设置显式 > 棋谱 RU > 默认」解析链。
+                self.active_rules = None;
                 // 新对局：清空分析快照与胜率历史（新对局不混旧曲线）；
                 // 定位高亮所指的局面已不存在，一并清除；旧棋盘的临时提示
                 //（建分支等）随棋盘替换失效，同样清除。
@@ -486,18 +507,51 @@ impl GuanqiApp {
         self.board = board;
         // 棋盘整体替换：树布局指纹换代（与载谱同理）。
         self.tree_epoch = self.tree_epoch.wrapping_add(1);
-        // 元信息同样整体替换：旧棋谱的对局信息与逐手注释不能混进新对局
-        // 的另存文件；让子数记入 info，「另存」才能写出 HA[n]
-        // （普通对局为 0，不写 HA）。
+        // 元信息同样整体替换：旧棋谱的对局信息（含上一盘的结果 RE[] /
+        // 双方 PB[]/PW[]）与逐手注释不能混进新对局的另存文件；让子数
+        // 记入 info，「另存」才能写出 HA[n]（普通对局为 0，不写 HA）。
+        // 对局双方按执子写入（任务 B：人机对弈的 SGF 缺 PB/PW 的补口）；
+        // 时限写 TM/OT（TM = 包干或读秒主时间，OT = 读秒描述）。
         let mut meta = GameMeta::for_path(Path::new("guanqi.sgf"), setup.size);
         meta.info.komi = Some(setup.komi);
         meta.info.handicap = handicap.min(9) as u8;
+        let (human_name, engine_name) = match setup.human {
+            Stone::Black => (&mut meta.info.player_black, &mut meta.info.player_white),
+            Stone::White => (&mut meta.info.player_white, &mut meta.info.player_black),
+        };
+        *human_name = Some("人类".to_owned());
+        *engine_name = Some("观棋(KataGo)".to_owned());
+        let (time_limit, overtime) = time_meta_text(setup.time_system);
+        meta.info.time_limit = time_limit;
+        meta.info.overtime = overtime;
+        // 规则写进 RU（规范名）：打完的棋谱不再丢规则。本局规则在对局
+        // 开始时确定（与时限同一精神）——设置面板的规则偏好只作用于
+        // 载入的棋谱，绝不覆盖本局查询口径。
+        let rules_wire = setup.rules.wire().to_owned();
+        meta.info.rules = Some(rules_wire.clone());
         self.loaded = Some(meta);
         self.komi = setup.komi;
+        // 本局生效规则：新对局直接取对话框所选（new_game_rules），设置
+        // 面板的 rules（None = 自动 / Some = 强制）不参与本局解析。
+        self.active_rules = Some(rules_wire);
+        // 时限制式与新对局规则是新对局设置的一部分：落位到引擎配置并
+        // 持久化（与难度同一落点），下次新对局默认带出。
+        if self.engine_cfg.time_system != setup.time_system
+            || self.engine_cfg.new_game_rules != setup.rules
+        {
+            self.engine_cfg.time_system = setup.time_system;
+            self.engine_cfg.new_game_rules = setup.rules;
+            if let Err(text) = save_settings(&self.engine_cfg) {
+                self.persist_notice = Some(text);
+            } else {
+                self.persist_notice = None;
+            }
+        }
         // 难度是新对局设置的一部分：落位到引擎配置并持久化（与侧栏切换
         // 同一落点），下一手应手即按该档搜索。
         self.set_difficulty(setup.difficulty);
         self.play = PlayState::new_game(&setup);
+        self.last_frame = None;
         let size = setup.size;
         let desc = if handicap > 0 {
             format!("{size} 让{handicap}子")
@@ -505,10 +559,11 @@ impl GuanqiApp {
             size.to_string()
         };
         self.load_notice = Some(LoadNotice::Ok(format!(
-            "新对局已开始：{desc}，你执{}，难度{}（{} visits）。{}",
+            "新对局已开始：{desc}，你执{}，难度{}（{} visits），时限{}。{}",
             setup.human.name(),
             setup.difficulty.name(),
             setup.difficulty.visits(),
+            setup.time_system.name(),
             if kept_research > 0 {
                 format!("（研究副本连同 {kept_research} 手研究成果已丢弃。）")
             } else {
@@ -531,6 +586,145 @@ impl GuanqiApp {
             self.persist_notice = None;
         }
     }
+
+    /// 结束对局：写回对局结果（任务 B 的 RE[] 补口）并提示。
+    /// `result` 为 SGF 标准结果串（`B+R` / `W+T` / `B+3.5` / `?`…）。
+    /// 结果写进 `loaded.info.result`（新对局的元信息由 `start_new_game`
+    /// 整体重建，串不进下一盘；载入棋谱的对局结果原值被本盘结果覆盖
+    /// ——本盘确实结束了，覆盖是事实修正）。
+    /// 弃着终局的引擎判定（`Some` = 最深终态评估的 (visits, 黑方视角
+    /// scoreLead)；`None` = 无可用评估）同时写进根注释界标块
+    /// 「【观棋终局】」（幂等，见 `save::merge_delimited_block`）——存
+    /// meta 的 root_comment，另存路径把它合入 C[]。评估**就是**本盘
+    /// 结果（口径见 `terminal_result_string`），但明确标注非点目。
+    fn finish_game(
+        &mut self,
+        result: String,
+        text: String,
+        evaluation: Option<(u64, f64)>,
+    ) {
+        // 规则名先取（借用于 loaded 之外），再进 meta 的可变借用。
+        let rules_name = self.current_rules_name();
+        if let Some(meta) = self.loaded.as_mut() {
+            meta.info.result = Some(result);
+            if let Some((_, lead)) = evaluation {
+                // 写进**独立字段**而不是 root_comment：root_comment 是棋谱
+                // 自带内容（载入的谱里可能有用户写的文字），另存时原样写回。
+                meta.info.result_block =
+                    Some(crate::ui::analysis::result_block_text(lead, rules_name.as_deref()));
+            }
+        }
+        self.load_notice = Some(analysis_panel::LoadNotice::Ok(text));
+    }
+
+    /// 当前生效规则的中文名（终局判定块的口径标注；取本局锁定规则或
+    /// 载入棋谱的解析规则）。
+    fn current_rules_name(&self) -> Option<String> {
+        let wire = self.active_rules.clone().or_else(|| {
+            self.loaded
+                .as_ref()
+                .and_then(|meta| meta.info.rules.as_deref())
+                .map(|raw| crate::engine::resolve_rules(None, Some(raw)).rules)
+        })?;
+        crate::engine::Rules::from_wire(&wire).map(|r| r.name().to_owned())
+    }
+
+    /// 弃着终局的收尾：取当时可用的最深终局评估定 RE（无评估写 `?`），
+    /// 评估不足 [`TERMINAL_EVAL_TARGET_VISITS`] 时自动发起加深评估
+    /// （复用既有查询管线；到达后 [`refresh_terminal_result`] 更新）。
+    /// 界面提示语按有无评估分两态（评估中 / 终局判定）。
+    fn finish_two_passes(&mut self) {
+        // 手上评估已够深：直接定结果。
+        let deepest = self.analysis.deepest_terminal_eval(&self.board);
+        if let Some((visits, lead)) = deepest
+            && visits >= u64::from(TERMINAL_EVAL_TARGET_VISITS)
+        {
+            let result = crate::ui::analysis::terminal_result_string(lead);
+            let rules = self.current_rules_name().unwrap_or_else(|| "未知".to_owned());
+            let side = if result == "0" {
+                "和棋".to_owned()
+            } else if result.starts_with('B') {
+                "黑胜".to_owned()
+            } else {
+                "白胜".to_owned()
+            };
+            let text = format!(
+                "对局结束：双方连续弃着。终局判定（引擎）：{side}，{result} · \
+                 按规则「{rules}」评估（{visits} visits），非点目结果。"
+            );
+            self.finish_game(result, text, deepest);
+            return;
+        }
+        // 评估缺失 / 不够深：先按现状写（有浅评估也先给出暂定结果，
+        // 无评估写 `?`），同时发起加深评估——到达后 refresh 更新 RE。
+        let result = deepest
+            .as_ref()
+            .map(|(_, lead)| crate::ui::analysis::terminal_result_string(*lead))
+            .unwrap_or_else(|| "?".to_owned());
+        let text = if deepest.is_some() {
+            "对局结束：双方连续弃着。终局评估中…（评估到达后更新结果）。".to_owned()
+        } else {
+            "对局结束：双方连续弃着。暂无引擎评估，SGF 记 RE[?]（评估中…）。".to_owned()
+        };
+        self.analysis
+            .request_terminal_eval(&self.board, TERMINAL_EVAL_TARGET_VISITS);
+        self.finish_game(result, text, deepest);
+    }
+
+    /// 加深评估到达后刷新弃着终局的结果（`logic` 每帧检查）：最深
+    /// 评估达标时更新 RE 与根注释块，并给出终局判定提示。
+    fn refresh_terminal_result(&mut self) {
+        if !self.play.finished(&self.board) || !play::two_passes(&self.board) {
+            return;
+        }
+        let Some((visits, lead)) = self.analysis.deepest_terminal_eval(&self.board) else {
+            return;
+        };
+        if visits < u64::from(TERMINAL_EVAL_TARGET_VISITS) {
+            return;
+        }
+        let result = crate::ui::analysis::terminal_result_string(lead);
+        let already = self
+            .loaded
+            .as_ref()
+            .and_then(|meta| meta.info.result.as_deref())
+            .is_some_and(|r| r == result);
+        if already {
+            return;
+        }
+        let rules = self.current_rules_name().unwrap_or_else(|| "未知".to_owned());
+        let side = if result == "0" {
+            "和棋".to_owned()
+        } else if result.starts_with('B') {
+            "黑胜".to_owned()
+        } else {
+            "白胜".to_owned()
+        };
+        let text = format!(
+            "终局判定（引擎）：{side}，{result} · 按棋谱规则「{rules}」评估 \
+             （{visits} visits），非点目结果。"
+        );
+        self.finish_game(result, text, Some((visits, lead)));
+    }
+
+    /// 超时判负的结束路径：与认输同一条结束语义（自动应手停止、进入
+    /// 复盘浏览），SGF 结果串用 `B+T` / `W+T`（时间超时）。
+    fn finish_timeout(&mut self, loser: Stone) {
+        self.play.timeout_loss = Some(loser);
+        let winner = loser.opposite();
+        let result = format!("{}+T", match winner {
+            Stone::Black => "B",
+            Stone::White => "W",
+        });
+        let text = format!(
+            "{}方超时，{}方胜（{}）。对局已结束，可继续复盘浏览。",
+            loser.name(),
+            winner.name(),
+            result
+        );
+        self.finish_game(result, text, None);
+    }
+
 
     // ---- 研究副本 ----
 
@@ -961,15 +1155,35 @@ impl eframe::App for GuanqiApp {
                 };
             }
             // 人类弃着：与引擎弃着走同一入口（谱树挂弃着子节点）。
+            // 落子后重置该方读秒（读秒制口径：本手 M 秒内完成）；
+            // 若构成双方连续弃着，对局结束——结果未知（本项目不做点目，
+            // 不能拿引擎估计冒充结果），SGF 记 `?`（未知）。
             analysis_panel::PanelAction::HumanPass => {
                 if self.play.mode && !self.play.finished(&self.board) {
+                    let mover = self.play.human;
                     self.board.pass();
+                    self.play.clock.on_human_move(mover);
+                    if play::two_passes(&self.board) {
+                        self.finish_two_passes();
+                    }
                 }
             }
             // 人类认输：记录认输方并给出结果提示；之后自动应手停止。
+            // 结果写回元信息（任务 B：`B+R` / `W+R`，SGF 标准认输方
+            // 记 +R，胜方为对方）。
             analysis_panel::PanelAction::HumanResign => {
                 if self.play.mode && !self.play.finished(&self.board) {
-                    self.play.resigned = Some(self.play.human);
+                    let loser = self.play.human;
+                    self.play.resigned = Some(loser);
+                    let winner = loser.opposite();
+                    let result = format!("{}+R", result_letter(winner));
+                    let text = format!(
+                        "{}认输：{}（{}）。对局已结束，可继续复盘浏览。",
+                        loser.name(),
+                        play::resign_text(loser),
+                        result
+                    );
+                    self.finish_game(result, text, None);
                 }
             }
             // 确认「引擎无望」提示：只收起提示，不自动替引擎认输。
@@ -1160,7 +1374,7 @@ impl eframe::App for GuanqiApp {
                 &mut self.analysis,
                 &self.overlay,
                 self.manual_revealed,
-                Some(&self.play),
+                Some(&mut self.play),
             );
         });
 
@@ -1173,6 +1387,8 @@ impl eframe::App for GuanqiApp {
                 &mut self.new_game,
                 &self.analysis.engine,
                 self.engine_cfg.play_difficulty,
+                self.engine_cfg.time_system,
+                self.engine_cfg.new_game_rules,
             );
             if let new_game::NewGameAction::Start(setup) = action {
                 // 副本有研究成果时先确认（中止 = 新对局窗口已关，保持现状）。
@@ -1279,24 +1495,73 @@ impl eframe::App for GuanqiApp {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
 
+        // ---- 时限计时推进（真实墙钟差；推进条件 = 计时口径，见
+        // play::timer 模块文档：对弈模式、未结束、轮到该方、游标在活子
+        // 位置——导航 / 回看 / 浏览不计时）----
+        let now = Instant::now();
+        // 帧差**限幅 10 秒**：本应用会在窗口不重绘时长时间不跑帧
+        // （KWin 不派发 frame callback、DPMS 熄灭、锁屏都会如此），若不限幅，
+        // 恢复后的第一帧会一次性扣掉几十秒甚至几分钟，等于人类被环境判负。
+        // 限幅后每次停顿最多扣 10 秒（偏向人类、有界），引擎一侧不受影响
+        // ——AI 的用时按实际思考时间结算，不按帧推进。
+        let frame_dt = self.last_frame.replace(now).map_or(0.0, |t| {
+            now.duration_since(t).as_secs_f64().min(10.0)
+        });
+        let finished = self.play.finished(&self.board);
+        let timing_side = self.play.mode
+            && !finished
+            && self.board.cursor() == self.board.line_len()
+            // 引擎按实际思考时间结算（on_engine_move），不按帧推进。
+            && self.board.to_play() == self.play.human;
+        if timing_side {
+            let human = self.play.human;
+            // 读秒扣穿消耗一次但次数尚余时不判负（tick 内部已重置读秒，
+            // 该手继续计时）；次数用尽或包干用尽返回超时方。
+            if let Some(loser) = self.play.clock.tick(human, frame_dt) {
+                self.finish_timeout(loser);
+            }
+        }
+
+        // ---- 引擎时间预算：AI 出招查询带 overrideSettings.maxTime =
+        // max(0.2, 该方剩余可用 − 余量)；AI 剩余 ≤ 0 ⇒ 判 AI 超时负
+        // （不给引擎 0 时间；预算由 play::engine_budget 计算，难度档
+        // maxVisits 仍是上限——时间只是另一条截止线）----
+        let engine = self.play.human.opposite();
+        let engine_budget = if self.play.mode
+            && !finished
+            && self.play.clock.side(engine).usable().is_some_and(|t| t <= 0.0)
+        {
+            self.finish_timeout(engine);
+            None
+        } else {
+            play::engine_budget(self.play.clock.side(engine))
+        };
+
         // 走子查询需求（App 判定，AnalysisState 不感知对弈状态）：对弈
         // 模式开启、未认输、未双方连续弃着、轮到引擎且在活子位置。
         let want_play_query = self.play.mode
             && self.play.resigned.is_none()
+            && self.play.timeout_loss.is_none()
             && !play::two_passes(&self.board)
             && self.board.to_play() != self.play.human
             && self.board.cursor() == self.board.line_len();
-        // 规则来源：已载入棋谱的 `RU[]` 原始串（None = 无棋谱 / 谱上未写）。
-        // 与设置偏好一起在 AnalysisState.sync 内按「显式 > 棋谱（宽容映射）
-        // > 默认」解析；未识别串的提示由 take_rules_notice 取走进消息区。
-        let game_rules = self.loaded.as_ref().and_then(|meta| meta.info.rules.as_deref());
+        // 规则来源（口径见 active_rules 字段文档）：新对局锁定为开局
+        // 所选（active_rules），绕过设置面板与棋谱 RU 的解析链；复盘 /
+        // 载谱态走既有「设置显式 > 棋谱 RU（宽容映射）> 默认」。
+        let game_rules = match self.active_rules.as_deref() {
+            Some(rules) => Some(rules),
+            None => self.loaded.as_ref().and_then(|meta| meta.info.rules.as_deref()),
+        };
         self.analysis.sync(
             &self.board,
             &self.engine_cfg,
             self.komi,
             game_rules,
             want_play_query,
+            engine_budget,
         );
+        // 弃着终局的加深评估到达后刷新结果（RE / 根注释 / 提示）。
+        self.refresh_terminal_result();
         // 整谱快扫结束提示（完成 / 取消 / 局面变化自动取消）落位到消息区。
         if let Some(notice) = self.analysis.take_batch_notice() {
             self.load_notice = Some(analysis_panel::LoadNotice::Ok(notice));
@@ -1324,26 +1589,48 @@ impl eframe::App for GuanqiApp {
                 .play_snapshot(&self.board, self.engine_cfg.play_difficulty),
             engine_ready,
         );
-        // 认输状态独立短路：决策函数只看棋盘，看不到 resigned。
+        // 认输状态独立短路：决策函数只看棋盘，看不到 resigned。落子的
+        // 同时按引擎**实际思考时间**结算 AI 方时钟（口径：从发走子口径
+        // 查询到收到终态；play_snapshot 就绪即终态已到）。
         // 首选着法由引擎对当前盘面搜索得出；除非盘面在报告间隙被人为
         // 改过（对弈流程内不会发生），落子必然合法，非法结果忽略。
         if self.play.resigned.is_none()
+            && self.play.timeout_loss.is_none()
             && let Some(action) = decision
         {
+            let think = self
+                .analysis
+                .play_snapshot(&self.board, self.engine_cfg.play_difficulty)
+                .map(|s| s.elapsed)
+                .unwrap_or_default();
+            self.play.clock.on_engine_move(engine, think);
             match action {
                 crate::board::Action::Place(at) => {
                     let _ = self.board.play(at);
                 }
-                crate::board::Action::Pass => self.board.pass(),
+                // 引擎弃着：若构成双方连续弃着，对局结束（结果未知，
+                // RE[?]；引擎估计的口径与人类弃着路径一致）。
+                crate::board::Action::Pass => {
+                    self.board.pass();
+                    if self.play.mode && play::two_passes(&self.board) {
+                        self.finish_two_passes();
+                    }
+                }
             }
         }
 
         // 启动 / 分析期间保持低频重绘，让状态与计时可见
-        // （事件到达时 waker 已会触发立即重绘）。
+        // （事件到达时 waker 已会触发立即重绘）。对弈中人类计时需要
+        // 秒级可见的推进，空闲兜底同样保持低频即可（无限制 / 读秒的
+        // 剩余显示 1s 粒度足够，无需高频重绘费电）。
         if matches!(self.analysis.engine, EngineStatus::Starting)
             || self.analysis.analyzing()
             || self.analysis.batch_progress().is_some()
         {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        } else if self.play.mode && !self.play.finished(&self.board) {
+            // 对局进行中：时钟显示需要持续刷新（每 500ms 一帧，读秒
+            // 剩余 / 累计用时的秒位跳动可见）。
             ctx.request_repaint_after(Duration::from_millis(500));
         } else {
             // 空闲兜底：复盘浏览时若没有任何 repaint 源（引擎空闲、无对话框、
@@ -1359,3 +1646,28 @@ impl eframe::App for GuanqiApp {
         self.analysis.shutdown();
     }
 }
+
+/// 时限制式的 SGF 元信息文本（`TM` / `OT`）：包干与读秒的主时间都进
+/// `TM`；读秒描述（每手秒数 × 次数）进 `OT`。无限制不写（`None`，
+/// 与 SGF 惯例一致——未配置时限的谱不落 TM/OT）。
+fn time_meta_text(system: play::TimeSystem) -> (Option<String>, Option<String>) {
+    match system {
+        play::TimeSystem::Unlimited => (None, None),
+        play::TimeSystem::Absolute { seconds } => {
+            (Some(format!("{} 分钟", (seconds / 60.0).round() as u64)), None)
+        }
+        play::TimeSystem::Byoyomi { main_seconds, period_seconds, periods } => (
+            Some(format!("{} 分钟", (main_seconds / 60.0).round() as u64)),
+            Some(format!("{} 次 × {} 秒读秒", periods, period_seconds.round() as u64)),
+        ),
+    }
+}
+
+/// 胜方的 SGF 结果串字母（`B+R` / `W+T` 等的 `B` / `W` 部分）。
+fn result_letter(winner: Stone) -> &'static str {
+    match winner {
+        Stone::Black => "B",
+        Stone::White => "W",
+    }
+}
+

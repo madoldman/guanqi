@@ -104,6 +104,7 @@ impl GameMeta {
                 charset: None,
                 format: None,
                 root_comment: None,
+            result_block: None,
             },
             comments: HashMap::new(),
         }

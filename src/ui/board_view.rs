@@ -75,9 +75,9 @@ pub fn show(
     analysis: &mut AnalysisState,
     overlay: &Overlay,
     manual_revealed: bool,
-    play: Option<&PlayState>,
+    mut play: Option<&mut PlayState>,
 ) {
-    handle_keyboard(ui, board, notice, branch_notice, play);
+    handle_keyboard(ui, board, notice, branch_notice, play.as_deref());
 
     // 限制状态整帧共用一份快照（状态栏标识与棋盘绘制同源）。
     let limits = analysis.limits().clone();
@@ -191,7 +191,7 @@ pub fn show(
                 analysis.toggle_avoid(board.to_play(), at);
             }
             if response.clicked() {
-                handle_click(board, notice, branch_notice, &layout, response.interact_pointer_pos());
+                handle_click(board, notice, branch_notice, &layout, response.interact_pointer_pos(), play.as_deref_mut());
             }
         }
     }
@@ -237,7 +237,7 @@ pub fn show(
         );
     }
 
-    draw_status(ui, board, *notice, branch_notice.as_deref(), play, &limits);
+    draw_status(ui, board, *notice, branch_notice.as_deref(), play.as_deref(), &limits);
 }
 
 /// 热度图数据源标识行：棋盘上方小字（琥珀/紫色弱化），只在候选点层
@@ -389,14 +389,25 @@ fn handle_click(
     branch_notice: &mut Option<String>,
     layout: &Layout,
     pos: Option<Pos2>,
+    play: Option<&mut PlayState>,
 ) {
     let Some(pos) = pos else { return };
     let Some(at) = layout.hit_test(pos) else { return };
     let children_before = board.child_count();
     let moves_before = board.move_count();
+    let mover = board.to_play();
     match board.play(at) {
         Ok(()) => {
             *notice = None;
+            // 人类在对弈模式下落子成功：读秒制下重置该方当前读秒
+            // （「每手 M 秒内落子即可」——下一手重新数满）。复盘模式的
+            // 摆子不经过时钟（时钟只在对弈模式推进）。
+            if let Some(play) = play
+                && play.mode
+                && mover == play.human
+            {
+                play.clock.on_human_move(mover);
+            }
             // 「新建了变着分支」= 当前节点**确实多了一个兄弟分支**：
             // play 后全树节点数增加（排除「切进已有分支」），且落子前当前
             // 节点已有别的子（根 / 叶的第一个子是正常续棋，不是变着）。
@@ -795,11 +806,16 @@ fn draw_status(
                     segment(ui, &|ui| match play {
                         Some(play) if play.mode => {
                             if play.finished(board) {
-                                let text = match play.resigned {
-                                    Some(side) => {
-                                        format!("{}认输，{}", side.name(), resign_text(side))
-                                    }
-                                    None => "对局结束：双方连续弃着".to_owned(),
+                                let text = if let Some(side) = play.resigned {
+                                    format!("{}认输，{}", side.name(), resign_text(side))
+                                } else if let Some(side) = play.timeout_loss {
+                                    format!(
+                                        "{}超时，{}方胜",
+                                        side.name(),
+                                        side.opposite().name()
+                                    )
+                                } else {
+                                    "对局结束：双方连续弃着".to_owned()
                                 };
                                 ui.colored_label(theme::colors::WARN, text);
                             } else if board.to_play() == play.human {

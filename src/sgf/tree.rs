@@ -204,7 +204,16 @@ pub struct GameInfo {
     pub charset: Option<String>,
     pub format: Option<u8>,
     /// 根节点注释（`C`，首尾空白已整理）。
+    ///
+    /// **只读语义**：这是从棋谱里读到的东西，另存时原样写回。程序自己要
+    /// 追加的内容（局后统计、终局判定）一律走 [`Self::stats_block`] /
+    /// [`Self::result_block`]，**绝不改写本字段**——否则用户写在根注释里的
+    /// 文字会被静默抹掉（`finish_game` 曾这么干过）。
     pub root_comment: Option<String>,
+    /// 待写入根注释的「终局判定」界标块（程序生成、非棋谱内容；局后统计
+    /// 是另存时现算的，走 `stats_block` 参数，不入本结构）。
+    /// 由另存路径按 [`crate::ui::analysis::RESULT_BLOCK_BEGIN`] 界标幂等合入。
+    pub result_block: Option<String>,
 }
 
 impl GameInfo {
@@ -267,6 +276,8 @@ impl GameInfo {
             charset: s("CA"),
             format,
             root_comment: root.comment().filter(|v| !v.is_empty()).map(str::to_owned),
+            // 程序生成的终局判定块：解析出来的棋谱里没有，恒 None。
+            result_block: None,
         })
     }
 }

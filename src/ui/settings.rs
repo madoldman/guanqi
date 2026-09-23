@@ -70,6 +70,10 @@ impl SettingsUi {
             play_difficulty: base.play_difficulty,
             // 规则存规范名（下拉只产规范名，防自由文本进 settings.json）。
             rules: self.draft.rules.map(|r| r.wire().to_owned()),
+            // 时限制式与「新对局规则」不在本窗口编辑（新对局窗口改），
+            // 原值保留。
+            time_system: base.time_system,
+            new_game_rules: base.new_game_rules,
         }
     }
 

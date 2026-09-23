@@ -70,7 +70,7 @@ impl std::error::Error for SaveError {
 /// 空盘或未载入棋谱时也能存出合法的 SGF，此时只写通用属性与根摆子。
 /// `stats_block` 为「局后统计」根注释块（含首尾界标
 /// 的整段文本，`ui::analysis::stats_block_text` 产出）；`Some` 时按
-/// [`append_stats_block`] 的幂等语义合入根注释（不覆盖用户原有内容）。
+/// [`merge_delimited_block`] 的幂等语义合入根注释（不覆盖用户原有内容）。
 pub fn board_to_sgf(board: &Board, meta: Option<&GameMeta>, stats_block: Option<&str>) -> String {
     let info = meta.map(|m| &m.info);
     let mut tree = GameTree::default();
@@ -78,11 +78,22 @@ pub fn board_to_sgf(board: &Board, meta: Option<&GameMeta>, stats_block: Option<
     if let Some(block) = stats_block {
         merge_stats_block(&mut root, block);
     }
+    // 终局判定块（终局由引擎判定时 `finish_game` 写进 info.result_block）：
+    // 按同一套界标语义幂等合入，**用户原有的根注释文字原样保留**。
+    // 早先的写法是把整段 root_comment 当块传进来（还会先把 root_comment
+    // 覆盖成块）——那会静默抹掉用户写在根注释里的文字，已改掉。
+    if let Some(block) = info.and_then(|i| i.result_block.as_deref()) {
+        merge_delimited_block(
+            &mut root,
+            crate::ui::analysis::RESULT_BLOCK_BEGIN,
+            crate::ui::analysis::RESULT_BLOCK_END,
+            block,
+        );
+    }
     tree.nodes.push(root);
     extend_tree(board, 0, SIG_INIT, meta, &mut tree);
     tree.write()
 }
-
 /// 序列化并写入文件（UTF-8 无 BOM；文本由 [`GameTree::write`] 生成）。
 /// 落盘为原子写（见 [`write_atomically`]），失败时已有文件不受影响。
 /// `stats_block` 语义见 [`board_to_sgf`]。
@@ -97,17 +108,28 @@ pub fn save_to_file(
 }
 
 /// 把统计块合入根节点的 `C[]`（幂等）：根注释原有的用户内容**原样保留**，
-/// 统计块以界标（【观棋统计】…【/观棋统计】）定位——
-/// - 根注释不存在 / 为空：新建根注释，只含统计块；
-/// - 根注释里没有块：在原注释与统计块之间以一个空行衔接后**追加**；
+/// 统计块以界标（【观棋统计】…【/观棋统计】）定位——委托给通用函数
+/// [`merge_delimited_block`]。
+fn merge_stats_block(root: &mut SgfNode, block: &str) {
+    merge_delimited_block(
+        root,
+        crate::ui::analysis::STATS_BLOCK_BEGIN,
+        crate::ui::analysis::STATS_BLOCK_END,
+        block,
+    );
+}
+
+/// 把一块**界标定界**的文本幂等合入根节点 `C[]`（统计块与终局估计块
+/// 共用的通用实现）：根注释原有的用户内容原样保留，块以 `begin` …
+/// `end` 界标定位——
+/// - 根注释不存在 / 为空：新建根注释，只含该块；
+/// - 根注释里没有块：在原注释与块之间以一个空行衔接后**追加**；
 /// - 根注释里已有块（重复另存）：**替换**界标区间内的全部内容（含两个
-///   界标本身），区间外用户内容不动——绝不出现两份统计块。
+///   界标本身），区间外用户内容不动——绝不出现两份同界标块。
 ///
 /// 根节点可能存在多个 C 属性（罕见但合法）；写入目标取第一个，替换 /
 /// 追加都在它身上进行，其余原样保留，避免重排用户数据。
-fn merge_stats_block(root: &mut SgfNode, block: &str) {
-    let begin = crate::ui::analysis::STATS_BLOCK_BEGIN;
-    let end = crate::ui::analysis::STATS_BLOCK_END;
+fn merge_delimited_block(root: &mut SgfNode, begin: &str, end: &str, block: &str) {
     let pos = root.props.iter().position(|prop| prop.ident == "C");
     let Some(pos) = pos else {
         root.props.push(prop("C", block));
@@ -122,7 +144,7 @@ fn merge_stats_block(root: &mut SgfNode, block: &str) {
     }
     let Some(comment) = values.first_mut() else { return };
     if let Some(start) = comment.find(begin) {
-        // 已有统计块：替换到结束界标为止（结束界标缺失时替换到注释末尾
+        // 已有块：替换到结束界标为止（结束界标缺失时替换到注释末尾
         // ——半截块同样按幂等处理，不留下孤儿开头）。
         let tail_start = comment[start..]
             .find(end)

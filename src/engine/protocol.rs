@@ -171,6 +171,13 @@ pub struct AnalysisQuery {
     /// = 显示口径（报告在 [`super::Engine`] 出口被归一化回黑视角，
     /// 上层读取恒为黑视角值）。
     pub view: WinrateView,
+    /// 时间预算（`overrideSettings.maxTime`，秒）：对局制式下 AI 应手
+    /// 查询的**截止时间线**；`None` = 不发送（无限制制式 / 非走子查询）。
+    /// 与难度档 `maxVisits` 同时生效、先到为准——时间限制是截止线，
+    /// 绝不借它让引擎变强（visits 上限语义不变）。必须并入
+    /// [`WireOverrideSettings`] 这**唯一一个** overrideSettings 对象
+    /// （发两次后者顶掉前者，见该结构文档）。
+    pub max_time: Option<f64>,
 }
 
 /// 一组选点限制。`allow` 与 `avoid` 不可同时非空（引擎实测显式报错）。
@@ -237,6 +244,7 @@ impl AnalysisQuery {
             priority: 0,
             move_rules: None,
             view: WinrateView::Black,
+            max_time: None,
         }
     }
 }
@@ -289,12 +297,12 @@ struct WireQuery<'a> {
     /// 视角等查询级覆盖项。**永远发送**（恒 `Some`）：本项目不依赖用户
     /// cfg 里的 `reportAnalysisWinratesAs`——cfg 可被用户手改成任意值，
     /// 而「报告一律归一化回黑视角」的解析前提必须由本字段逐查询钉死。
-    /// 现在只有视角一项；将来其它 overrideSettings 一律并入本对象，
-    /// 绝不发两个 overrideSettings（后者会顶掉前者）。
+    /// 其它 overrideSettings（maxTime 等）一律并入本对象，绝不发两个
+    /// overrideSettings（后者会顶掉前者）。
     override_settings: WireOverrideSettings<'a>,
 }
 
-/// `overrideSettings` 的线上形态（目前只有视角一项）。
+/// `overrideSettings` 的线上形态（视角 + 时间预算）。
 ///
 /// v1.18.2 实测：嵌套 overrideSettings 内的键值引擎认识即生效；对照
 /// 报文见 [`WinrateView`]。注意模块文档的教训：**嵌套**字段拼错是
@@ -304,6 +312,12 @@ struct WireQuery<'a> {
 struct WireOverrideSettings<'a> {
     #[serde(rename = "reportAnalysisWinratesAs")]
     report_analysis_winrates_as: &'a str,
+    /// 时间预算（秒）。`None` = 省略字段（对局无时间压力的查询全部
+    /// 不发该键，引擎沿用其默认 = 无时限）。KataGo v1.18 的
+    /// `maxTime` 是查询级 overrideSettings 键：搜索在到达该时长时
+    /// 输出当前进度并按既有流程结束（终态照常返回）。
+    #[serde(rename = "maxTime", skip_serializing_if = "Option::is_none")]
+    max_time: Option<f64>,
 }
 
 /// 线上规则条目：坐标串借自 [`AnalysisQuery::move_rules`] 的字符串。
@@ -392,6 +406,7 @@ impl AnalysisQuery {
             avoid_moves,
             override_settings: WireOverrideSettings {
                 report_analysis_winrates_as: self.view.wire(),
+                max_time: self.max_time,
             },
         };
         serde_json::to_string(&wire).unwrap_or_else(|_| {
