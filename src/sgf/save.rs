@@ -19,7 +19,13 @@
 //! - `AE`（清除摆子）在盘面上不留痕迹（清除后即空点），写不出；
 //!   载入端对空 `AE` 无感，仅「全清摆子」这类罕见谱会丢摆子信息；
 //! - 当前选中分支（`Board::selected_child`）在 SGF 标准里没有对应
-//!   属性，不保存；重新载入后按惯例定位主变。
+//!   属性，不保存；重新载入后按惯例定位主变；
+//! - **恒按 `FF[4]` 写出**：写出端与我们支持的属性集合以 FF4 为准，
+//!   FF[5] 谱另存后版本号会降为 4（内容不丢，只是版本标称变小）。这是
+//!   有损改写，App 侧在另存后如实提示「原谱 SGF 版本为 FF[n]，已按
+//!   FF[4] 另存」，不静默降级；
+//! - `AP`（创建该文件的程序）**只用原值**：原谱写了就照写（作者是原程序），
+//!   没有才署本程序的名——恒写自己的名字等于认领别人做的谱。
 
 use std::path::Path;
 
@@ -295,8 +301,14 @@ fn build_root(board: &Board, info: Option<&GameInfo>) -> SgfNode {
     node.props.push(prop("GM", "1"));
     node.props.push(prop("FF", "4"));
     node.props.push(prop("CA", "UTF-8"));
-    node.props
-        .push(prop("AP", concat!("Guanqi:", env!("CARGO_PKG_VERSION"))));
+    // 产生程序（`AP`）：**谱上有原值就保留原值**。`AP` 的语义是「创建
+    // 该文件的程序」，恒写我们自己的名字等于把别人做的谱认领到自己头上
+    // （冒名）；只有在原谱没写 `AP` 时（本程序新建的谱）才署名。
+    let application = info
+        .and_then(|i| i.application.as_deref())
+        .filter(|v| !v.is_empty())
+        .unwrap_or(concat!("Guanqi:", env!("CARGO_PKG_VERSION")));
+    node.props.push(prop("AP", application));
     node.props.push(prop("SZ", &size.n().to_string()));
     if let Some(info) = info {
         // KM / HA / PL 只在语义非缺省时写：贴目 0、无让子、以及与

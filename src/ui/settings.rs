@@ -1,7 +1,9 @@
-//! 引擎设置窗口（TASKS 3.3）：编辑引擎路径 / 权重 / 后端 / 思考量并持久化。
+//! 引擎设置窗口（TASKS 3.3）：编辑引擎路径 / 权重 / 思考量并持久化。
 //!
-//! KataGo 是外部依赖：这里列出的都是用户可配置项，不含任何本机预设。
-//! 修改引擎路径 / 权重 / 后端后必须**重启引擎进程**才生效——「保存并重启
+//! KataGo 是外部依赖，由用户自备：这里列出的都是用户可配置项，不含任何
+//! 本机预设。引擎的构建/后端（OpenCL 版 / Eigen 版）取决于用户安装的
+//! 引擎二进制，不是本项目的设置项，故不在此处暴露。
+//! 修改引擎路径 / 权重后必须**重启引擎进程**才生效——「保存并重启
 //! 引擎」按钮一并完成持久化与重启触发（返回 [`SettingsAction::ApplyRestart`]）；
 //! 仅「保存」则写入磁盘并更新当前配置，引擎在下次启动时生效。
 
@@ -9,9 +11,7 @@ use std::path::{Path, PathBuf};
 
 use egui::{Color32, Context, Ui};
 
-use crate::engine::{
-    find_katago_in_path, save_settings, scan_weights, EngineBackend, EngineConfig,
-};
+use crate::engine::{find_katago_in_path, save_settings, scan_weights, EngineConfig};
 
 /// 设置窗口状态（编辑草稿 + 权重候选缓存 + 提示）。
 pub struct SettingsUi {
@@ -28,7 +28,6 @@ pub struct SettingsUi {
         engine_path: String,
         model_path: Option<PathBuf>,
         weights_dir: String,
-        backend: EngineBackend,
         visits: u32,
         /// 搜索线程数（写入 `analysis.cfg` 的 `numSearchThreads`）。
         search_threads: u32,
@@ -43,7 +42,6 @@ impl SettingsUi {
                 engine_path: cfg.engine_path.display().to_string(),
                 model_path: cfg.model_path.clone(),
                 weights_dir: cfg.weights_dir.display().to_string(),
-                backend: cfg.backend,
                 visits: cfg.visits,
                 search_threads: cfg.search_threads,
                 rules: cfg.rules.as_deref().and_then(crate::engine::Rules::from_wire),
@@ -65,7 +63,6 @@ impl SettingsUi {
             engine_path: PathBuf::from(self.draft.engine_path.trim()),
             model_path: self.draft.model_path.clone(),
             weights_dir: PathBuf::from(self.draft.weights_dir.trim()),
-            backend: self.draft.backend,
             visits: self.draft.visits.max(1),
             search_threads: self.draft.search_threads.max(1),
             analysis_cfg: base.analysis_cfg.clone(),
@@ -159,13 +156,6 @@ fn body(ui: &mut Ui, state: &mut SettingsUi, cfg: &mut EngineConfig, action: &mu
             weight_selector(ui, state);
             ui.end_row();
 
-            ui.label("后端");
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut state.draft.backend, EngineBackend::OpenCL, "OpenCL（GPU）");
-                ui.radio_value(&mut state.draft.backend, EngineBackend::Eigen, "Eigen（CPU）");
-            });
-            ui.end_row();
-
             ui.label("思考量");
             ui.vertical(|ui| {
                 ui.add(
@@ -256,7 +246,7 @@ fn body(ui: &mut Ui, state: &mut SettingsUi, cfg: &mut EngineConfig, action: &mu
         ui.colored_label(color, text);
     }
     ui.add_space(4.0);
-    ui.weak("修改引擎路径 / 权重 / 后端 / 搜索线程后，需要重启引擎进程才能生效。");
+    ui.weak("修改引擎路径 / 权重 / 搜索线程后，需要重启引擎进程才能生效。");
 }
 
 /// 权重下拉选择：显示文件名与体积，按训练步数新→旧（`scan_weights` 已排序）。

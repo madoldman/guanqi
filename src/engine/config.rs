@@ -1,8 +1,11 @@
 //! 引擎配置与应用设置数据层（阶段 3.3 的非 UI 部分）。
 //!
-//! KataGo 是**外部依赖**而非项目自身的一部分：用户用什么引擎路径、哪个权重、
-//! 哪个后端、多少思考量，全部是可配置项。本模块只负责给出**可移植的默认值
-//! 来源**与持久化：
+//! KataGo 是**外部依赖**而非项目自身的一部分，由用户自备：用哪个引擎
+//! 路径、哪个权重、多少思考量是可配置项；而引擎的**构建/后端**（OpenCL
+//! 版还是 Eigen 版）由用户安装的引擎二进制决定，不属于本项目设置项——
+//! 历史上这里曾有一个 `backend` 字段，但它从未传给引擎，是个假开关，
+//! 已删除（旧配置文件里的 `"backend"` 键按退休项静默忽略）。
+//! 本模块只负责给出**可移植的默认值来源**与持久化：
 //!
 //! - 引擎路径：先在 `PATH` 中查找 `katago`，查不到再回退 `/usr/bin/katago`；
 //! - 权重：扫描 [`EngineConfig::weights_dir`]（默认 `~/.local/share/katago/`）
@@ -164,27 +167,6 @@ impl UiPrefs {
     }
 }
 
-/// 推理后端。这是对**引擎二进制**的描述（OpenCL 版 / Eigen 版），
-/// 不影响命令行参数；供界面展示与降级提示用。可配置项。
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
-pub enum EngineBackend {
-    /// GPU（OpenCL）。
-    #[default]
-    OpenCL,
-    /// CPU（Eigen），降级方案。
-    Eigen,
-}
-
-impl EngineBackend {
-    /// 用户可读名称（界面直接显示）。
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::OpenCL => "OpenCL（GPU）",
-            Self::Eigen => "Eigen（CPU）",
-        }
-    }
-}
-
 /// 人机对弈难度档位：预设**引擎走子**使用的访问量（visits）。
 ///
 /// 只影响引擎应手的思考量，不影响展示分析（展示口径仍是「快查询 →
@@ -259,8 +241,6 @@ pub struct EngineConfig {
     pub model_path: Option<PathBuf>,
     /// 权重扫描目录（供界面列出候选项）。
     pub weights_dir: PathBuf,
-    /// 推理后端（描述性字段，见 [`EngineBackend`]）。
-    pub backend: EngineBackend,
     /// 默认思考量（visits）。查询级 `maxVisits` 可再覆盖。
     pub visits: u32,
     /// 引擎搜索线程数，写入生成的 `analysis.cfg`。
@@ -296,7 +276,6 @@ impl Default for EngineConfig {
             engine_path: find_katago_in_path().unwrap_or_else(fallback_engine_path),
             model_path: pick_newest_weights(&default_weights_dir()),
             weights_dir: default_weights_dir(),
-            backend: EngineBackend::OpenCL,
             // 默认展示思考量 300（作者确认下调；仅影响未配置过的新用户，
             // 已有 settings.json 里显式的 visits 值不受影响）。
             visits: 300,
@@ -700,10 +679,12 @@ fn config_from_value(value: &serde_json::Value, notices: &mut Vec<String>) -> En
         },
         None => default.weights_dir.clone(),
     };
-    let backend: EngineBackend = match map.get("backend") {
-        Some(raw) => field(notices, "backend", raw, "默认", r#""OpenCL""#),
-        None => default.backend,
-    };
+    // `backend` 是退休项（2026-09 删除）：它描述引擎二进制的构建
+    // （OpenCL / Eigen），由用户安装的 katago 决定，本程序无从也无需
+    // 运行时切换，更从未传给引擎。旧 settings.json 里遗留的该键**静默
+    // 丢弃**——它不是错误，所以不产生提示（提示只用于「值无法识别、
+    // 已按某某处理」这类会改变用户观感的场合）。
+    // 本函数逐字段收割已知键，未列出的键（含退休的 `backend`）自然被忽略。
     let visits: u32 = match map.get("visits") {
         Some(raw) => field(notices, "visits", raw, "默认", "300"),
         None => default.visits,
@@ -789,7 +770,6 @@ fn config_from_value(value: &serde_json::Value, notices: &mut Vec<String>) -> En
         engine_path,
         model_path,
         weights_dir,
-        backend,
         visits: visits.max(1),
         search_threads: search_threads.max(1),
         analysis_cfg,

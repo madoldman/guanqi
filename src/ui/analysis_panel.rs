@@ -693,7 +693,7 @@ fn card_play(
     action
 }
 
-/// 「引擎」卡片：状态点 + 权重 / 后端 / 思考量 / 规则信息与设置入口。
+/// 「引擎」卡片：状态点 + 权重 / 思考量 / 规则信息与设置入口。
 fn card_engine(
     ui: &mut Ui,
     analysis: &AnalysisState,
@@ -736,7 +736,6 @@ fn card_engine(
             ui.weak("模型加载或显卡调优可能需要数十秒，请稍候。");
         }
         info_line(ui, "权重", &model_name(cfg));
-        info_line(ui, "后端", cfg.backend.name());
         info_line(ui, "思考量", &format!("{} visits", cfg.visits.max(1))).on_hover_text(
             "visits = 引擎搜索时对每个候选点的模拟访问次数，总和即思考量。             越大越强、越慢：本机实测（b18 权重 + OpenCL）约 60 visits/秒，             300 visits ≈ 5–6 秒，2000 visits ≈ 半分钟。",
         );

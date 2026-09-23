@@ -11,7 +11,8 @@
 //! - 其后逐节点取 `B` / `W` 着点（空值与 `tt` 为弃着），用
 //!   [`Board::play`] / [`Board::pass`] 重放；中途节点的摆子属性不支持，
 //!   忽略并在提示中说明（不静默丢数据）；无行棋属性的纯注释节点跳过，
-//!   其 `C` 注释随节点丢弃（与既有行为一致）；
+//!   其 `C` 注释随节点丢弃——**丢弃条数计入载入提示**（不静默丢，见
+//!   [`LoadedGame::dropped_comments`]）；
 //! - **非法着法不整体失败**：主变上遇到即停止重放该线，保留已载入部分
 //!   （[`LoadedGame::partial`] = true）；变着分支上遇到只放弃该分支，
 //!   其它分支与主变不受影响；两类情况连同中途摆子一并汇入
@@ -192,6 +193,11 @@ pub struct LoadedGame {
     /// 无法对应到任何节点的未识别属性条数（挂在被载入过程丢弃的节点上，
     /// 例如非法着法的节点、纯注释节点）：另存写不出它们，App 据此提示。
     pub unplaced_props: usize,
+    /// 因所在节点没有着法（纯注释 / 空节点）而无法挂载的**注释条数**：
+    /// 逐手注释按局面签名索引，而这类节点不产生棋盘节点、拿不到签名，
+    /// 注释只能丢弃。与 [`Self::unplaced_props`] 同为「载入丢东西」的
+    /// 计数，两者合并进同一条提示（App 侧），不静默丢。
+    pub dropped_comments: usize,
 }
 
 impl LoadedGame {
@@ -235,6 +241,8 @@ pub fn load_from_bytes(source: &Path, bytes: &[u8]) -> Result<LoadedGame, LoadEr
     // 挂不上任何节点的条数（被丢弃节点上的属性）单独累计，随结果带出。
     let mut extras = HashMap::new();
     let mut orphan_extras = 0usize;
+    // 无行棋属性节点上的注释无处可挂（没有对应局面签名），累计后提示。
+    let mut dropped_comments = 0usize;
     {
         let root = tree.root().expect("from_tree 成功则根节点必然存在");
         let root_props = collect_extras(root);
@@ -250,6 +258,7 @@ pub fn load_from_bytes(source: &Path, bytes: &[u8]) -> Result<LoadedGame, LoadEr
         &mut comments,
         &mut extras,
         &mut orphan_extras,
+        &mut dropped_comments,
         &mut warnings,
         &mut partial,
         None,
@@ -279,6 +288,7 @@ pub fn load_from_bytes(source: &Path, bytes: &[u8]) -> Result<LoadedGame, LoadEr
         warning: (!warnings.is_empty()).then(|| warnings.join("；")),
         partial,
         unplaced_props: orphan_extras,
+        dropped_comments,
     })
 }
 
@@ -294,6 +304,7 @@ pub fn load_from_bytes(source: &Path, bytes: &[u8]) -> Result<LoadedGame, LoadEr
 /// 未识别属性随节点收集：落子成功的节点按**落子后的局面签名**挂入
 /// `extras`（与注释同一套键——保存端逐节点重放路径可还原同一签名）；
 /// 被跳过 / 丢弃节点上的条数计入 `orphan_extras`（写不出，需如实提示）。
+/// 无行棋属性节点上的注释同样无处可挂，条数计入 `dropped_comments`。
 #[allow(clippy::too_many_arguments)]
 fn walk(
     board: &mut Board,
@@ -301,6 +312,7 @@ fn walk(
     comments: &mut HashMap<u64, String>,
     extras: &mut HashMap<u64, Vec<super::tree::Property>>,
     orphan_extras: &mut usize,
+    dropped_comments: &mut usize,
     warnings: &mut Vec<String>,
     partial: &mut bool,
     label: Option<&str>,
@@ -329,11 +341,15 @@ fn walk(
                     extras.insert(position_sig(board.records()), props);
                 }
             }
-            // 无行棋属性的节点（纯注释 / 空节点）跳过，注释随之丢弃。
-            // 其上若挂有未识别属性，同样写不出（没有 board 节点可对应
-            // 签名）——计数带出，另存时如实提示而非静默丢。
+            // 无行棋属性的节点（纯注释 / 空节点）跳过。其上若挂有未识别
+            // 属性，同样写不出（没有 board 节点可对应签名）——计数带出。
+            // 它的 `C` 注释同样无处可挂（没有局面签名），一并计数——
+            // 这是载入过程真的丢了用户数据，必须在提示里如实告知。
             Ok(false) => {
                 *orphan_extras += collect_extras(node).len();
+                if node.comment().is_some_and(|text| !text.is_empty()) {
+                    *dropped_comments += 1;
+                }
             }
             Err(reason) => {
                 // 非法着法节点被丢弃：其上未识别属性无处可挂，计数带出。
@@ -372,6 +388,7 @@ fn walk(
             comments,
             extras,
             orphan_extras,
+            dropped_comments,
             warnings,
             partial,
             child_label.as_deref(),

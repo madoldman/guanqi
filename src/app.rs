@@ -687,6 +687,19 @@ impl GuanqiApp {
         }
     }
 
+    /// 清掉所有**从属于当前棋盘**的派生状态（定位高亮与临时提示）。
+    ///
+    /// 换棋盘时必走（载谱 / 新对局 / 建副本 / 切文档四处共用的同一组
+    /// 清理，此前各自手写了 3 行）：`Overlay.focus` 指向的坐标在新棋盘上
+    /// 是别的意思（甚至越界），旧棋盘的「已建分支」等临时提示同样失效。
+    /// 调用方各自还要做的事（`tree_epoch` 换代、`saved_rev` 对齐等）语义
+    /// 不同，不在本函数里拢。
+    fn clear_board_derived(&mut self) {
+        self.overlay.focus = None;
+        self.branch_notice = None;
+        self.notice = None;
+    }
+
     /// 从字节流载入棋谱（[`Self::load_game`] 的读盘后半段；headless 工具
     /// 复用以绕开 portal 对话框）。解析失败时**保留原棋盘**，只提示错误。
     fn load_game_from_bytes(&mut self, path: PathBuf, bytes: Vec<u8>) {
@@ -697,6 +710,7 @@ impl GuanqiApp {
             Ok(loaded) => {
                 let (warning, partial) = (loaded.warning.clone(), loaded.partial);
                 let unplaced_props = loaded.unplaced_props;
+                let dropped_comments = loaded.dropped_comments;
                 let (board, meta) = loaded.into_parts();
                 // 载入棋谱的贴目进入分析口径：查询 komi 改取谱上的 KM
                 // （缺失时默认 7.5）。此前 `komi` 只在 start_new_game 赋值，
@@ -711,9 +725,7 @@ impl GuanqiApp {
                 //（建分支等）随棋盘替换失效，同样清除。
                 self.analysis.reset();
                 self.analysis.clear_limits();
-                self.overlay.focus = None;
-                self.branch_notice = None;
-                self.notice = None;
+                self.clear_board_derived();
                 // 副本是原谱的附属品，离开这份棋谱即弃。带研究成果时
                 // 用户已在确认框里同意（见 `open_file_dialog`），无成果
                 // 时静默丢弃并在提示里带一句。
@@ -751,16 +763,28 @@ impl GuanqiApp {
                 } else {
                     notice
                 };
-                // 挂在被载入丢弃节点上的未识别属性（非法着法节点 /
-                // 纯注释节点上的第三方属性）：另存写不出，如实提示。
-                let notice = if unplaced_props > 0 {
-                    LoadNotice::Warn(format!(
-                        "{}（谱上另有 {unplaced_props} 条标记/扩展属性挂在无法载入的\
+                // 载入过程中真的丢了的用户数据，合并进同一条提示：
+                // - 纯注释节点（所在节点没有着法）上的 `C` 注释：逐手注释
+                //   按局面签名索引，这类节点不产生棋盘节点、拿不到签名，
+                //   注释无处可挂；
+                // - 挂在同一类 / 非法着法节点上的标记与扩展属性（另存写不出）。
+                // 二者都不可挽回，必须让用户知道，不能静默丢。
+                let notice = match (dropped_comments, unplaced_props) {
+                    (0, 0) => notice,
+                    (n, 0) => LoadNotice::Warn(format!(
+                        "{}（谱上有 {n} 条注释因所在节点没有着法，无法保留。）",
+                        notice.text()
+                    )),
+                    (0, m) => LoadNotice::Warn(format!(
+                        "{}（谱上另有 {m} 条标记/扩展属性挂在无法载入的\
                          节点上，另存时将无法保留。）",
                         notice.text()
-                    ))
-                } else {
-                    notice
+                    )),
+                    (n, m) => LoadNotice::Warn(format!(
+                        "{}（谱上有 {n} 条注释因所在节点没有着法无法保留；\
+                         另有 {m} 条标记/扩展属性挂在无法载入的节点上，另存时将无法保留。）",
+                        notice.text()
+                    )),
                 };
                 self.notices.push(notice);
             }
@@ -827,7 +851,12 @@ impl GuanqiApp {
     /// 同一次计算口径）合成进根节点 `C[]`——界标块幂等替换，用户原有根
     /// 注释不覆盖。未载入棋谱（空盘 / 新对局）不写：新对局的统计属于
     /// 「本盘」，快扫结束后按普通另存自然带出。
-    fn save_game(&mut self, path: PathBuf) {        let stats_block = if self.loaded.is_some() {
+    fn save_game(&mut self, path: PathBuf) {
+        // 写出前先记下原谱的 SGF 版本：写出端恒按 FF[4] 写（见
+        // `save::build_root`），原谱是别的值就意味着**降级另存**，必须
+        // 如实告知，不能无声无息把 FF[5] 的文件换成 FF[4]。
+        let source_format = self.loaded.as_ref().and_then(|meta| meta.info.format);
+        let stats_block = if self.loaded.is_some() {
             crate::ui::analysis::stats_block_text(
                 &self.analysis.game_summary(&self.board),
                 crate::ui::analysis::WORST_LIMIT,
@@ -859,6 +888,15 @@ impl GuanqiApp {
                     "已另存到 {}（{size}，{branches} 手）。",
                     path.display()
                 )));
+                // 原谱不是 FF[4] 而我们恒按 FF[4] 写：降级另存，如实说明
+                // （写出值本身不改，见 `save::build_root`）。
+                if let Some(n) = source_format
+                    && n != 4
+                {
+                    self.notices.push(LoadNotice::Warn(format!(
+                        "原谱 SGF 版本为 FF[{n}]，已按 FF[4] 另存。"
+                    )));
+                }
                 match post_save {
                     PostSaveAction::None => {}
                     PostSaveAction::NewGame(setup) => {
@@ -899,10 +937,7 @@ impl GuanqiApp {
             .expect("新对局的尺寸与星位坐标均合法，构造必然成功");
         self.analysis.reset();
         self.analysis.clear_limits();
-        self.overlay.focus = None;
-        // 旧棋盘的临时提示随棋盘替换失效。
-        self.branch_notice = None;
-        self.notice = None;
+        self.clear_board_derived();
         // 副本同样随原谱离开（研究成果已在「新对局」入口确认过）。
         let kept_research = self.research_moves();
         self.others.clear();
@@ -1249,9 +1284,7 @@ impl GuanqiApp {
         // 基准同样对齐到 0 —— 副本创建即干净，之后在副本里落子才变脏。
         self.saved_rev = self.board.record_rev();
         self.tree_epoch = self.tree_epoch.wrapping_add(1);
-        self.overlay.focus = None;
-        self.branch_notice = None;
-        self.notice = None;
+        self.clear_board_derived();
         let notice = LoadNotice::Ok(format!(
             "已创建研究副本 {number}（自第 {from_move} 手起），原谱保持不变；\
              当前在研究副本 {number} 中。"
@@ -1308,9 +1341,7 @@ impl GuanqiApp {
         // 基准对齐到新活动文档的当前修订号：每份文档各自判脏。
         self.saved_rev = self.board.record_rev();
         self.tree_epoch = self.tree_epoch.wrapping_add(1);
-        self.overlay.focus = None;
-        self.branch_notice = None;
-        self.notice = None;
+        self.clear_board_derived();
     }
 
     /// 「沿主变前进」的执行体（预览式语义 (a)）：只在谱上**已存在**的
