@@ -77,6 +77,8 @@ impl SettingsUi {
             // 原值保留。
             time_system: base.time_system,
             new_game_rules: base.new_game_rules,
+            // 界面偏好不在本窗口编辑（App 侧管理），原值保留。
+            ui_prefs: base.ui_prefs.clone(),
         }
     }
 

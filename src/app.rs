@@ -37,7 +37,7 @@ use crate::ui::{
 };
 
 /// 弃着终局加深评估的目标 visits：手上终态低于此值时自动发起加深
-/// （800 ≈ 默认展示档 500 的 1.6 倍、40 visits 快扫的 20 倍，目差
+/// （800 ≈ 默认展示档 300 的 2.7 倍、40 visits 快扫的 20 倍，目差
 /// 噪声收敛到远低于半目；一局已终，多花几秒把结果定稳值得）。
 const TERMINAL_EVAL_TARGET_VISITS: u32 = 800;
 
@@ -52,6 +52,10 @@ fn default_sgf_name(source: &Path) -> String {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "guanqi.sgf".to_owned())
 }
+
+/// 界面偏好与窗口几何的落盘防抖时长：用户拖窗口 / 切开关是连续事件，
+/// 每次都写盘会放大 I/O；停稳 1.5 秒后一次性落盘（退出时无条件再写）。
+const PREFS_SAVE_DEBOUNCE: Duration = Duration::from_millis(1500);
 
 /// 观棋主应用。
 pub struct GuanqiApp {
@@ -140,6 +144,9 @@ pub struct GuanqiApp {
     next_number: usize,
     /// 待确认的破坏性动作（丢弃副本 / 带副本研究载谱 / 带副本研究开新局）。
     pending_confirm: PendingConfirm,
+    /// 偏好（界面开关 / 窗口几何）脏标记 + 防抖截止时刻：改动后停稳
+    /// [`PREFS_SAVE_DEBOUNCE`] 才落盘，退出时无条件补写（子项 1/2 共用）。
+    prefs_dirty_since: Option<Instant>,
 }
 
 /// 等待中的对话框用途：打开与保存各自独立接结果，互不串线。
@@ -148,6 +155,15 @@ enum PendingDialog {
     /// 等待用户选择要打开的棋谱。
     Open,
     /// 等待用户确认另存位置。
+    Save,
+}
+
+/// 目录记忆的槽位（打开 / 另存各记各的，见 `remember_dir`）。
+#[derive(Clone, Copy)]
+enum OpenSaveDir {
+    /// 「打开棋谱」的目录（`last_open_dir`）。
+    Open,
+    /// 「另存为」的目录（`last_save_dir`）。
     Save,
 }
 
@@ -200,6 +216,22 @@ impl PendingConfirm {
 impl GuanqiApp {
     /// 在 eframe 创建阶段完成一次性初始化（主题、字体、引擎启动、portal 探测）。
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self::new_with_prefs(cc, None, Vec::new())
+    }
+
+    /// 可注入构造（headless 探针 / 验证用）：显式传入加载结果。
+    /// `notice` 会作为启动提示落进消息区（与正常加载路径一致）；空
+    /// `notices` 走 [`Self::new`] 同款「加载即所得」路径。
+    ///
+    /// eframe 的 `CreationContext` 无法在外部构造（字段含 `pub(crate)`），
+    /// headless 驱动只能绕开 `new`；本构造把「读设置 → 应用偏好 → 引擎
+    /// 启动」与 eframe 解耦，使两条路径共享同一初始化代码。引擎启动
+    /// 失败（无权重）不影响偏好逻辑验证——引擎状态机自己显示错误。
+    pub fn new_with_prefs(
+        cc: &eframe::CreationContext<'_>,
+        loaded: Option<(EngineConfig, Option<String>)>,
+        notices: Vec<String>,
+    ) -> Self {
         // 深色主题：在默认深色基础上应用观棋的统一视觉（琥珀强调、
         // 分层背景、按钮三态与圆角），启动时一次性设置，不逐帧重设。
         cc.egui_ctx.set_visuals(ui::theme::visuals());
@@ -211,12 +243,41 @@ impl GuanqiApp {
         let ctx = cc.egui_ctx.clone();
         let waker: Waker = std::sync::Arc::new(move || ctx.request_repaint());
 
-        let (engine_cfg, startup_notice) = load_settings();
+        let (engine_cfg, startup_notice) = loaded.unwrap_or_else(load_settings);
+        let mut startup_notice = startup_notice;
+        for extra in notices {
+            // 注入提示与既有启动提示并列（都属「启动期须知」，换行串接）。
+            startup_notice = Some(match startup_notice {
+                Some(existing) => format!("{existing}\n{extra}"),
+                None => extra,
+            });
+        }
         let mut analysis = AnalysisState::new();
         // 设置里的规则偏好（含旧 settings.json 的存量值）进分析状态机。
         analysis.set_want_rules(engine_cfg.rules.clone());
         analysis.start_engine(&engine_cfg, &waker);
         let settings = settings::SettingsUi::new(&engine_cfg);
+
+        // 界面偏好：从 settings.json 恢复（子项 1）。快扫配置整份带出；
+        // 门控 / 视角走解析（None = 用户手改出了未知值，用默认并在消息区
+        // 提示——提示文案由 load_settings 的字段级容错统一给出）。
+        let prefs = engine_cfg.ui_prefs.clone();
+        let batch_config = crate::ui::analysis::BatchConfig {
+            visits: prefs.batch_visits.max(1),
+            side: prefs.batch_side().unwrap_or(crate::ui::analysis::BatchSide::All),
+            include_variations: prefs.batch_variations,
+            deepen_enabled: prefs.batch_deepen,
+            deepen_top: prefs.batch_deepen_top.max(1),
+            deepen_visits: prefs.batch_deepen_visits.max(1),
+            ..crate::ui::analysis::BatchConfig::default()
+        };
+        analysis.set_batch_config(batch_config);
+        if let Some(gating) = prefs.gating() {
+            analysis.set_gating(gating);
+        }
+        if let Some(view) = prefs.display_view() {
+            analysis.set_display_view(view);
+        }
 
         // portal 可用性探测（不弹窗，启动时一次）；
         // 不可用时置灰「打开棋谱」入口，并在入口悬停 / 提示行说明原因。
@@ -229,17 +290,17 @@ impl GuanqiApp {
             branch_notice: None,
             analysis,
             overlay: overlay::Overlay {
-                show_candidates: true,
-                show_heat: true,
-                show_policy: false,
-                show_moves_heat: false,
-                show_mistakes: true,
-                show_score_lead: true,
-                show_mini_board: false,
+                show_candidates: prefs.show_candidates,
+                show_heat: prefs.show_heat,
+                show_policy: prefs.show_policy,
+                show_moves_heat: prefs.show_moves_heat,
+                show_mistakes: prefs.show_mistakes,
+                show_score_lead: prefs.show_score_lead,
+                show_mini_board: prefs.show_mini_board,
                 focus: None,
             },
-            curve_open: true,
-            tree_open: false,
+            curve_open: prefs.curve_open,
+            tree_open: prefs.tree_open,
             tree_ui: tree::TreeUi::default(),
             mini_board: mini_board::MiniBoard::default(),
             tree_epoch: 0,
@@ -267,7 +328,74 @@ impl GuanqiApp {
             active_number: 0,
             next_number: 1,
             pending_confirm: PendingConfirm::None,
+            prefs_dirty_since: None,
         }
+    }
+
+    /// 标记偏好已变（防抖落盘的入口；UI 每次改开关 / 几何时调用）。
+    fn mark_prefs_dirty(&mut self) {
+        self.prefs_dirty_since.get_or_insert(Instant::now());
+    }
+
+    /// 每帧调用：把界面开关状态快照进 `ui_prefs`，与上一帧比对——
+    /// 有变化才标脏（防抖计时从真正变化起算）。窗口几何与文件目录
+    /// 记忆不在此同步（各有专门的写入时机），`sync_prefs` 会保留它们。
+    fn sync_prefs_and_track(&mut self) {
+        let before = self.engine_cfg.ui_prefs.clone();
+        self.sync_prefs();
+        // 比对排除「保留型」字段后仍不等 ⇒ 有开关真变了。
+        let mut now = self.engine_cfg.ui_prefs.clone();
+        now.window_geometry = before.window_geometry;
+        now.last_open_dir = before.last_open_dir.clone();
+        now.last_save_dir = before.last_save_dir.clone();
+        if now != before || self.engine_cfg.ui_prefs.gating_delay_secs != before.gating_delay_secs
+        {
+            self.mark_prefs_dirty();
+        }
+    }
+
+    /// 把当前 UI 状态快照进 `engine_cfg.ui_prefs`（不落盘；落盘由
+    /// `logic` 的防抖与 `on_exit` 负责）。
+    fn sync_prefs(&mut self) {
+        let overlay = &self.overlay;
+        self.engine_cfg.ui_prefs = crate::engine::UiPrefs {
+            show_candidates: overlay.show_candidates,
+            show_heat: overlay.show_heat,
+            show_policy: overlay.show_policy,
+            show_moves_heat: overlay.show_moves_heat,
+            show_mistakes: overlay.show_mistakes,
+            show_score_lead: overlay.show_score_lead,
+            show_mini_board: overlay.show_mini_board,
+            curve_open: self.curve_open,
+            tree_open: self.tree_open,
+            candidate_gating: match self.analysis.gating() {
+                crate::ui::analysis::CandidateGating::Immediate => "immediate".to_owned(),
+                crate::ui::analysis::CandidateGating::Delayed { secs } => {
+                    self.engine_cfg.ui_prefs.gating_delay_secs = secs;
+                    "delayed".to_owned()
+                }
+                crate::ui::analysis::CandidateGating::Manual => "manual".to_owned(),
+            },
+            gating_delay_secs: self.engine_cfg.ui_prefs.gating_delay_secs,
+            display_view: match self.analysis.display_view() {
+                crate::ui::analysis::DisplayView::Black => "black".to_owned(),
+                crate::ui::analysis::DisplayView::Alternating => "alternating".to_owned(),
+            },
+            batch_visits: self.analysis.batch_config().visits,
+            batch_side: match self.analysis.batch_config().side {
+                crate::ui::analysis::BatchSide::All => "all".to_owned(),
+                crate::ui::analysis::BatchSide::BlackOnly => "black".to_owned(),
+                crate::ui::analysis::BatchSide::WhiteOnly => "white".to_owned(),
+            },
+            batch_variations: self.analysis.batch_config().include_variations,
+            batch_deepen: self.analysis.batch_config().deepen_enabled,
+            batch_deepen_top: self.analysis.batch_config().deepen_top,
+            batch_deepen_visits: self.analysis.batch_config().deepen_visits,
+            // 窗口几何 / 文件目录记忆在各自路径上单独写入，这里原样保留。
+            window_geometry: self.engine_cfg.ui_prefs.window_geometry.take(),
+            last_open_dir: self.engine_cfg.ui_prefs.last_open_dir.take(),
+            last_save_dir: self.engine_cfg.ui_prefs.last_save_dir.take(),
+        };
     }
 
     /// 发起「打开棋谱」对话框（菜单入口与 Ctrl+O 共用）。
@@ -288,7 +416,13 @@ impl GuanqiApp {
             self.load_notice = Some(notice);
             return;
         }
-        match FileDialog::open_file("打开棋谱（SGF）", Some(self.waker.clone())) {
+        match FileDialog::open_file(
+            "打开棋谱（SGF）",
+            // 从上次记住的目录打开（子项 3）；目录已不存在时 portal 侧
+            // 自行回退默认目录，这里不做额外校验。
+            self.engine_cfg.ui_prefs.last_open_dir.as_deref(),
+            Some(self.waker.clone()),
+        ) {
             Ok(dialog) => {
                 self.dialog = Some((dialog, PendingDialog::Open));
                 self.load_notice = None;
@@ -324,8 +458,19 @@ impl GuanqiApp {
                 .map(|meta| default_sgf_name(&meta.source))
                 .unwrap_or_else(|| "guanqi.sgf".to_owned())
         };
-        match FileDialog::save_file("另存棋谱（SGF）", &default_name, Some(self.waker.clone()))
-        {
+        match FileDialog::save_file(
+            "另存棋谱（SGF）",
+            &default_name,
+            // 另存的初始目录：记住上次另存位置（子项 3）；无记录时用
+            // 上次打开目录兜底（谱的来源目录通常就是想存过去的地方），
+            // 都没有则交 portal 自选。
+            self.engine_cfg
+                .ui_prefs
+                .last_save_dir
+                .as_deref()
+                .or(self.engine_cfg.ui_prefs.last_open_dir.as_deref()),
+            Some(self.waker.clone()),
+        ) {
             Ok(dialog) => {
                 self.dialog = Some((dialog, PendingDialog::Save));
                 self.save_notice = None;
@@ -440,22 +585,48 @@ impl GuanqiApp {
     }
 
     /// 处理 portal 对话框结果（`logic` 每帧轮询取出，不阻塞）。
+    /// 选中即记住该文件所在目录（子项 3）：下次打开 / 另存的 portal
+    /// `current_folder` 用它（随防抖落盘持久化）。
     fn on_portal_event(&mut self, kind: PendingDialog, event: PortalEvent) {
         match kind {
             PendingDialog::Open => match event {
-                PortalEvent::Picked(path) => self.load_game(path),
+                PortalEvent::Picked(path) => {
+                    self.remember_dir(OpenSaveDir::Open, &path);
+                    self.load_game(path);
+                }
                 PortalEvent::Cancelled => {} // 用户取消：静默，界面保持原状
                 PortalEvent::Failed(err) => {
                     self.load_notice = Some(LoadNotice::Failed(err.to_string()));
                 }
             },
             PendingDialog::Save => match event {
-                PortalEvent::Picked(path) => self.save_game(path),
+                PortalEvent::Picked(path) => {
+                    self.remember_dir(OpenSaveDir::Save, &path);
+                    self.save_game(path);
+                }
                 PortalEvent::Cancelled => {} // 用户取消：静默，界面保持原状
                 PortalEvent::Failed(err) => {
                     self.save_notice = Some(LoadNotice::Failed(err.to_string()));
                 }
             },
+        }
+    }
+
+    /// 记住文件对话框选中文件所在的目录（子项 3）。目录随 `ui_prefs`
+    /// 持久化（防抖 / 退出落盘），下次对话框从它打开。
+    fn remember_dir(&mut self, which: OpenSaveDir, path: &Path) {
+        let Some(dir) = path.parent() else { return };
+        if dir.as_os_str().is_empty() {
+            return;
+        }
+        let dir = dir.to_path_buf();
+        let slot = match which {
+            OpenSaveDir::Open => &mut self.engine_cfg.ui_prefs.last_open_dir,
+            OpenSaveDir::Save => &mut self.engine_cfg.ui_prefs.last_save_dir,
+        };
+        if *slot != Some(dir.clone()) {
+            *slot = Some(dir);
+            self.mark_prefs_dirty();
         }
     }
 
@@ -1326,6 +1497,29 @@ impl eframe::App for GuanqiApp {
             }
         }
 
+        // 偏好持久化（子项 1）：面板动作 / 复选框可能改了任何界面开关。
+        // 每帧把开关状态快照进 ui_prefs；内容相对上次快照有变化才标脏
+        // （防抖计时从「真正变化」起算，而不是每次重绘）。
+        self.sync_prefs_and_track();
+
+        // 窗口几何记录（子项 2）：每帧从 ViewportInfo 读当前内容区矩形。
+        // Wayland 下 egui-winit 会给出位置（估算）；拿不到（最小化 / 个别
+        // WM）时保留几何尺寸、位置清空——下次启动交给 WM 摆放。几何变化
+        // 走与开关同一套 1.5s 防抖落盘。
+        let info = ui.ctx().input(|i| i.viewport().clone());
+        if let Some(rect) = info.inner_rect {
+            let geo = crate::engine::WindowGeometry {
+                width: rect.width(),
+                height: rect.height(),
+                position: Some([rect.min.x, rect.min.y]),
+            };
+            let changed = self.engine_cfg.ui_prefs.window_geometry != Some(geo);
+            self.engine_cfg.ui_prefs.window_geometry = Some(geo);
+            if changed {
+                self.mark_prefs_dirty();
+            }
+        }
+
         // 胜率曲线底部面板（TASKS 4.3）：隐藏时不创建，零额外计算；
         // 需在 CentralPanel 之前创建，中央区才会让出空间。
         if self.curve_open {
@@ -1376,8 +1570,7 @@ impl eframe::App for GuanqiApp {
                 });
         }
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            // 顶部一行主操作按钮：主按钮（新对局）用琥珀填充强调，设置为普通按钮。
+        egui::CentralPanel::default().show(ui, |ui| {            // 顶部一行主操作按钮：主按钮（新对局）用琥珀填充强调，设置为普通按钮。
             // 不再在这里重复应用名——窗口标题栏已经有「观棋」。
             ui.horizontal(|ui| {
                 if !self.fonts_ok {
@@ -1663,26 +1856,54 @@ impl eframe::App for GuanqiApp {
         // （事件到达时 waker 已会触发立即重绘）。对弈中人类计时需要
         // 秒级可见的推进，空闲兜底同样保持低频即可（无限制 / 读秒的
         // 剩余显示 1s 粒度足够，无需高频重绘费电）。
-        if matches!(self.analysis.engine, EngineStatus::Starting)
+        // 偏好防抖兜底唤醒：标脏后停稳 PREFS_SAVE_DEBOUNCE 落盘一次；
+        // 没有这行，空闲态（700ms 兜底帧）虽也会到点，但把到点判断
+        // 集中放在这里便于统一安排下一次唤醒。
+        let repaint_after = if matches!(self.analysis.engine, EngineStatus::Starting)
             || self.analysis.analyzing()
             || self.analysis.batch_progress().is_some()
         {
-            ctx.request_repaint_after(Duration::from_millis(500));
+            Duration::from_millis(500)
         } else if self.play.mode && !self.play.finished(&self.board) {
             // 对局进行中：时钟显示需要持续刷新（每 500ms 一帧，读秒
             // 剩余 / 累计用时的秒位跳动可见）。
-            ctx.request_repaint_after(Duration::from_millis(500));
+            Duration::from_millis(500)
         } else {
             // 空闲兜底：复盘浏览时若没有任何 repaint 源（引擎空闲、无对话框、
             // 无输入），egui 会进入无限期 idle；此时落子 / 导航等在「输入唤醒的
             // 帧串」里推进的状态可能停在没有新帧可画的状态（用户可见「假死」，
             // 改一次窗口大小才刷新）。低频唤醒保证最终状态总能落到屏幕上。
-            ctx.request_repaint_after(Duration::from_millis(700));
+            Duration::from_millis(700)
+        };
+
+        // ---- 偏好 / 窗口几何防抖落盘（子项 1/2 共用）----
+        if let Some(since) = self.prefs_dirty_since
+            && since.elapsed() >= PREFS_SAVE_DEBOUNCE
+        {
+            self.prefs_dirty_since = None;
+            if let Err(text) = save_settings(&self.engine_cfg) {
+                self.persist_notice = Some(text);
+            }
+            // 落盘后仍保证有下一帧（当前帧可能就是兜底唤醒帧）。
+            ctx.request_repaint_after(repaint_after);
+        } else {
+            let wait = self
+                .prefs_dirty_since
+                .map(|since| {
+                    PREFS_SAVE_DEBOUNCE
+                        .saturating_sub(since.elapsed())
+                        .max(repaint_after)
+                })
+                .unwrap_or(repaint_after);
+            ctx.request_repaint_after(wait);
         }
     }
 
     // 退出时优雅关闭引擎进程（关 stdin 引擎自行退出，超时强杀）。
+    // 偏好与窗口几何无条件补写一次（防抖未到点的改动不丢）。
     fn on_exit(&mut self) {
+        self.sync_prefs();
+        let _ = save_settings(&self.engine_cfg);
         self.analysis.shutdown();
     }
 }

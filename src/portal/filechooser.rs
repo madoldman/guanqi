@@ -11,7 +11,7 @@
 use super::PortalError;
 use super::dbus::Connection;
 use super::wire::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// portal 桌面服务（各后端以其名义应答）。
@@ -63,36 +63,40 @@ pub fn probe(conn: &mut Connection) -> Result<u32, PortalError> {
 }
 
 /// 打开「打开文件」对话框并**阻塞**到用户选择 / 取消 / 超时（须在工作线程调用）。
-/// `Ok(Some(path))` = 用户选中；`Ok(None)` = 用户取消。
+/// `current_folder` 为对话框初始目录（`None` = 交 portal 自选，通常上次
+/// 位置或用户主目录）。`Ok(Some(path))` = 用户选中；`Ok(None)` = 用户取消。
 pub fn open_file_blocking(
     conn: &mut Connection,
     title: &str,
+    current_folder: Option<&Path>,
 ) -> Result<Option<PathBuf>, PortalError> {
     let token = handle_token();
     let predicted = request_path(conn.unique_name(), &token);
     let rule = response_match_rule(&predicted);
     conn.add_match(&rule)?;
     let result = run_request(conn, title, &token, &predicted, |conn, title, token| {
-        open_file_call(conn, title, token)
+        open_file_call(conn, title, token, current_folder)
     });
     conn.remove_match(&rule);
     result
 }
 
 /// 打开「保存文件」对话框并**阻塞**到用户选择 / 取消 / 超时（须在工作线程调用）。
-/// `default_name` 经 `current_name` 选项作为对话框里的默认文件名。
+/// `default_name` 经 `current_name` 选项作为对话框里的默认文件名；
+/// `current_folder` 为初始目录（`None` = 交 portal 自选）。
 /// `Ok(Some(path))` = 用户确认的保存位置；`Ok(None)` = 用户取消。
 pub fn save_file_blocking(
     conn: &mut Connection,
     title: &str,
     default_name: &str,
+    current_folder: Option<&Path>,
 ) -> Result<Option<PathBuf>, PortalError> {
     let token = handle_token();
     let predicted = request_path(conn.unique_name(), &token);
     let rule = response_match_rule(&predicted);
     conn.add_match(&rule)?;
     let result = run_request(conn, title, &token, &predicted, |conn, title, token| {
-        save_file_call(conn, title, token, default_name)
+        save_file_call(conn, title, token, default_name, current_folder)
     });
     conn.remove_match(&rule);
     result
@@ -140,41 +144,69 @@ fn run_request(
 
 /// 调 `OpenFile`（签名 `s sa{sv} -> o`），返回 request 对象路径（handle）。
 /// 调用方必须**先**对 `request_path(unique_name, token)` 做 AddMatch。
+/// `current_folder` 以 `file://` URI 传入（规范要求），目录不存在等异常
+/// 由 portal 侧自行忽略（选项非必需，缺失时对话框落到默认目录）。
 pub fn open_file_call(
     conn: &mut Connection,
     title: &str,
     token: &str,
+    current_folder: Option<&Path>,
 ) -> Result<String, PortalError> {
+    let mut items = vec![
+        entry("handle_token", Value::Str(token.to_owned())),
+        entry("multiple", Value::Bool(false)),
+        sgf_filter_entry(),
+    ];
+    if let Some(folder) = current_folder {
+        items.push(entry("current_folder", Value::Str(folder_uri(folder))));
+    }
     let options = Value::Array {
         elem: "{sv}".into(),
-        items: vec![
-            entry("handle_token", Value::Str(token.to_owned())),
-            entry("multiple", Value::Bool(false)),
-            sgf_filter_entry(),
-        ],
+        items,
     };
     dialog_call(conn, "OpenFile", title, options)
 }
 
 /// 调 `SaveFile`（签名与 OpenFile 相同：`s sa{sv} -> o`）。
-/// 选项：`handle_token` + `current_name`（默认文件名）+ `filters`。
-/// 不传 `current_folder`（路径以 `file://` URI 传入，且非必需——对话框
-/// 默认落在用户常用目录，`current_name` 已足够定位保存意图）。
+/// 选项：`handle_token` + `current_name`（默认文件名）+ `current_folder`
+///（初始目录）+ `filters`。
 pub fn save_file_call(
     conn: &mut Connection,
     title: &str,
     token: &str,
     default_name: &str,
+    current_folder: Option<&Path>,
 ) -> Result<String, PortalError> {
+    let mut items = vec![
+        entry("handle_token", Value::Str(token.to_owned())),
+        entry("current_name", Value::Str(default_name.to_owned())),
+        sgf_filter_entry(),
+    ];
+    if let Some(folder) = current_folder {
+        items.push(entry("current_folder", Value::Str(folder_uri(folder))));
+    }
     let options = Value::Array {
         elem: "{sv}".into(),
-        items: vec![
-            entry("handle_token", Value::Str(token.to_owned())),
-            entry("current_name", Value::Str(default_name.to_owned())),
-            sgf_filter_entry(),
-        ],
+        items,
     };
     dialog_call(conn, "SaveFile", title, options)
+}
+
+/// 目录 → `file://` URI（portal `current_folder` 的线上形式）。
+/// 路径含中文 / 空格时做百分号编码（与应答侧 [`uri_to_path`] 对称）。
+fn folder_uri(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let mut uri = String::from("file://");
+    for byte in text.bytes() {
+        // unreserved = ALPHA / DIGIT / `-` / `.` / `_` / `~`；`/` 是路径分隔符。
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                uri.push(byte as char)
+            }
+            _ => uri.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    uri
 }
 
 /// 发起 FileChooser 的成员调用并取回 request handle。

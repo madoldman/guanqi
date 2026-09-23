@@ -1038,8 +1038,8 @@ pub struct AnalysisState {
     /// 引擎 stderr 日志的**最近 [`LOG_TAIL_LINES`] 行**环形缓冲：
     /// 只留最后一行时，崩溃前的关键原因常被启动期日志冲掉。
     log_tail: std::collections::VecDeque<String>,
-    /// 引擎「顶层未知字段」警告（会话内保留、按字段名去重）：同一字段
-    /// 只提示一条，避免流式查询每 0.5s 一条报告前都警告一次刷屏。
+    /// 引擎「顶层未知字段」警告（引擎重启时清除、按字段名去重）：同一
+    /// 字段只提示一条，避免流式查询每 0.5s 一条报告前都警告一次刷屏。
     /// 侧栏「消息」卡片直接读取（WARN 色）——不能只落 `last_log`：
     /// 它没有任何界面展示，用户看不见，等于没修。
     engine_warnings: Vec<EngineWarning>,
@@ -1343,7 +1343,7 @@ impl AnalysisState {
         self.snapshot = None;
     }
 
-    /// 引擎「顶层未知字段」警告（按字段名去重，会话内保留）。
+    /// 引擎「顶层未知字段」警告（**引擎重启时清除**，按字段名去重）。
     /// 「消息」卡片读取；无警告返回空切片。
     pub fn engine_warnings(&self) -> &[EngineWarning] {
         &self.engine_warnings
@@ -1436,6 +1436,10 @@ impl AnalysisState {
         self.play_sig = None;
         self.snapshot = None;
         self.transient_error = None;
+        // 引擎重启即清除历史警告：警告对应的是**旧引擎进程**看到的查询
+        // 环境（字段拼写 / 引擎版本），重启后旧提示不再可信（保留策略
+        // 见 `on_warning` 文档）。
+        self.engine_warnings.clear();
         self.engine = if cfg.model_path.is_some() {
             match Engine::spawn_with_waker(cfg, Some(waker.clone())) {
                 Ok(handle) => {
@@ -2320,7 +2324,13 @@ impl AnalysisState {
     /// 分析该查询（全部报告正常到达），这里只落用户可见提示，绝不能走
     /// [`Self::on_failed`]（那会清 `inflight`，把仍在工作的查询打死）。
     /// 按字段名去重：流式查询每个中间报告都可能触发一次警告，
-    /// 同一字段只保留首条，避免消息卡片刷屏；会话内保留不自动清除。
+    /// 同一字段只保留首条，避免消息卡片刷屏。
+    ///
+    /// **保留策略**：会话内保留、**引擎重启时清除**（见 `start_engine`）。
+    /// 理由：警告源于「查询字段与引擎能力不匹配」，重启意味着用户改了
+    /// 配置（设置面板「应用并重启」）或换了一次引擎进程——旧警告对应
+    /// 的查询环境已不存在，保留只会误导；同一会话内不改配置则保留，
+    /// 用户始终能看到「配置可能拼错了」的提醒。
     fn on_warning(&mut self, id: Option<QueryId>, field: Option<String>, message: String) {
         let _ = id; // 警告不改变任何查询状态，id 仅用于展示定位
         if self.engine_warnings.iter().any(|w| w.field == field) {
@@ -2557,7 +2567,7 @@ impl AnalysisState {
         query.view = view;
         query.max_visits = Some(
             // 终局评估查询的 visits 覆盖：任务在、局面匹配、目标高于
-            // 展示配置时按目标发（目标必 ≥800，展示档默认 500；不达标
+            // 展示配置时按目标发（目标必 ≥800，展示档默认 300；不达标
             // 的任务在 sync 派发处已被 visits 判定拦住，这里是执行点）。
             self.terminal_eval
                 .as_ref()

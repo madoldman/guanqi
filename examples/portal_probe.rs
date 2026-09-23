@@ -87,7 +87,7 @@ fn check_flow() {
 fn dialog_flow() {
     let waker: Waker =
         Arc::new(|| println!("[waker] 结果已入队（此处应触发 ctx.request_repaint）"));
-    let mut dialog = match FileDialog::open_file("观棋探针：选择棋谱 (SGF)", Some(waker)) {
+    let mut dialog = match FileDialog::open_file("观棋探针：选择棋谱 (SGF)", None, Some(waker)) {
         Ok(dialog) => dialog,
         Err(error) => {
             eprintln!("open_file 同步失败：{error:?}");
@@ -127,7 +127,7 @@ fn predict_flow() {
 
     let started = Instant::now();
     let handle =
-        filechooser::open_file_call(&mut conn, "观棋探针：路径预测实证（自动关闭）", &token)
+        filechooser::open_file_call(&mut conn, "观棋探针：路径预测实证（自动关闭）", &token, None)
             .expect("OpenFile 失败");
     println!("[predict] OpenFile OK（耗时 {:?}）", started.elapsed());
     println!("[predict] handle   = {handle}");

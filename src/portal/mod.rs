@@ -87,26 +87,41 @@ impl FileDialog {
     ///
     /// - 选中 → [`PortalEvent::Picked`]；取消 → [`PortalEvent::Cancelled`]；
     ///   失败（含 300s 等待超时，超时前会尽力关闭对话框）→ [`PortalEvent::Failed`]。
+    /// - `current_folder`：对话框初始目录（上次记住的目录；`None` = 交
+    ///   portal 自选）。
     /// - `waker` 在结果入队时于**工作线程**被调用（如 `move || ctx.request_repaint()`）。
     /// - 连接 / 探测失败会**同步**返回 Err，便于 UI 立即提示。
     /// - 一个实例只产生一个事件；丢弃实例后结果仍会投递（发送失败被忽略）。
-    pub fn open_file(title: &str, waker: Option<Waker>) -> Result<FileDialog, PortalError> {
-        spawn_dialog(title, waker, |conn, title| {
-            filechooser::open_file_blocking(conn, title)
+    pub fn open_file(
+        title: &str,
+        current_folder: Option<&std::path::Path>,
+        waker: Option<Waker>,
+    ) -> Result<FileDialog, PortalError> {
+        let current_folder = current_folder.map(std::path::Path::to_path_buf);
+        spawn_dialog(title, waker, move |conn, title| {
+            filechooser::open_file_blocking(conn, title, current_folder.as_deref())
         })
     }
 
     /// 发起「保存文件」对话框（默认文件名 `default_name`），**立即返回**；
     /// 等待在专职线程进行。事件语义与 [`FileDialog::open_file`] 一致：
     /// 确认位置 → [`PortalEvent::Picked`]，取消 → [`PortalEvent::Cancelled`]。
+    /// `current_folder` 为初始目录（`None` = 交 portal 自选）。
     pub fn save_file(
         title: &str,
         default_name: &str,
+        current_folder: Option<&std::path::Path>,
         waker: Option<Waker>,
     ) -> Result<FileDialog, PortalError> {
         let default_name = default_name.to_owned();
+        let current_folder = current_folder.map(std::path::Path::to_path_buf);
         spawn_dialog(title, waker, move |conn, title| {
-            filechooser::save_file_blocking(conn, title, &default_name)
+            filechooser::save_file_blocking(
+                conn,
+                title,
+                &default_name,
+                current_folder.as_deref(),
+            )
         })
     }
 

@@ -27,7 +27,7 @@ pub use config::{
     config_dir, default_analysis_cfg_path, default_weights_dir, effective_analysis_cfg,
     ensure_analysis_cfg, find_katago_in_path, load_settings, resolve_rules, save_settings,
     scan_weights, settings_path, Difficulty, EngineBackend, EngineConfig, LoadedSettings, Rules,
-    RulesResolution,
+    RulesResolution, UiPrefs, WindowGeometry,
 };
 pub use protocol::{
     AnalysisQuery, AnalysisReport, MoveInfo, MoveRule, MoveRules, QueryId, RootInfo, WinrateView,

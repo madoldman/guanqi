@@ -1,4 +1,4 @@
-//! 引擎配置数据层与持久化（阶段 3.3 的非 UI 部分）。
+//! 引擎配置与应用设置数据层（阶段 3.3 的非 UI 部分）。
 //!
 //! KataGo 是**外部依赖**而非项目自身的一部分：用户用什么引擎路径、哪个权重、
 //! 哪个后端、多少思考量，全部是可配置项。本模块只负责给出**可移植的默认值
@@ -10,15 +10,159 @@
 //!   由上层提示用户设置；
 //! - 搜索线程数：默认按 [`std::thread::available_parallelism()`] 推导。
 //!
-//! 持久化到 `~/.config/guanqi/settings.json`；读取失败 / 文件损坏时回退默认值
-//! 并返回提示信息，不 panic。引擎配置文件（`analysis.cfg`）生成见
-//! [`ensure_analysis_cfg`]，**必须包含无默认值的必填键 `numAnalysisThreads`
-//! 与 `nnMaxBatchSize`**（缺任一引擎直接抛 IOError 退出，实测见任务实测记录）。
+//! 持久化到 `~/.config/guanqi/settings.json`。该文件是**应用设置**：引擎
+//! 配置 + 界面偏好（[`UiPrefs`]：叠加层开关、面板开关、窗口几何、文件
+//! 目录记忆等）共用一份；读取失败 / 文件损坏时回退默认值并返回提示信息，
+//! 不 panic。与**棋谱绑定**的进行态（游标、副本列表、时钟等）不持久化。
+//! 引擎配置文件（`analysis.cfg`）生成见 [`ensure_analysis_cfg`]，**必须
+//! 包含无默认值的必填键 `numAnalysisThreads` 与 `nnMaxBatchSize`**（缺任一
+//! 引擎直接抛 IOError 退出，实测见任务实测记录）。
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::play::TimeSystem;
+
+/// 窗口几何（启动时恢复用）：内容区尺寸（egui points）与窗口位置。
+///
+/// 位置是 egui-winit 的 `inner_rect.min`（Wayland 下为窗口内容区坐标，
+/// KDE/Wayland 会给出估算值）；拿不到位置时 `None`，启动交由窗口管理器
+/// 自行摆放。不区分显示器、不做越界校正——交给 `ViewportBuilder` 与
+/// WM 的 clamp 处理。
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct WindowGeometry {
+    /// 窗口内容区宽（points）。
+    pub width: f32,
+    /// 窗口内容区高（points）。
+    pub height: f32,
+    /// 窗口位置（x, y，points）；`None` = 上次未取得（Wayland 可能拿不到），
+    /// 启动时不指定位置。
+    pub position: Option<[f32; 2]>,
+}
+
+/// 界面偏好（随 `settings.json` 持久化）：叠加层与面板开关、候选显示
+/// 门控、目数视角、快扫设置、窗口几何、文件目录记忆。
+///
+/// 只存「用户改起来麻烦、重开又希望还在」的偏好；与**棋谱绑定**的状态
+/// （游标、副本列表、时钟、分析数据）一律不进设置文件。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiPrefs {
+    /// ---- 叠加层各层开关（`overlay::Overlay` 的可持久化子集）----
+    /// 候选点圆圈层。
+    pub show_candidates: bool,
+    /// 局势热度图层。
+    pub show_heat: bool,
+    /// 策略热度图层。
+    pub show_policy: bool,
+    /// 「候选点领地」层（opt-in includeMovesOwnership）。
+    pub show_moves_heat: bool,
+    /// 失误标注层。
+    pub show_mistakes: bool,
+    /// 胜率曲线面板叠加**目差线**开关。
+    pub show_score_lead: bool,
+    /// 小棋盘 PV 回放面板开关。
+    pub show_mini_board: bool,
+    /// ---- 面板开关 ----
+    /// 胜率曲线底部面板。
+    pub curve_open: bool,
+    /// 棋谱树底部面板。
+    pub tree_open: bool,
+    /// ---- 候选类显示门控（立即 / 延迟 N 秒 / 手动）----
+    /// `immediate` / `delayed` / `manual`；未识别值由加载层回退
+    /// `immediate` 并提示（见 `load_settings` 的逐字段容错）。
+    pub candidate_gating: String,
+    /// 延迟模式的秒数（仅 `candidate_gating == "delayed"` 时生效）。
+    pub gating_delay_secs: u32,
+    /// ---- 目数视角 ----
+    /// `black`（永远黑视角）/ `alternating`（黑白交替）。
+    pub display_view: String,
+    /// ---- 整谱快扫设置 ----
+    /// 主扫描每手 visits。
+    pub batch_visits: u32,
+    /// 只扫一方：`all` / `black` / `white`。
+    pub batch_side: String,
+    /// 含变着（全树逐节点）。
+    pub batch_variations: bool,
+    /// 扫完自动加深差异手。
+    pub batch_deepen: bool,
+    /// 加深取前 N 手。
+    pub batch_deepen_top: usize,
+    /// 加深每手 visits。
+    pub batch_deepen_visits: u32,
+    /// ---- 窗口几何 ----
+    /// 上次退出的窗口尺寸与位置（`None` = 从未记录，用程序默认）。
+    pub window_geometry: Option<WindowGeometry>,
+    /// ---- 文件目录记忆 ----
+    /// 上次「打开棋谱」成功选中的目录（portal `current_folder`）。
+    pub last_open_dir: Option<PathBuf>,
+    /// 上次「另存」成功写入的目录（另存对话框的 `current_folder`）。
+    pub last_save_dir: Option<PathBuf>,
+}
+
+impl Default for UiPrefs {
+    fn default() -> Self {
+        Self {
+            // 叠加层 / 面板默认值与 `GuanqiApp::new` 的既有初值一致：
+            // 持久化是「记住改动」，不是改默认观感。
+            show_candidates: true,
+            show_heat: true,
+            show_policy: false,
+            show_moves_heat: false,
+            show_mistakes: true,
+            show_score_lead: true,
+            show_mini_board: false,
+            curve_open: true,
+            tree_open: false,
+            candidate_gating: "immediate".to_owned(),
+            gating_delay_secs: 3,
+            display_view: "black".to_owned(),
+            batch_visits: 40,
+            batch_side: "all".to_owned(),
+            batch_variations: false,
+            batch_deepen: true,
+            batch_deepen_top: 10,
+            batch_deepen_visits: 300,
+            window_geometry: None,
+            last_open_dir: None,
+            last_save_dir: None,
+        }
+    }
+}
+
+impl UiPrefs {
+    /// 门控字符串 → 枚举；未识别值回退立即显示（`None`）。
+    /// 加载层据此对坏值出提示。
+    pub fn gating(&self) -> Option<crate::ui::analysis::CandidateGating> {
+        match self.candidate_gating.as_str() {
+            "immediate" => Some(crate::ui::analysis::CandidateGating::Immediate),
+            "delayed" => Some(crate::ui::analysis::CandidateGating::Delayed {
+                secs: self.gating_delay_secs.max(1),
+            }),
+            "manual" => Some(crate::ui::analysis::CandidateGating::Manual),
+            _ => None,
+        }
+    }
+
+    /// 目数视角字符串 → 枚举；未识别值回退黑视角（`None`）。
+    pub fn display_view(&self) -> Option<crate::ui::analysis::DisplayView> {
+        match self.display_view.as_str() {
+            "black" => Some(crate::ui::analysis::DisplayView::Black),
+            "alternating" => Some(crate::ui::analysis::DisplayView::Alternating),
+            _ => None,
+        }
+    }
+
+    /// 快扫「只扫一方」字符串 → 枚举；未识别值回退全部（`None`）。
+    pub fn batch_side(&self) -> Option<crate::ui::analysis::BatchSide> {
+        match self.batch_side.as_str() {
+            "all" => Some(crate::ui::analysis::BatchSide::All),
+            "black" => Some(crate::ui::analysis::BatchSide::BlackOnly),
+            "white" => Some(crate::ui::analysis::BatchSide::WhiteOnly),
+            _ => None,
+        }
+    }
+}
 
 /// 推理后端。这是对**引擎二进制**的描述（OpenCL 版 / Eigen 版），
 /// 不影响命令行参数；供界面展示与降级提示用。可配置项。
@@ -100,7 +244,11 @@ impl Difficulty {
     }
 }
 
-/// 引擎配置（持久化到 `settings.json`）。
+/// 引擎与应用设置（持久化到 `settings.json`）。
+///
+/// 文档更正：本结构早已不只是「引擎配置」——`play_difficulty` /
+/// `time_system` / `new_game_rules` 与 [`ui_prefs`] 都是应用级设置，
+/// 恰好共用这一份文件。字段级容错见 [`load_settings`]。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EngineConfig {
@@ -136,6 +284,10 @@ pub struct EngineConfig {
     /// `RU[]`；复盘 / 载谱的规则口径仍由设置面板字段管（自动跟随 /
     /// 显式指定），互不覆盖。旧配置缺此键回退中国规则。
     pub new_game_rules: Rules,
+    /// 界面偏好（叠加层 / 面板开关、门控、视角、快扫设置、窗口几何、
+    /// 文件目录记忆）。旧配置缺此键时整体回退默认值
+    /// （struct 级 `#[serde(default)]`）；见 [`UiPrefs`]。
+    pub ui_prefs: UiPrefs,
 }
 
 impl Default for EngineConfig {
@@ -145,13 +297,16 @@ impl Default for EngineConfig {
             model_path: pick_newest_weights(&default_weights_dir()),
             weights_dir: default_weights_dir(),
             backend: EngineBackend::OpenCL,
-            visits: 500,
+            // 默认展示思考量 300（作者确认下调；仅影响未配置过的新用户，
+            // 已有 settings.json 里显式的 visits 值不受影响）。
+            visits: 300,
             search_threads: default_search_threads(),
             analysis_cfg: None,
             play_difficulty: Difficulty::default(),
             rules: None,
             time_system: TimeSystem::default(),
             new_game_rules: Rules::Chinese,
+            ui_prefs: UiPrefs::default(),
         }
     }
 }
@@ -418,8 +573,14 @@ fn network_steps(path: &Path) -> Option<u64> {
 /// 读取配置的返回：配置 + 读取异常时的用户提示（正常为 `None`）。
 pub type LoadedSettings = (EngineConfig, Option<String>);
 
-/// 从 `settings.json` 读取配置。文件不存在视为首次运行（静默用默认值）；
-/// 读取失败 / 解析损坏时回退默认值并返回提示，不 panic。
+/// 从 `settings.json` 读取配置。文件不存在视为首次运行（静默用默认值）。
+///
+/// **字段级容错**：任一字段值非法（如 `"play_difficulty": "Expert"`、
+/// `visits` 写成字符串）只回退**该字段**默认值，其余字段（含引擎路径 /
+/// 权重）原样保留，并针对每个坏字段给出「哪个字段、原值是什么、已按
+/// 什么处理」的提示——整份 JSON 结构损坏（无法解析为对象）才整体回退
+/// 默认配置，不 panic。实现：先按 `serde_json::Value` 松散解析，再用
+/// `Value → EngineConfig` 的镜像反序列化逐字段收割错误。
 pub fn load_settings() -> LoadedSettings {
     let path = settings_path();
     let text = match std::fs::read_to_string(&path) {
@@ -437,15 +598,206 @@ pub fn load_settings() -> LoadedSettings {
             )
         }
     };
-    match serde_json::from_str::<EngineConfig>(&text) {
-        Ok(cfg) => (cfg, None),
-        Err(e) => (
-            EngineConfig::default(),
-            Some(format!(
-                "{} 无法解析（{e}），已回退默认引擎配置。",
-                path.display()
-            )),
-        ),
+    // 整体无法解析（截断 / 非 JSON）：文件级损坏，整份回退（与旧行为一致）。
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(e) => {
+            return (
+                EngineConfig::default(),
+                Some(format!(
+                    "{} 无法解析（{e}），已回退默认引擎配置。",
+                    path.display()
+                )),
+            )
+        }
+    };
+    let mut notices: Vec<String> = Vec::new();
+    let cfg = config_from_value(&value, &mut notices);
+    let notice = (!notices.is_empty()).then(|| {
+        format!(
+            "{} 有 {} 处设置值无法识别（其余设置已保留）：{}",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("settings.json"),
+            notices.len(),
+            notices.join("；")
+        )
+    });
+    (cfg, notice)
+}
+
+/// `serde_json::Value` → [`EngineConfig`] 的逐字段收割：每个字段先试从
+/// 原值反序列化，失败即取默认并记一条提示。这是 [`EngineConfig`]
+/// 序列化形态的镜像（新增字段时同步加一行），不引入第二个配置文件。
+fn config_from_value(value: &serde_json::Value, notices: &mut Vec<String>) -> EngineConfig {
+    let default = EngineConfig::default();
+    // 顶层不是对象（数组 / 字符串 / 数字等）：无字段可收割，整份默认。
+    let Some(map) = value.as_object() else {
+        notices.push("文件内容不是设置对象".to_owned());
+        return default;
+    };
+    // 路径类字段（engine_path / weights_dir / model_path 等）在下方内联
+    // 处理：提示文案各自点名回退目标，不走通用闭包。
+
+    /// 单个标量字段的收割：反序列化失败即回退 `fallback`（默认值串）并
+    /// 记一条提示。提示里如实点名字段、原值与回退结果（子项 4 的要求）。
+    /// `fallback` 为该类型 serde 形式的默认值串（如 `"Medium"`）。
+    fn field<T: serde::de::DeserializeOwned + serde::Serialize>(
+        notices: &mut Vec<String>,
+        key: &str,
+        raw: &serde_json::Value,
+        desc: &str,
+        fallback: &str,
+    ) -> T {
+        let fallback: T = serde_json::from_str(fallback).expect("默认值串与本类型恒匹配");
+        match serde_json::from_value(raw.clone()) {
+            Ok(v) => v,
+            Err(_) => {
+                notices.push(format!(
+                    "「{key}」的值 {raw} 无法识别，已按{desc}「{}」处理",
+                    serde_json::to_string(&fallback).unwrap_or_default()
+                ));
+                fallback
+            }
+        }
+    }
+
+    // ---- 引擎核心字段（坏值回退默认，路径与权重必须活下来）----
+    let engine_path = match map.get("engine_path") {
+        Some(raw) => match serde_json::from_value::<PathBuf>(raw.clone()) {
+            Ok(p) => p,
+            Err(_) => {
+                notices.push(format!(
+                    "「engine_path」的值 {raw} 无法识别，已回退默认引擎路径"
+                ));
+                default.engine_path.clone()
+            }
+        },
+        None => default.engine_path.clone(),
+    };
+    let model_path = match map.get("model_path") {
+        Some(raw) if !raw.is_null() => {
+            match serde_json::from_value::<Option<PathBuf>>(raw.clone()) {
+                // 显式 null = 未配置（合法，语义见 EngineConfig::model_path）。
+                Ok(p) => p,
+                Err(_) => {
+                    notices.push(format!(
+                        "「model_path」的值 {raw} 无法识别，已按未配置处理"
+                    ));
+                    None
+                }
+            }
+        }
+        _ => default.model_path.clone(),
+    };
+    let weights_dir = match map.get("weights_dir") {
+        Some(raw) => match serde_json::from_value::<PathBuf>(raw.clone()) {
+            Ok(p) => p,
+            Err(_) => {
+                notices.push(format!(
+                    "「weights_dir」的值 {raw} 无法识别，已回退默认权重目录"
+                ));
+                default.weights_dir.clone()
+            }
+        },
+        None => default.weights_dir.clone(),
+    };
+    let backend: EngineBackend = match map.get("backend") {
+        Some(raw) => field(notices, "backend", raw, "默认", r#""OpenCL""#),
+        None => default.backend,
+    };
+    let visits: u32 = match map.get("visits") {
+        Some(raw) => field(notices, "visits", raw, "默认", "300"),
+        None => default.visits,
+    };
+    let search_threads: u32 = match map.get("search_threads") {
+        Some(raw) => field(notices, "search_threads", raw, "默认", "4"),
+        None => default.search_threads,
+    };
+    let analysis_cfg = match map.get("analysis_cfg") {
+        Some(raw) if !raw.is_null() => {
+            serde_json::from_value::<Option<PathBuf>>(raw.clone()).unwrap_or_else(|_| {
+                notices.push(format!(
+                    "「analysis_cfg」的值 {raw} 无法识别，已按未指定处理"
+                ));
+                None
+            })
+        }
+        _ => default.analysis_cfg,
+    };
+    let play_difficulty: Difficulty = match map.get("play_difficulty") {
+        Some(raw) => field(notices, "play_difficulty", raw, "默认", r#""Medium""#),
+        None => default.play_difficulty,
+    };
+    let rules: Option<String> = match map.get("rules") {
+        Some(raw) if !raw.is_null() => {
+            serde_json::from_value::<Option<String>>(raw.clone()).unwrap_or_else(|_| {
+                notices.push(format!("「rules」的值 {raw} 无法识别，已按自动跟随棋谱处理"));
+                None
+            })
+        }
+        _ => default.rules,
+    };
+    let time_system: TimeSystem = match map.get("time_system") {
+        Some(raw) => field(notices, "time_system", raw, "无限制", r#""Unlimited""#),
+        None => default.time_system,
+    };
+    let new_game_rules: Rules = match map.get("new_game_rules") {
+        Some(raw) => field(notices, "new_game_rules", raw, "默认", r#""chinese""#),
+        None => default.new_game_rules,
+    };
+
+    // ---- 界面偏好（UiPrefs）：整体坏值提示 + 内部字段兜底 ----
+    let ui_prefs = match map.get("ui_prefs") {
+        Some(raw) => match serde_json::from_value::<UiPrefs>(raw.clone()) {
+            Ok(mut prefs) => {
+                // 语义校验：字符串型枚举值必须可解析（serde 拦不住未知串）。
+                if prefs.gating().is_none() {
+                    notices.push(format!(
+                        "「ui_prefs.candidate_gating」的值 {:?} 无法识别，已按默认「immediate」处理",
+                        prefs.candidate_gating
+                    ));
+                    prefs.candidate_gating = "immediate".to_owned();
+                }
+                if prefs.display_view().is_none() {
+                    notices.push(format!(
+                        "「ui_prefs.display_view」的值 {:?} 无法识别，已按默认「black」处理",
+                        prefs.display_view
+                    ));
+                    prefs.display_view = "black".to_owned();
+                }
+                if prefs.batch_side().is_none() {
+                    notices.push(format!(
+                        "「ui_prefs.batch_side」的值 {:?} 无法识别，已按默认「all」处理",
+                        prefs.batch_side
+                    ));
+                    prefs.batch_side = "all".to_owned();
+                }
+                prefs
+            }
+            Err(_) => {
+                // 结构坏了（非对象 / 字段类型不符）：回退整体默认并提示。
+                // serde 的 struct 级 default 只兜缺字段，兜不了类型错值，
+                // 所以这里只能整块回退——ui_prefs 里没有会丢引擎的键，
+                // 损失可控，提示讲清楚即可。
+                notices.push("「ui_prefs」内容无法识别，界面偏好已回退默认值".to_owned());
+                UiPrefs::default()
+            }
+        },
+        None => UiPrefs::default(), // 旧配置文件缺此键：静默默认（兼容）
+    };
+
+    EngineConfig {
+        engine_path,
+        model_path,
+        weights_dir,
+        backend,
+        visits: visits.max(1),
+        search_threads: search_threads.max(1),
+        analysis_cfg,
+        play_difficulty,
+        rules,
+        time_system,
+        new_game_rules,
+        ui_prefs,
     }
 }
 
@@ -459,21 +811,35 @@ pub fn save_settings(cfg: &EngineConfig) -> Result<(), String> {
     .map_err(|e| format!("保存 {} 失败：{e}", path.display()))
 }
 
+/// 生成配置的注释已按实测改写；已存在的旧文件不会被重写，于是出现
+/// 「值是 16、注释还说 8 核 16 线程物理核最优」的自相矛盾。对策：文件
+/// 中**精确**存在下面两行旧注释原文时，替换为新注释；不匹配（用户改过
+/// / 删过）一律保持原样，其余内容不动，多次执行幂等。
+const CFG_LEGACY_COMMENT: [&str; 2] = [
+    "# 8 cores / 16 threads host: one search thread per physical core is the",
+    "# efficiency sweet spot for KataGo MCTS.",
+];
+/// 替换旧注释用的**新注释**（与 `default_analysis_cfg_text` 的实测口径
+/// 一致：16 线程比 8 快 17–21%，界面未被饿死，发滞可降物理核数）。
+const CFG_NEW_COMMENT: &str = "\
+    # 搜索线程：OpenCL 只做网络前向、搜索全在 CPU 线程上，线程越多越能\n\
+    # 喂满 GPU 批。实测（b18 + 680M iGPU）：16 线程比 8 快 17–21%\n\
+    # （2000 visits：23.8s vs 28.6s），界面未被饿死；若发滞可降到物理核数。";
+
 /// `analysis.cfg` 不存在时按当前配置生成一份可用的默认配置；
-/// 已存在时**仅当其中的 `numSearchThreads` 与当前配置不一致**才原地
-/// 更新线程数（其余内容不动——用户可自由修改该文件，程序只接管线
-/// 需要的那一个键）。返回是否新写入 / 更新了文件。
+/// 已存在时做两类**受限**更新，其余内容一律不动（用户可自由修改该文件）：
+/// 1. 仅同步 `numSearchThreads`（管线接管的键）与当前配置不一致时的值；
+/// 2. 仅当文件里存在 [`CFG_LEGACY_COMMENT`] 两行**精确原文**时，替换为
+///    [`CFG_NEW_COMMENT`]（旧注释与新实测口径矛盾，见其文档）。
 ///
-/// 背景：`search_threads` 此前只用于首次生成配置——文件已存在时改了
-/// 设置等于没改。保存设置时调用本函数即可让新线程数真的生效
-///（引擎重启后读新配置）。
+/// 返回是否新写入 / 更新了文件（两次运行间内容不变则 `false`，幂等）。
 pub fn ensure_analysis_cfg(path: &Path, cfg: &EngineConfig) -> Result<bool, String> {
     let threads = cfg.search_threads.max(1);
     if !path.exists() {
         write_atomically(path, &default_analysis_cfg_text(cfg))?;
         return Ok(true);
     }
-    // 已存在：仅同步 numSearchThreads（管线接管的键），其余行原样保留。
+    // 已存在：仅同步 numSearchThreads 与旧注释升级（若精确匹配），其余行原样保留。
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
     let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
@@ -489,13 +855,25 @@ pub fn ensure_analysis_cfg(path: &Path, cfg: &EngineConfig) -> Result<bool, Stri
             }
         }
     }
-    if seen && !changed {
-        return Ok(false);
-    }
     if !seen {
         // 配置被用户删掉了该键：KataGo 缺省 numSearchThreads = 1，
         // 把当前值追加到必填键区块，保证设置改动有处落。
         lines.push(format!("numSearchThreads = {threads}"));
+        changed = true;
+    }
+    // 旧注释升级（子项 5）：逐行扫描相邻两行是否**精确**等于旧注释原文。
+    // 只替换这两行；找不到 / 改过就保持原样，绝不整段重排。
+    if let Some(start) = lines
+        .windows(2)
+        .position(|w| w[0] == CFG_LEGACY_COMMENT[0] && w[1] == CFG_LEGACY_COMMENT[1])
+    {
+        // 新注释为 3 行，替换 2 行旧文；其余行下标不变（先替换，再在
+        // 同一个 Vec 上继续，无需二次扫描）。
+        let mut new_lines: Vec<String> = Vec::with_capacity(lines.len() + 1);
+        new_lines.extend_from_slice(&lines[..start]);
+        new_lines.extend(CFG_NEW_COMMENT.lines().map(str::to_owned));
+        new_lines.extend_from_slice(&lines[start + 2..]);
+        lines = new_lines;
         changed = true;
     }
     if changed {
