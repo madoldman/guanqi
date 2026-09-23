@@ -3,6 +3,7 @@
 
 pub mod analysis;
 pub mod analysis_panel;
+pub mod batch_scan;
 pub mod board_view;
 pub mod curve;
 pub mod explain;

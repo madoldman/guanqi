@@ -88,6 +88,9 @@ pub struct GuanqiApp {
     settings: settings::SettingsUi,
     /// 设置窗口是否打开。
     settings_open: bool,
+    /// 整谱快扫设置对话框是否打开（菜单「分析 → 整谱快扫…」的入口，
+    /// 从侧栏卡片搬家而来：设置与预估同屏，看完预估再决定发起）。
+    batch_scan_open: bool,
     /// 首次读取配置的提示（文件损坏回退等），直到用户保存过新配置。
     startup_notice: Option<String>,
     /// 最近一次难度/设置保存失败的用户提示（成功时不显示）。
@@ -390,6 +393,7 @@ impl GuanqiApp {
             engine_cfg,
             settings,
             settings_open: false,
+            batch_scan_open: false,
             startup_notice,
             persist_notice: None,
             waker,
@@ -545,6 +549,450 @@ impl GuanqiApp {
             last_open_dir: self.engine_cfg.ui_prefs.last_open_dir.take(),
             last_save_dir: self.engine_cfg.ui_prefs.last_save_dir.take(),
         };
+    }
+
+    /// 「文件」菜单：棋谱的打开 / 另存，与研究副本的三个动作。
+    ///
+    /// 副本动作做成子菜单（创建 / 切换 / 丢弃）而不是散在顶层：三个
+    /// 动作同属一个概念，且「切换 / 丢弃」在没开副本时不可用，收进
+    /// 子菜单后顶层只剩三条，与「对局」「分析」的条目数相当。
+    ///
+    /// 置灰一律给原因（[`egui::Response::on_disabled_hover_text`]）：
+    /// 静默无效的菜单项比没有更糟——用户会以为点了没生效。
+    fn file_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("文件", |ui| {
+            let disabled_reason = self.portal_unavailable.clone();
+            let mut entry = ui.add_enabled(
+                disabled_reason.is_none(),
+                egui::Button::new("打开棋谱…").shortcut_text("Ctrl+O"),
+            );
+            if let Some(reason) = disabled_reason.as_deref() {
+                entry = entry.on_disabled_hover_text(reason.to_owned());
+            }
+            if entry.clicked() {
+                self.open_file_dialog();
+                // 菜单内的普通按钮不会自动收起菜单，显式关闭。
+                ui.close();
+            }
+            let mut entry = ui.add_enabled(
+                disabled_reason.is_none(),
+                egui::Button::new("另存为…").shortcut_text("Ctrl+Shift+S"),
+            );
+            if let Some(reason) = disabled_reason.as_deref() {
+                entry = entry.on_disabled_hover_text(reason.to_owned());
+            }
+            if entry.clicked() {
+                self.save_file_dialog();
+                ui.close();
+            }
+            ui.separator();
+            ui.menu_button("研究副本", |ui| {
+                // 仅空盘置灰（原谱 / 任意副本里都可再开副本）。
+                let copy_disabled = if self.loaded.is_none() {
+                    Some("未载入棋谱，无谱可复制")
+                } else {
+                    None
+                };
+                let mut entry = ui.add_enabled(
+                    copy_disabled.is_none(),
+                    egui::Button::new("从当前手创建副本"),
+                );
+                if let Some(reason) = copy_disabled {
+                    entry = entry.on_disabled_hover_text(reason.to_owned());
+                }
+                if entry.clicked() {
+                    self.create_copy();
+                    ui.close();
+                }
+                ui.separator();
+                // 「切换文档…」：展开各文档（原谱 + 各副本），当前项打勾。
+                // 侧栏文档列表的**切换**保留（它本质是「看当前是哪份文档」
+                // 的展示），这里给一个不依赖侧栏滚动位置的等价入口。
+                if self.doc_entries().is_empty() {
+                    let entry = ui.add_enabled(false, egui::Button::new("切换文档…▸"));
+                    entry.on_disabled_hover_text("未载入棋谱");
+                } else {
+                    ui.menu_button("切换文档…", |ui| {
+                        for entry in self.doc_entries() {
+                            if ui
+                                .add(egui::Button::selectable(entry.active, &entry.name))
+                                .clicked()
+                            {
+                                self.switch_doc(entry.number);
+                                ui.close();
+                            }
+                        }
+                    });
+                }
+                // 「丢弃当前副本」：当前是原谱时置灰（无可丢）。有研究
+                // 成果时 App 侧照旧弹确认框（确认机制与文案不变）。
+                let drop_reason = match self.active_from_move {
+                    None => Some("当前是原谱，没有副本可丢弃".to_owned()),
+                    Some(_) => None,
+                };
+                let mut entry = ui.add_enabled(
+                    drop_reason.is_none(),
+                    egui::Button::new("丢弃当前副本"),
+                );
+                if let Some(reason) = drop_reason {
+                    entry = entry.on_disabled_hover_text(reason);
+                }
+                if entry.clicked() {
+                    // 编号即身份：丢弃语义与原侧栏行尾「丢弃」完全一致
+                    // （有研究成果先确认）。
+                    let number = self.active_number;
+                    let research = self.doc_research(number).unwrap_or(0);
+                    if research > 0 {
+                        self.pending_confirm = PendingConfirm::DropCopy { number };
+                    } else {
+                        self.drop_copy(number);
+                    }
+                    ui.close();
+                }
+            });
+        });
+    }
+
+    /// 「对局」菜单：人机对弈开关、难度子菜单与终局动作。
+    ///
+    /// 对弈类动作在**非对弈态**一律置灰并说明原因（原侧栏是靠「整张
+    /// 卡片只在 `play.mode` 时才渲染按钮」隐式隐藏，搬到菜单后不能靠
+    /// 隐藏——菜单项忽有忽无会让用户以为功能丢了，置灰 + 悬停原因才
+    /// 是「同一个动作、此刻不可用」的诚实表达）。
+    fn play_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("对局", |ui| {
+            if ui.button("新对局…").clicked() {
+                self.new_game_open = true;
+                ui.close();
+            }
+            ui.separator();
+            // 人机对弈开关（复选）：与原侧栏同一个 `play.mode` 字段。
+            // 勾选即刻生效（对局开始 = 从当前局面起人类执 `play.human`）。
+            if ui.checkbox(&mut self.play.mode, "人机对弈").clicked() {
+                ui.close();
+            }
+            // 难度子菜单：五档单选，当前项打勾；hover 给 visits 与
+            // 预计等待（与原侧栏分段选择器的 hover 文案同一口径）。
+            ui.menu_button("难度", |ui| {
+                for &d in Difficulty::ALL.iter() {
+                    let selected = self.engine_cfg.play_difficulty == d;
+                    let response = ui
+                        .add(egui::Button::selectable(selected, d.name()))
+                        .on_hover_text(format!(
+                            "{} visits，预计每手约 {} 秒",
+                            d.visits(),
+                            d.estimate_secs()
+                        ));
+                    if response.clicked() && !selected {
+                        self.set_difficulty(d);
+                        ui.close();
+                    }
+                }
+            });
+            ui.separator();
+            // ---- 终局动作（认输 / 让引擎认输 / 弃着）----
+            // 启用条件与原侧栏按钮**逐字照搬**：对弈中 && 未结束 &&
+            // 轮到人类 && 游标在活子位置（让引擎认输另要求无望提示在）。
+            let finished = self.play.finished(&self.board);
+            let human_turn = self.board.to_play() == self.play.human;
+            let live = self.board.cursor() == self.board.line_len();
+            let playable = self.play.mode
+                && !finished
+                && human_turn
+                && live
+                && self.play.resigned.is_none()
+                && self.play.timeout_loss.is_none();
+            let idle_reason = "当前不是对局中（人机对弈未开启，或本局已结束）";
+            for (text, enabled, reason) in [
+                ("认输", playable, idle_reason),
+                ("弃着", playable, idle_reason),
+            ] {
+                let entry = ui.add_enabled(enabled, egui::Button::new(text));
+                if !enabled {
+                    entry.on_disabled_hover_text(reason);
+                } else if entry.clicked() {
+                    match text {
+                        "认输" => self.human_resign(),
+                        "弃着" => self.human_pass(),
+                        _ => {}
+                    }
+                    ui.close();
+                }
+            }
+            // 「让引擎认输」：仅在引擎无望提示可用时启用（提示只给一次，
+            // 与侧栏「让引擎认输」按钮的可见条件同源）。
+            let hopeless = self.hopeless_now();
+            let entry = ui.add_enabled(hopeless && playable, egui::Button::new("让引擎认输"));
+            if !(hopeless && playable) {
+                entry.on_disabled_hover_text(if hopeless {
+                    idle_reason
+                } else {
+                    "引擎尚未认定自己无望（胜率 ≤ 5% 时才会出现该入口）"
+                });
+            } else if entry.clicked() {
+                self.engine_resign();
+                ui.close();
+            }
+            ui.separator();
+            // 规则与时限：对局开始时确定、对局中不可改——对局中置灰并
+            // 说明原因（不是「没有这个菜单项」，也不是静默无效）。
+            let in_game = self.play.mode && !finished;
+            let rules_line = self.menu_rules_line();
+            let entry = ui.add_enabled(
+                !in_game,
+                egui::Button::new(format!("规则：{rules_line}")),
+            );
+            if in_game {
+                entry.on_disabled_hover_text("规则在对局开始时确定，对局中不可改");
+            }
+            let time_line = self.play.clock.system.name().to_owned();
+            let entry = ui.add_enabled(
+                !in_game,
+                egui::Button::new(format!("时限：{time_line}")),
+            );
+            if in_game {
+                entry.on_disabled_hover_text("时限在对局开始时确定，对局中不可改");
+            }
+        });
+    }
+
+    /// 当前生效规则的中文名（「对局」菜单的只读行；与本局锁定 / 棋谱
+    /// RU 的解析链同源，见 `active_rules` 字段文档）。
+    fn menu_rules_line(&self) -> String {
+        match self.active_rules.as_deref() {
+            Some(wire) => crate::engine::Rules::from_wire(wire)
+                .map_or_else(|| wire.to_owned(), |r| r.name().to_owned()),
+            None => match self
+                .loaded
+                .as_ref()
+                .and_then(|meta| meta.info.rules.as_deref())
+            {
+                Some(raw) => {
+                    let mapped = crate::engine::resolve_rules(None, Some(raw));
+                    crate::engine::Rules::from_wire(&mapped.rules)
+                        .map_or_else(|| raw.to_owned(), |r| r.name().to_owned())
+                }
+                None => "中国".to_owned(),
+            },
+        }
+    }
+
+    /// 引擎无望提示当前是否可用（与侧栏提示区的判定同源，供菜单置灰
+    /// 决策；**不**消费「已提示」标记——真正的消费在 `ui` 的提示区）。
+    fn hopeless_now(&self) -> bool {
+        play::should_show_hopeless(&self.play, self.analysis.snapshot.as_ref())
+    }
+
+    /// 人类认输（菜单入口；与侧栏「认输」按钮执行体完全相同）。
+    fn human_resign(&mut self) {
+        if self.play.mode && !self.play.finished(&self.board) {
+            let loser = self.play.human;
+            self.play.resigned = Some(loser);
+            let winner = loser.opposite();
+            let result = format!("{}+R", result_letter(winner));
+            let text = format!(
+                "{}认输：{}（{}）。对局已结束，可继续复盘浏览。",
+                loser.name(),
+                play::resign_text(loser),
+                result
+            );
+            self.finish_game(result, text, None);
+        }
+    }
+
+    /// 人类弃着（菜单入口；与侧栏「弃着」按钮执行体完全相同）。
+    fn human_pass(&mut self) {
+        if self.play.mode && !self.play.finished(&self.board) {
+            let mover = self.play.human;
+            self.board.pass();
+            self.play.clock.on_human_move(mover);
+            if play::two_passes(&self.board) {
+                self.finish_two_passes();
+            }
+        }
+    }
+
+    /// 「分析」菜单：整谱快扫（对话框）、限定选点、叠加层、候选显示、
+    /// 目数视角、底部面板。
+    ///
+    /// 这些都是**分析口径的设置**，原先散在侧栏的四张卡片里；侧栏改为
+    /// 纯展示后统一归此。改的是同一份状态（[`overlay::Overlay`] /
+    /// [`AnalysisState`] 的门控与视角 / 限定选点），因此既有的偏好
+    /// 持久化（`sync_prefs` 每帧快照 + 防抖落盘）对菜单改动照旧生效。
+    fn analyze_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("分析", |ui| {
+            // ---- 整谱快扫：打开对话框（设置 + 预估 + 发起同屏）----
+            if ui.button("整谱快扫…").clicked() {
+                self.batch_scan_open = true;
+                ui.close();
+            }
+            ui.separator();
+            // ---- 限定选点：区域开关 / 清除区域 / 清除排除列表 ----
+            // 「清除排除列表」在原侧栏卡片里有独立按钮，搬家后必须仍
+            // 可达（无排除项时置灰，说明「列表本来是空的」）。
+            ui.menu_button("限定选点", |ui| {
+                let limits = self.analysis.limits();
+                let region_on = limits.has_region();
+                if ui
+                    .add(egui::Button::selectable(
+                        region_on,
+                        if region_on {
+                            "限定区域：开（在棋盘上拖框）"
+                        } else {
+                            "限定区域：关"
+                        },
+                    ))
+                    .on_hover_text(if region_on {
+                        "关闭区域并清除它（引擎恢复全盘选点）"
+                    } else {
+                        "开启后在棋盘上拖框；引擎只考虑区域内的空点"
+                    })
+                    .clicked()
+                {
+                    if region_on {
+                        self.analysis.set_region(None);
+                    } else {
+                        self.analysis.enable_region_mode();
+                    }
+                    ui.close();
+                }
+                let has_region = region_on;
+                let entry = ui.add_enabled(has_region, egui::Button::new("清除区域"));
+                if !has_region {
+                    entry.on_disabled_hover_text("当前没有限定区域");
+                } else if entry.clicked() {
+                    self.analysis.set_region(None);
+                    ui.close();
+                }
+                let avoid_count = self.analysis.limits().avoid.len();
+                let entry = ui.add_enabled(avoid_count > 0, egui::Button::new("清除排除列表"));
+                if avoid_count == 0 {
+                    entry.on_disabled_hover_text("排除列表是空的");
+                } else if entry.clicked() {
+                    self.analysis.clear_avoid();
+                    ui.close();
+                }
+                let has_any = has_region || avoid_count > 0;
+                let entry = ui.add_enabled(has_any, egui::Button::new("清除全部限制"));
+                if !has_any {
+                    entry.on_disabled_hover_text("没有区域也没有排除项");
+                } else if entry.clicked() {
+                    self.analysis.clear_limits();
+                    ui.close();
+                }
+            });
+            // ---- 叠加层：七项复选（与原侧栏同名同状态）----
+            // 策略热度图 / 候选点领地两项是 opt-in 数据，翻转后必须
+            // 经 AnalysisState 重发查询（走与侧栏一致的 want/sent 比对）。
+            ui.menu_button("叠加层", |ui| {
+                let overlay = &mut self.overlay;
+                ui.checkbox(&mut overlay.show_candidates, "候选点圆圈");
+                ui.checkbox(&mut overlay.show_heat, "局势热度图");
+                let policy = ui
+                    .checkbox(&mut overlay.show_policy, "策略热度图")
+                    .on_hover_text(
+                        "引擎还没搜索时的第一直觉（策略网络先验），\
+                         不是搜索后的推荐——推荐看「候选点」。",
+                    );
+                let moves_heat = ui
+                    .checkbox(&mut overlay.show_moves_heat, "候选点领地")
+                    .on_hover_text(
+                        "开启后点击候选点定位时，热度图切换为「走这一手之后」的\
+                         领地（紫色层，候选点级 ownership）。代价：每条报告按\
+                         候选数增重，引擎需重查一次才生效；未聚焦候选点时仍\
+                         显示当前局面。",
+                    );
+                ui.checkbox(&mut overlay.show_mistakes, "失误标注");
+                ui.checkbox(&mut overlay.show_score_lead, "曲线叠加目差线");
+                ui.checkbox(&mut overlay.show_mini_board, "小棋盘变化图");
+                // opt-in 两项的翻转回传（与侧栏 card_overlay 同一条路径）。
+                if policy.changed() {
+                    self.analysis.set_want_policy(overlay.show_policy);
+                }
+                if moves_heat.changed() {
+                    self.analysis.set_want_moves_ownership(overlay.show_moves_heat);
+                }
+            });
+            // ---- 候选显示（门控）：三选一 + 延迟秒数 ----
+            ui.menu_button("候选显示", |ui| {
+                let gating = self.analysis.gating();
+                let delay = match gating {
+                    crate::ui::analysis::CandidateGating::Delayed { secs } => secs,
+                    _ => self.engine_cfg.ui_prefs.gating_delay_secs,
+                };
+                for mode in [
+                    crate::ui::analysis::CandidateGating::Immediate,
+                    crate::ui::analysis::CandidateGating::Delayed { secs: delay },
+                    crate::ui::analysis::CandidateGating::Manual,
+                ] {
+                    let selected =
+                        std::mem::discriminant(&gating) == std::mem::discriminant(&mode);
+                    if ui
+                        .add(egui::Button::selectable(selected, mode.name()))
+                        .on_hover_text(match mode {
+                            crate::ui::analysis::CandidateGating::Immediate => {
+                                "收到报告即显示候选（默认）"
+                            }
+                            crate::ui::analysis::CandidateGating::Delayed { .. } => {
+                                "引擎开始思考满 N 秒后才显示候选，避免浅层搜索结果误导"
+                            }
+                            crate::ui::analysis::CandidateGating::Manual => {
+                                "按 F 显示候选；局面一变需重新按键"
+                            }
+                        })
+                        .clicked()
+                        && !selected
+                    {
+                        self.analysis.set_gating(mode);
+                        if mode != crate::ui::analysis::CandidateGating::Manual {
+                            // 与 App 处理 SetGating 的同一条收尾：切回
+                            // 立即 / 延迟时清掉手动确认残留。
+                            self.manual_revealed = false;
+                            self.manual_sig = None;
+                        }
+                    }
+                }
+                // 延迟秒数：小数值控件（1..=30 秒）。
+                if let crate::ui::analysis::CandidateGating::Delayed { secs } = gating {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.weak("延迟");
+                        let mut edit = secs as i32;
+                        if ui
+                            .add(egui::DragValue::new(&mut edit).range(1..=30).suffix(" 秒"))
+                            .changed()
+                        {
+                            self.analysis.set_gating(
+                                crate::ui::analysis::CandidateGating::Delayed {
+                                    secs: edit.max(1) as u32,
+                                },
+                            );
+                        }
+                    });
+                }
+            });
+            // ---- 目数视角：两选一 ----
+            ui.menu_button("目数视角", |ui| {
+                let view = self.analysis.display_view();
+                for mode in [
+                    crate::ui::analysis::DisplayView::Black,
+                    crate::ui::analysis::DisplayView::Alternating,
+                ] {
+                    if ui
+                        .add(egui::Button::selectable(view == mode, mode.name()))
+                        .clicked()
+                        && view != mode
+                    {
+                        self.analysis.set_display_view(mode);
+                    }
+                }
+            });
+            // ---- 底部面板：胜率曲线 / 棋谱树（小棋盘归叠加层，不重复）----
+            ui.menu_button("面板", |ui| {
+                ui.checkbox(&mut self.curve_open, "胜率曲线");
+                ui.checkbox(&mut self.tree_open, "棋谱树");
+            });
+        });
     }
 
     /// 发起「打开棋谱」对话框（菜单入口与 Ctrl+O 共用）。
@@ -1511,66 +1959,16 @@ impl eframe::App for GuanqiApp {
             self.manual_revealed = false;
             self.manual_sig = None;
         }
-        // 顶部菜单栏：文件 → 打开棋谱… / 另存为…；对局 → 新对局…
+        // 顶部菜单栏：文件（棋谱与副本）/ 对局（人机对弈与终局动作）/
+        // 分析（快扫 / 限定选点 / 叠加层 / 候选显示 / 视角 / 面板）。
+        // 侧栏只做信息展示，可改的设置一律规整进这三个菜单（见各菜单
+        // 方法文档）：同一份状态（Overlay / 门控 / 视角 / 偏好），入口
+        // 搬家不改语义。
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("文件", |ui| {
-                    let disabled_reason = self.portal_unavailable.clone();
-                    let mut entry = ui.add_enabled(
-                        disabled_reason.is_none(),
-                        egui::Button::new("打开棋谱…").shortcut_text("Ctrl+O"),
-                    );
-                    if let Some(reason) = disabled_reason.as_deref() {
-                        entry = entry.on_disabled_hover_text(reason.to_owned());
-                    }
-                    if entry.clicked() {
-                        self.open_file_dialog();
-                        // 菜单内的普通按钮不会自动收起菜单，显式关闭。
-                        ui.close();
-                    }
-                    ui.separator();
-                    let mut entry = ui.add_enabled(
-                        disabled_reason.is_none(),
-                        egui::Button::new("另存为…").shortcut_text("Ctrl+Shift+S"),
-                    );
-                    if let Some(reason) = disabled_reason.as_deref() {
-                        entry = entry.on_disabled_hover_text(reason.to_owned());
-                    }
-                    if entry.clicked() {
-                        self.save_file_dialog();
-                        ui.close();
-                    }
-                    ui.separator();
-                    // 研究副本：仅空盘置灰（原谱 / 任意副本里都可再开副本）。
-                    let copy_disabled = if self.loaded.is_none() {
-                        Some("未载入棋谱，无谱可复制")
-                    } else {
-                        None
-                    };
-                    let mut entry = ui.add_enabled(
-                        copy_disabled.is_none(),
-                        egui::Button::new("从当前手复制为研究副本"),
-                    );
-                    if let Some(reason) = copy_disabled {
-                        entry = entry.on_disabled_hover_text(reason.to_owned());
-                    }
-                    if entry.clicked() {
-                        self.create_copy();
-                        ui.close();
-                    }
-                    // 副本存在时提供「切换到原谱」快捷入口；丢弃入口唯一
-                    // 化在侧栏文档列表（多副本下菜单项无法指向具体某份）。
-                    if self.active_from_move.is_some() && ui.button("切换到原谱").clicked() {
-                        self.switch_to_original();
-                        ui.close();
-                    }
-                });
-                ui.menu_button("对局", |ui| {
-                    if ui.button("新对局…").clicked() {
-                        self.new_game_open = true;
-                        ui.close();
-                    }
-                });
+                self.file_menu(ui);
+                self.play_menu(ui);
+                self.analyze_menu(ui);
             });
         });
 
