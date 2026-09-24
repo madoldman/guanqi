@@ -263,6 +263,41 @@ pub(crate) fn pv_text(pv: &[Option<Coord>], size: Size) -> Option<String> {
     Some(parts.join(" → "))
 }
 
+/// 主变（PV）带每手计算量的悬停文本：`D4(120) → Q16(35) → …`。
+///
+/// `pv_visits` 与 `pv` 逐项对齐（opt-in `includePVVisits`，实测见
+/// `engine::protocol` 模块文档）。**visits 越小 = 引擎对这一步越不确定**
+/// （该手及其后续只分到极少的模拟访问次数）。截断口径与 [`pv_text`]
+/// 一致（同一主变的同一前缀，两处显示不能漂移）。
+/// `pv_visits` 为 `None`（查询未开启该字段）时返回 `None`——调用方
+/// 回落纯坐标版 `pv_text`，**绝不显示 0 或臆造**。
+/// 坐标与 visits 长度本应相等（协议对齐实测）；数组长度意外不齐时
+/// 按较短者截断防御，绝不越界。
+pub(crate) fn pv_visits_text(
+    pv: &[Option<Coord>],
+    pv_visits: &[u64],
+    size: Size,
+) -> Option<String> {
+    if pv.is_empty() || pv_visits.is_empty() {
+        return None;
+    }
+    // 丢弃的尾手也要同步丢掉它的 visits：显示段与截断标记对齐。
+    let take = PV_LIMIT.min(pv.len()).min(pv_visits.len());
+    let mut parts: Vec<String> = pv
+        .iter()
+        .zip(pv_visits.iter())
+        .take(take)
+        .map(|(c, v)| {
+            let coord = c.map_or_else(|| "弃着".to_owned(), |c| c.to_gtp(size));
+            format!("{coord}({v})")
+        })
+        .collect();
+    if pv.len() > take {
+        parts.push("…".to_owned());
+    }
+    Some(parts.join(" → "))
+}
+
 /// 绘制分析侧栏（纯信息展示）。`settings_open` 仅透传给引擎卡的
 /// 设置入口（设置窗口开关由本面板与顶部按钮共享）；
 /// `overlay` 为棋盘叠加层的层开关与定位状态（本面板只读其定位态）；
@@ -1042,6 +1077,25 @@ fn candidate_row(
     let interactive = info.mv.is_some();
     // PV 文本行：空 PV（罕见，引擎至少回首手）不占位。
     let pv_line = pv_text(&info.pv, size);
+    // 悬停增强：查询开启了 includePVVisits 且报文带 pv_visits 时，悬停
+    // 文本升级为「每手 visits」版（visits 越小 = 引擎对这一步越不确定）；
+    // 未开启 / 字段缺失时回落纯坐标版（不显示 0、不臆造）。
+    let pv_hover: Option<String> = info
+        .pv_visits
+        .as_deref()
+        .map_or_else(
+            || pv_line.clone().map(|text| (text, "该候选的主变（PV）前缀，与棋盘预览截断一致")),
+            |visits| {
+                pv_visits_text(&info.pv, visits, size).map(|text| {
+                    (
+                        text,
+                        "主变各手的计算量（visits）：越小 = 引擎对这一步越不确定\n\
+                         该查询开启了 PV 计算量（includePVVisits），每条报告按候选数 × 变长略增",
+                    )
+                })
+            },
+        )
+        .map(|(_, tip)| tip.to_owned());
 
     let height = 24.0;
     // 行尾「排除」「前进」按钮占宽（弃着行没有，行体占满整行）。
@@ -1098,7 +1152,7 @@ fn candidate_row(
         Color32::from_rgb(150, 156, 166),
     );
     response = if info.mv.is_some() {
-        response.on_hover_text("点击在棋盘上定位该点")
+        response.on_hover_text(pv_hover.as_deref().unwrap_or("点击在棋盘上定位该点"))
     } else {
         response.on_hover_text("弃着无处定位")
     };
@@ -1117,13 +1171,23 @@ fn candidate_row(
     if let Some(at) = info.mv
         && let Some(player) = to_play
     {
-        // 两个小钮并排（排除 / 沿主变前进），等宽对齐。
+        // 两个小钮并排（排除 / 沿主变前进），等宽对齐。自绘文字必须用
+        // `allocate_response + senseless_label`（或等效）补 label，否则
+        // accesskit 树里没有这两个按钮的文本，headless 工具的
+        // click_label「排除」探不到（也是无障碍读屏的缺失）。
         let btn_w = (tail - 8.0) / 2.0;
         let region_on = analysis.limits().has_region();
         let (brect, btn) = ui.allocate_exact_size(
             Vec2::new(btn_w, height - 4.0),
             if region_on { Sense::hover() } else { Sense::click() },
         );
+        btn.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                region_on,
+                "排除",
+            )
+        });
         let painter = ui.painter_at(brect);
         let hover = !region_on && (btn.hovered() || btn.is_pointer_button_down_on());
         painter.rect_filled(
@@ -1161,6 +1225,9 @@ fn candidate_row(
         }
 
         let (frect, fwd) = ui.allocate_exact_size(Vec2::new(btn_w, height - 4.0), Sense::click());
+        fwd.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "前进")
+        });
         let painter = ui.painter_at(frect);
         let hover = fwd.hovered() || fwd.is_pointer_button_down_on();
         painter.rect_filled(

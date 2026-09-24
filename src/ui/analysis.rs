@@ -1108,6 +1108,14 @@ pub struct AnalysisState {
     want_moves_ownership: bool,
     /// 上次发起查询时的候选点级 ownership 开关值。
     sent_moves_ownership: bool,
+    /// PV 每手计算量（`includePVVisits`）的请求开关。opt-in 纪律与
+    /// policy / moves ownership 一致：查询级字段，引擎不感知开关事件，
+    /// want/sent 两值比对不一致即重发（局面未变也重发）。体积代价是
+    /// 紧凑整型数组（每项 1–3 字节 × 候选数 × PV 长度，实测见
+    /// `engine::protocol` 模块文档），但仍只在需要时 opt-in。
+    want_pv_visits: bool,
+    /// 上次发起查询时的 `includePVVisits` 开关值。
+    sent_pv_visits: bool,
     /// 整谱快扫任务（`Some` = 进行中）。与常规在飞查询（`inflight`）完全
     /// 独立：批量报告只回填历史，不落展示快照（`on_report` 按 stage 隔离）。
     batch: Option<BatchJob>,
@@ -1157,6 +1165,14 @@ pub struct AnalysisState {
     /// `None` = 无任务。局面变化（用户浏览）不取消任务——终局后棋盘
     /// 不再变化，签名恒匹配；换谱 / 新对局随 `reset()` 清除。
     terminal_eval: Option<TerminalEval>,
+    /// 「排除首选看次优」便捷入口（菜单）**自己**钉住的那一手。
+    ///
+    /// 便捷入口是开关式：再点一次要撤销**刚才那次**排除，而不是清掉
+    /// 全部排除（那会把用户手动排除的手一起清掉）。因此需要单独记住
+    /// 「这个入口加入的是哪一手」——只看「avoid 列表非空」没法区分
+    /// 「入口加的」与「用户手动右键 / 候选行加的」。`None` = 入口当前
+    /// 未排除任何手（或已被用户从菜单手动移除，见 `avoid_top_pinned`）。
+    avoid_pin: Option<(Stone, Coord)>,
 }
 
 /// 终局评估任务的状态（见 [`AnalysisState::terminal_eval`]）。
@@ -1193,6 +1209,8 @@ impl AnalysisState {
             sent_policy: false,
             want_moves_ownership: false,
             sent_moves_ownership: false,
+            want_pv_visits: false,
+            sent_pv_visits: false,
             batch: None,
             batch_config: BatchConfig::default(),
             batch_notice: None,
@@ -1206,6 +1224,7 @@ impl AnalysisState {
             rules_notice: None,
             rules_notice_slot: std::cell::Cell::new(None),
             terminal_eval: None,
+            avoid_pin: None,
         }
     }
 
@@ -1306,9 +1325,15 @@ impl AnalysisState {
         self.bump_limits();
     }
 
-    /// 移除一条排除项（下标 = 侧栏排除列表的行号）。
+    /// 移除一条排除项（下标 = 侧栏排除列表的行号）。移除的恰是入口
+    /// 钉住的那条时，pin 状态同步失效（按钮回到「排除首选」）。
     pub fn remove_avoid(&mut self, index: usize) {
         if index < self.limits.avoid.len() {
+            if let Some(pin) = self.avoid_pin
+                && self.limits.avoid[index] == pin
+            {
+                self.avoid_pin = None;
+            }
             self.limits.avoid.remove(index);
             self.bump_limits();
         }
@@ -1320,6 +1345,8 @@ impl AnalysisState {
             return;
         }
         self.limits = AnalysisLimits::default();
+        // 一键清空覆盖一切限制，入口的 pin 状态随之失效。
+        self.avoid_pin = None;
         self.bump_limits();
     }
 
@@ -1339,6 +1366,50 @@ impl AnalysisState {
             return;
         }
         self.limits.avoid.clear();
+        // 手动清空覆盖一切排除项，入口的 pin 状态随之失效。
+        self.avoid_pin = None;
+        self.bump_limits();
+    }
+
+    // ---- 「排除首选看次优」便捷入口（菜单开关式）----
+
+    /// 便捷入口当前钉住的手（菜单按钮文案判定用：`Some` = 显示「撤销」）。
+    pub fn avoid_pin(&self) -> Option<(Stone, Coord)> {
+        self.avoid_pin
+    }
+
+    /// 便捷入口的开关动作：`at = Some((player, coord))` 加入排除并钉住；
+    /// `None` 撤销入口自己钉住的那一次（按 (行棋方, 坐标) 精确匹配，
+    /// 只移除这一条——用户手动排除的其它手不受影响）。
+    ///
+    /// 区域模式下不生效（与 [`Self::toggle_avoid`] 同一互斥语义）；调用方
+    /// （菜单）本就会置灰该入口，这里是数据层兜底。
+    pub fn set_avoid_pin(&mut self, at: Option<(Stone, Coord)>) {
+        if self.limits.has_region() {
+            return;
+        }
+        match at {
+            Some((player, coord)) => {
+                // 已在列表里（例如用户手动排除过同一个点）：不重复添加，
+                // 只把 pin 指向它——再点一次撤销时移除的就是这一条，
+                // 状态与列表保持一致，不会出现「pin 有、列表没有」的幻觉。
+                if !self.limits.avoid.iter().any(|(p, c)| *p == player && *c == coord) {
+                    self.limits.avoid.push((player, coord));
+                }
+                self.avoid_pin = Some((player, coord));
+            }
+            None => {
+                if let Some((player, coord)) = self.avoid_pin.take()
+                    && let Some(pos) = self
+                        .limits
+                        .avoid
+                        .iter()
+                        .position(|(p, c)| *p == player && *c == coord)
+                {
+                    self.limits.avoid.remove(pos);
+                }
+            }
+        }
         self.bump_limits();
     }
 
@@ -1368,6 +1439,18 @@ impl AnalysisState {
         }
         self.want_moves_ownership = want;
         // 旧快照候选点的 ownership 有无与新开关矛盾，作废重查。
+        self.snapshot = None;
+    }
+
+    /// 设置 PV 每手计算量（`includePVVisits`）的请求开关。复刻
+    /// [`Self::set_want_policy`] 的机制：值变化即作废快照，`sync` 检测
+    /// `want/sent` 不一致后自动重发查询（局面未变也重发）。旧快照的
+    /// 候选点不带 `pv_visits`，与新开关矛盾，作废重查才一致。
+    pub fn set_want_pv_visits(&mut self, want: bool) {
+        if self.want_pv_visits == want {
+            return;
+        }
+        self.want_pv_visits = want;
         self.snapshot = None;
     }
 
@@ -1741,6 +1824,7 @@ impl AnalysisState {
         let limits_changed = self.limits_epoch != self.sent_epoch;
         let policy_changed = self.want_policy != self.sent_policy;
         let moves_ownership_changed = self.want_moves_ownership != self.sent_moves_ownership;
+        let pv_visits_changed = self.want_pv_visits != self.sent_pv_visits;
         let view_changed = self.want_view != self.sent_view;
         // 贴目：查询级字段，want/sent 比对（复刻 policy 机制）——载入
         // KM 不同的谱 / 新对局换贴目后，局面未变也必须重发查询。
@@ -1754,6 +1838,7 @@ impl AnalysisState {
             || limits_changed
             || policy_changed
             || moves_ownership_changed
+            || pv_visits_changed
             || view_changed
             || rules_changed
             || komi_changed
@@ -2629,6 +2714,12 @@ impl AnalysisState {
         // 使单条报告 3.6 KB → 34.2 KB（约 +3.4 KB/候选，实测见模块文档），
         // 只在「候选点领地」图层开启时才请求；关闭时零开销。
         query.include_moves_ownership = self.want_moves_ownership;
+        // PV 每手计算量（opt-in）：紧凑整型数组（每项 1–3 字节 × 候选数 ×
+        // PV 长度），增量远小于 ownership/policy；仍按 opt-in 纪律只在
+        // 「候选点悬停显示 PV visits」开启时请求（开关入口在
+        // 「分析 → 叠加层」），关闭时省略字段、零开销。实测与缺失语义见
+        // `engine::protocol` 模块文档「PV 每手计算量」条目。
+        query.include_pv_visits = self.want_pv_visits;
         // 展示口径开启流式中间报告（边搜边刷新界面）；走子口径只认终态。
         if stage.streaming() {
             query.report_during_search_every = Some(REPORT_EVERY_SECS);
@@ -2651,6 +2742,7 @@ impl AnalysisState {
         self.sent_epoch = self.limits_epoch;
         self.sent_policy = self.want_policy;
         self.sent_moves_ownership = self.want_moves_ownership;
+        self.sent_pv_visits = self.want_pv_visits;
         // 规则 / 视角 / 贴目随查询定格：want/sent 比对的基准（规则变化在下次
         // sync 比对中触发重发；视角与贴目同理）。
         self.sent_rules = Some(query_rules_after);

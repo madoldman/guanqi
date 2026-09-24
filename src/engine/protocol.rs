@@ -51,6 +51,26 @@
 //!   与根 `ownership` 同一下标口径），搜索早期即可显示、无需等终态。
 //!   代价：单条报告 3.6 KB → 34.2 KB（约 +3.4 KB/候选），300 visits
 //!   流式一次约 340 KB（基线 9.4 倍）⇒ 必须只在该图层开启时 opt-in。
+//! - **PV 每手计算量 `pvVisits`**（opt-in `includePVVisits: true`，
+//!   v1.18.2 实测——40 visits、7 手局面、终态报文对照）：
+//!   - 开启后 `moveInfos[]` 每条多出**两个**数组字段：`pvVisits` 与
+//!     `pvEdgeVisits`（本次实测两者数值完全相同，引擎同时给出两个名字）；
+//!   - `pvVisits` 与该候选的 `pv` **逐项对齐、长度相等**：
+//!     `pv = ["L17","C3","C4","D3","E4","F2","R3"]`（7 项）⇔
+//!     `pvVisits = [23,16,9,8,5,2,1]`（7 项）。`pvVisits[i]` = 走到 PV
+//!     第 i 手之后那个局面的搜索访问次数，沿 PV 递减；
+//!   - 首项恒等于该候选自身的 `visits`（23==23 / 11==11 / 6==6 / 1==1，
+//!     全部候选吻合）——**visits 越小 = 引擎对这一步越不确定**（这一手
+//!     及其后续只分到极少模拟次数），这正是悬停文本要传达的语义；
+//!   - 末位 = 该主变最后一个节点被访问的次数（≥1）；
+//!   - 体积：紧凑整型数组，每项 1–3 字节、随候选数 × PV 长度线性增长，
+//!     远小于 ownership / policy 的固定 KB 级膨胀（实测 off 3079 字节 vs
+//!     on 2965 字节的终态单条对照——差异被 visits 波动淹没，即增量量级
+//!     远低于报文本身的波动）。**未确证**：流式中间报告是否同样携带
+//!     （搜索太快未采到中间报文）；按 ownership / policy 的既有实测
+//!     惯例（中间报告同构）推断同样携带，使用处不做特殊区分；
+//!   - 查询不带该字段时 moveInfos 无这两个键 ⇒ 宽容解析缺省 `None`，
+//!     上层不显示 visits 文本（不显示 0、不臆造）。
 //! - 顶层未知字段的警告：引擎会发一条
 //!   `{"field":"<名>","id":"<id>","warning":"Unexpected or unused field, …"}`
 //!   并**随后照常分析该查询**（实测 warning 后仍收到全部正常报告）。
@@ -149,6 +169,13 @@ pub struct AnalysisQuery {
     /// 显示后续领地。体积是 ownership/policy 之最（约 +3.4 KB/候选/报告），
     /// 必须只在对应图层开启时才请求；关闭时不得发送该字段（零开销）。
     pub include_moves_ownership: bool,
+    /// 是否返回 PV 每手计算量（opt-in，字段名 `includePVVisits`，实测见
+    /// 模块文档「PV 每手计算量」条目）。开启后每个候选点带 `pvVisits`
+    /// 数组（与该候选的 `pv` 逐项对齐；`pvVisits[i]` = 走到 PV 第 i 手后
+    /// 局面的搜索访问次数，越往后越小——visits 越小 = 引擎对这一步越
+    /// 不确定）。体积为紧凑整型数组（每项 1–3 字节 × 候选数 × PV 长度），
+    /// 远小于 ownership/policy；仍按 opt-in 纪律只在需要时请求。
+    pub include_pv_visits: bool,
     /// 流式中间报告的输出间隔（秒）；`None` = 不开启，只回终态。
     /// 开启后搜索期间约每 N 秒一条 `isDuringSearch: true` 的中间报告，
     /// 最后仍有一条 `false` 终态（v1.18.2 实测，见模块文档）。
@@ -239,6 +266,7 @@ impl AnalysisQuery {
             include_ownership: false,
             include_policy: false,
             include_moves_ownership: false,
+            include_pv_visits: false,
             report_during_search_every: None,
             analyze_turns: None,
             priority: 0,
@@ -282,6 +310,14 @@ struct WireQuery<'a> {
     /// 分流到界面提示，不会再静默）。
     #[serde(skip_serializing_if = "is_false")]
     include_moves_ownership: bool,
+    /// PV 每手计算量（opt-in `includePVVisits`，实测见模块文档）。关闭时
+    /// 省略字段（零开销）。**显式 rename**：`rename_all = "camelCase"` 会
+    /// 把 `include_pv_visits` 变成 `includePvVisits`（小写 v），引擎不认识
+    /// ⇒ 发顶层未知字段警告且字段不生效（实测复现）。引擎字段名是
+    /// `includePVVisits`（PV 大写，与 `includeMovesOwnership` 复数命名
+    /// 风格同类），必须锁定原文。
+    #[serde(rename = "includePVVisits", skip_serializing_if = "is_false")]
+    include_pv_visits: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     report_during_search_every: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -399,6 +435,7 @@ impl AnalysisQuery {
             include_ownership: self.include_ownership,
             include_policy: self.include_policy,
             include_moves_ownership: self.include_moves_ownership,
+            include_pv_visits: self.include_pv_visits,
             report_during_search_every: self.report_during_search_every,
             analyze_turns: self.analyze_turns.as_deref(),
             priority: self.priority,
@@ -486,6 +523,10 @@ struct WireMoveInfo {
     /// 长度 = size²，下标与根 `ownership` 同口径）。缺省 `None` =
     /// 查询未开启该字段或引擎版本过旧，上层按无数据回落处理。
     ownership: Option<Vec<f32>>,
+    /// PV 每手计算量（opt-in `includePVVisits` 才有；与该候选 `pv` 逐项
+    /// 对齐，见模块文档实测条目）。缺省 `None` = 查询未开启该字段，
+    /// 上层不显示 visits 文本（不显示 0、不臆造）。
+    pv_visits: Option<Vec<u64>>,
 }
 
 #[derive(Default, Deserialize)]
@@ -552,6 +593,12 @@ pub struct MoveInfo {
     /// 正值 = 黑势。`None` = 查询未开启该字段（宽容解析缺省），上层必须
     /// 回落根局面数据而非报错。
     pub ownership: Option<Vec<f32>>,
+    /// PV 每手计算量（opt-in [`AnalysisQuery::include_pv_visits`] 才有）：
+    /// 与 [`Self::pv`] 逐项对齐（v1.18.2 实测，见模块文档），`pv_visits[i]`
+    /// = 走到 PV 第 i 手之后局面的搜索访问次数，首项 = [`Self::visits`]，
+    /// 沿 PV 递减；末位 = 主变末端节点被访问次数（≥1）。`None` = 查询未
+    /// 开启该字段，上层不显示 visits 文本（不显示 0、不臆造）。
+    pub pv_visits: Option<Vec<u64>>,
 }
 
 /// 一次分析报告。
@@ -663,6 +710,7 @@ impl RawReport {
                     order: info.order,
                     lcb: info.lcb,
                     ownership: info.ownership,
+                    pv_visits: info.pv_visits,
                 })
                 .collect(),
             ownership: self.ownership,
@@ -706,6 +754,9 @@ pub(crate) struct RawMoveInfo {
     pub lcb: f32,
     /// 候选点级领地图原文（opt-in 才有，[`RawReport::decode`] 原样透传）。
     pub ownership: Option<Vec<f32>>,
+    /// PV 每手计算量原文（opt-in 才有，[`RawReport::decode`] 原样透传；
+    /// 坐标解码不改变它的对齐关系——`pv` 逐项对应）。
+    pub pv_visits: Option<Vec<u64>>,
 }
 
 /// 一行 stdout 解码结果（坐标保持 GTP 原文，尺寸后补，见 [`RawReport::decode`]）。
@@ -794,6 +845,7 @@ impl WireMessage {
                     order: info.order.unwrap_or(u32::MAX),
                     lcb: info.lcb.unwrap_or(0.0),
                     ownership: info.ownership,
+                    pv_visits: info.pv_visits,
                 })
                 .collect(),
             ownership: self.ownership,

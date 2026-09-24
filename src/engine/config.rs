@@ -60,6 +60,8 @@ pub struct UiPrefs {
     pub show_policy: bool,
     /// 「候选点领地」层（opt-in includeMovesOwnership）。
     pub show_moves_heat: bool,
+    /// 候选点悬停显示 PV 每手计算量（opt-in includePVVisits，默认关）。
+    pub show_pv_visits: bool,
     /// 失误标注层。
     pub show_mistakes: bool,
     /// 胜率曲线面板叠加**目差线**开关。
@@ -112,6 +114,7 @@ impl Default for UiPrefs {
             show_heat: true,
             show_policy: false,
             show_moves_heat: false,
+            show_pv_visits: false,
             show_mistakes: true,
             show_score_lead: true,
             show_mini_board: false,

@@ -85,6 +85,13 @@ pub struct Overlay {
     /// 默认关闭：每候选 × 361 float 的查询字段，打开时 `App` 同步
     /// `AnalysisState` 重发查询。
     pub show_moves_heat: bool,
+    /// 候选点悬停显示 PV 每手计算量（opt-in `includePVVisits`）：开启后
+    /// 候选行悬停文本升级为「D4(120) → Q16(35) → …」。默认关闭：紧凑
+    /// 整型数组、增量小，但仍按 opt-in 纪律只在需要时请求；打开时 `App`
+    /// 同步 `AnalysisState` 重发查询。它**不是绘制层**，放这里的理由：
+    /// 与其余 opt-in 数据开关同一「开关 → 重查」通路，设置归「分析 →
+    /// 叠加层」菜单、持久化走同一份 UiPrefs。
+    pub show_pv_visits: bool,
     /// 失误标注层开关（疑问手及以上才画，关闭时零绘制开销）。
     pub show_mistakes: bool,
     /// 胜率曲线面板里叠加**目差折线**（右侧对称目差刻度）。默认开：

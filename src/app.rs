@@ -376,10 +376,11 @@ impl GuanqiApp {
             branch_notice: None,
             analysis,
             overlay: overlay::Overlay {
-                show_candidates: prefs.show_candidates,
-                show_heat: prefs.show_heat,
-                show_policy: prefs.show_policy,
-                show_moves_heat: prefs.show_moves_heat,
+            show_candidates: prefs.show_candidates,
+            show_heat: prefs.show_heat,
+            show_policy: prefs.show_policy,
+            show_moves_heat: prefs.show_moves_heat,
+            show_pv_visits: prefs.show_pv_visits,
                 show_mistakes: prefs.show_mistakes,
                 show_score_lead: prefs.show_score_lead,
                 show_mini_board: prefs.show_mini_board,
@@ -516,6 +517,7 @@ impl GuanqiApp {
             show_heat: overlay.show_heat,
             show_policy: overlay.show_policy,
             show_moves_heat: overlay.show_moves_heat,
+            show_pv_visits: overlay.show_pv_visits,
             show_mistakes: overlay.show_mistakes,
             show_score_lead: overlay.show_score_lead,
             show_mini_board: overlay.show_mini_board,
@@ -844,6 +846,85 @@ impl GuanqiApp {
             ui.menu_button("限定选点", |ui| {
                 let limits = self.analysis.limits();
                 let region_on = limits.has_region();
+                // ---- 「排除首选看次优」便捷入口（KaTrain find_alternatives
+                // 的同款语义，一键开关式）----
+                // 「首选」取当前快照 order==0 的候选（引擎实时排序，排除后
+                // 重查自动变成次优）；叠加而非替换：不清用户手动排除的其它手。
+                // 区域模式下置灰并说明原因（allowMoves/avoidMoves 引擎实测
+                // 互斥，与候选行「排除」按钮同一套文案口径）。
+                let top = self
+                    .analysis
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snap| snap.moves.iter().find(|info| info.order == 0))
+                    .and_then(|info| info.mv)
+                    .map(|at| (self.board.to_play(), at));
+                // 入口已排除首选且列表里那条还在 ⇒ 按钮呈「撤销」态。
+                // 用入口自己的 pin 记录判定，而不是只看列表非空——后者
+                // 分不清「入口加的」与「用户手动加的」。
+                let pinned = self.analysis.avoid_pin();
+                let pinned_active = pinned.is_some_and(|pin| {
+                    self.analysis.limits().avoid.contains(&pin)
+                });
+                let (label, tip) = match (pinned_active, top) {
+                    (true, Some((player, at))) => (
+                        format!("排除首选：撤销（已排除 {}）", at.to_gtp(self.board.size())),
+                        format!(
+                            "再点一次撤销刚才的排除（只移除 {} {}，\
+                             手动排除的其它手不受影响）",
+                            player.name(),
+                            at.to_gtp(self.board.size())
+                        ),
+                    ),
+                    (true, None) => (
+                        "排除首选：撤销".to_owned(),
+                        "再点一次撤销该入口的排除（首选已不在候选表，\
+                         以记录的坐标为准）"
+                            .to_owned(),
+                    ),
+                    (false, Some((player, at))) => (
+                        format!("排除首选 {} 看次优", at.to_gtp(self.board.size())),
+                        format!(
+                            "把引擎当前首选 {} {} 加入排除并重查，\
+                             看它不用时的最佳应手；再点一次撤销。\
+                             与已排除的其它手叠加，不清空列表",
+                            player.name(),
+                            at.to_gtp(self.board.size())
+                        ),
+                    ),
+                    (false, None) => (
+                        "排除首选：暂无候选".to_owned(),
+                        "引擎还没有当前局面的候选数据（或候选均为弃着），\
+                         无法确定首选".to_owned(),
+                    ),
+                };
+                let has_top = pinned_active || top.is_some();
+                let entry = ui.add_enabled(has_top && !region_on, egui::Button::new(label));
+                // 三态提示：区域禁用给原因、无候选给原因、常态给功能说明。
+                //（先算再挂：on_disabled_hover_text / on_hover_text 都消费
+                // Response，三分支各自 move 会过不了借用检查。）
+                let entry = if region_on {
+                    entry.on_disabled_hover_text(
+                        "限定区域模式下排除不生效（引擎只允许区域或排除二者其一）；\
+                         如需排除选点，请先关闭「限定区域」",
+                    )
+                } else if !has_top {
+                    entry.on_disabled_hover_text(tip)
+                } else {
+                    entry.on_hover_text(tip)
+                };
+                if has_top
+                    && !region_on
+                    && entry.clicked()
+                {
+                    if pinned_active {
+                        self.analysis.set_avoid_pin(None);
+                    } else if let Some((player, at)) = top {
+                        self.analysis.set_avoid_pin(Some((player, at)));
+                    }
+                    ui.close();
+                }
+                ui.separator();
                 if ui
                     .add(egui::Button::selectable(
                         region_on,
@@ -938,15 +1019,27 @@ impl GuanqiApp {
                          候选数增重，引擎需重查一次才生效；未聚焦候选点时仍\
                          显示当前局面。",
                     );
+                let pv_visits = ui
+                    .checkbox(&mut overlay.show_pv_visits, "候选悬停显示 PV 计算量")
+                    .on_hover_text(
+                        "开启后候选点悬停文本显示主变各手的 visits，\
+                         如「D4(120) → Q16(35) → …」——visits 越小 = \
+                         引擎对这一步越不确定。代价：每条报告按候选数 × \
+                         变长增加一小段整型数据（远小于「候选点领地」），\
+                         引擎需重查一次才生效。",
+                    );
                 ui.checkbox(&mut overlay.show_mistakes, "失误标注");
                 ui.checkbox(&mut overlay.show_score_lead, "曲线叠加目差线");
                 ui.checkbox(&mut overlay.show_mini_board, "小棋盘变化图");
-                // opt-in 两项的翻转回传（与侧栏 card_overlay 同一条路径）。
+                // opt-in 各项的翻转回传（与侧栏 card_overlay 同一条路径）。
                 if policy.changed() {
                     self.analysis.set_want_policy(overlay.show_policy);
                 }
                 if moves_heat.changed() {
                     self.analysis.set_want_moves_ownership(overlay.show_moves_heat);
+                }
+                if pv_visits.changed() {
+                    self.analysis.set_want_pv_visits(overlay.show_pv_visits);
                 }
             });
             // ---- 候选显示（门控）：三选一 + 延迟秒数 ----
