@@ -560,16 +560,23 @@ impl Region {
 /// 会被拒绝），因此区域与排除列表也互斥：区域开启时排除列表保留但不生效。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AnalysisLimits {
-    /// 限定区域（`Some` = 区域模式，只允许区域内的空点）。
+    /// 限定区域（`Some` = 已在棋盘上框出区域，引擎只考虑区域内的空点）。
     pub region: Option<Region>,
     /// 被排除的手（GTP 坐标，按记录时的行棋方分组）。
     pub avoid: Vec<(Stone, Coord)>,
+    /// 区域**模式**开关（独立于 `region` 矩形）：开启 = 棋盘进入框选
+    /// 交互、引擎按区域限制选点（区域未拖出时视为全盘等待框选状态）。
+    /// 之所以独立于 `region`：「开关在开、矩形还没画」是合法中间态
+    /// （用户开了开关还没拖框），若用 `region.is_some()` 兼作模式判定，
+    /// 开关会被拖框前的空状态弹回去（fa3c804 起的隐性缺陷，菜单重构
+    /// 后在 headless 驱动下暴露）。关闭模式时同时清 `region`。
+    pub mode: bool,
 }
 
 impl AnalysisLimits {
-    /// 区域模式是否生效。
+    /// 区域模式是否生效（模式开即生效，区域矩形可以在随后拖出）。
     pub fn has_region(&self) -> bool {
-        self.region.is_some()
+        self.mode
     }
 }
 
@@ -1268,12 +1275,15 @@ impl AnalysisState {
     }
 
     /// 设置限定区域（`None` = 清除区域）。区域与排除互斥：设置区域后
-    /// 排除列表保留但暂不生效（见 [`AnalysisLimits`] 文档）。
+    /// 排除列表保留但暂不生效（见 [`AnalysisLimits`] 文档）。设置非
+    /// `None` 的区域同时进入区域模式（棋盘拖框路径自带模式开启）。
     pub fn set_region(&mut self, region: Option<Region>) {
-        if self.limits.region == region {
+        let mode = region.is_some();
+        if self.limits.region == region && self.limits.mode == mode {
             return;
         }
         self.limits.region = region;
+        self.limits.mode = mode;
         self.bump_limits();
     }
 
@@ -1304,9 +1314,9 @@ impl AnalysisState {
         }
     }
 
-    /// 清空全部限制（区域 + 排除；「一键清除」入口共用）。
+    /// 清空全部限制（区域模式 + 区域矩形 + 排除；「一键清除」入口共用）。
     pub fn clear_limits(&mut self) {
-        if self.limits.region.is_none() && self.limits.avoid.is_empty() {
+        if !self.limits.mode && self.limits.region.is_none() && self.limits.avoid.is_empty() {
             return;
         }
         self.limits = AnalysisLimits::default();
@@ -1316,6 +1326,10 @@ impl AnalysisState {
     /// 开启区域模式（不设区域，等用户在棋盘上拖出）。
     /// 恒递增版本号：模式切换本身要触发重发（棋盘交互随之改变）。
     pub fn enable_region_mode(&mut self) {
+        if self.limits.mode {
+            return;
+        }
+        self.limits.mode = true;
         self.bump_limits();
     }
 

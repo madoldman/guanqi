@@ -164,14 +164,21 @@ fn main() {
     let _ = std::fs::remove_dir_all(&sandbox);
 }
 
-/// 内置自证脚本：四项数据证据（无需截图与像素）。
+/// 内置自证脚本：菜单路径下的五项数据证据（无需截图与像素）。
 ///
 /// ## 为什么用 `click_label` 而不是硬编码坐标
 ///
 /// 侧栏内容高度随异步引擎结果浮动，控件 y 坐标在不同运行间能差几百
 /// points，硬编码坐标只在单次运行内有效。这里一律用 `click_label`
 /// 按文本取**本帧**矩形点击；它会在日志里回显实际取到的点，便于事后
-/// 核对。唯一前提是先让滚动停稳（`wait` 足够久），详见「坐标漂移」。
+/// 核对。唯一前提是先让滚动**停稳**（`wait` 足够久），详见「坐标漂移」。
+/// 菜单条目同理：先点顶层菜单（如「分析」）展开，条目出现在弹层里后
+/// 再按文本点击。
+///
+/// ## 侧栏已瘦身为纯展示
+///
+/// 叠加层开关 / 门控 / 快扫发起等设置全部走菜单（65941bc 起的自证 2/3/4
+/// 原先点侧栏卡片控件，卡片摘除后改走菜单路径，验证目标不变）。
 ///
 /// ## 为什么每项自证都带「对照」
 ///
@@ -187,40 +194,79 @@ fn self_test_script() -> &'static str {
     wait 1500
     dump 载入后
 
-    # ── 自证 2：点叠加层「候选点圆圈」复选框 → 状态翻转 ──
-    # 目标控件被 ScrollArea 裁在视口外时 click_label 会自行滚动翻找，
-    # 无需手写滚轮量（内容高度随异步引擎结果浮动，写死的量必然过期）。
-    probe 候选点圆圈
-    click_label 候选点圆圈
+    # ── 自证 2：经菜单「分析 → 叠加层 ⏵ → 候选点圆圈」翻转开关 ──
+    # 注意「叠加层 ⏵」带子菜单后缀，避免误点到棋盘状态栏「限定选点中」等
+    # 含相同字样的文本。每次重开菜单前先 ESC 清层：弹层若还开着，点顶层
+    # 菜单是「收起」而不是「展开」。
+    click_label 分析
     wait 400
-    dump 点复选框后-应翻转
+    probe 叠加层 ⏵
+    click_label 叠加层 ⏵
+    wait 500
     click_label 候选点圆圈
+    wait 500
+    dump 菜单翻转候选圆圈-应false
+    # 对照：再翻回 true（先 ESC 收起残余弹层再重开菜单）
+    key ESC
     wait 400
-    dump 再点一次-应翻回
+    click_label 分析
+    wait 400
+    click_label 叠加层 ⏵
+    wait 500
+    click_label 候选点圆圈
+    wait 500
+    dump 菜单再翻回-应true
 
-    # ── 自证 3：门控切「手动」+ 按 F → 门控状态变化 ──
-    click_label 手动
+    # ── 自证 3：门控切「手动」（分析 → 候选显示 ⏵）+ 按 F ──
+    key ESC
     wait 400
+    click_label 分析
+    wait 400
+    click_label 候选显示 ⏵
+    wait 500
+    click_label 手动
+    wait 500
     dump 切手动后-应不可见
     key F
-    wait 400
+    wait 500
     dump 按F后-应已揭示
-    # 对照：点回「立即」应自动清除手动揭示标记
-    click_label 立即
+    # 对照：切回「立即」应自动清除手动揭示标记
+    key ESC
     wait 400
+    click_label 分析
+    wait 400
+    click_label 候选显示 ⏵
+    wait 500
+    click_label 立即
+    wait 500
     dump 切回立即后-应清除手动标记
 
-    # ── 自证 4：发起整谱快扫（真实引擎链路）→ dump 进度 ──
+    # ── 自证 4：非对弈态「对局 → 认输」置灰（点击无效果）──
+    click_label 对局
+    wait 400
+    probe 认输
+    click_label 认输
+    wait 500
+    dump 非对弈态点认输-应无变化
+
+    # ── 自证 5：经「分析 → 整谱快扫…」对话框发起快扫（真实引擎）──
     # 快扫需要引擎已就绪，前面几步的等待已足够；若仍是 starting 则报错回府。
+    click_label 分析
+    wait 400
+    click_label 整谱快扫
+    wait 600
+    dump 对话框已打开
     click_label 开始快扫
     wait 1500
     dump 快扫-刚发起
     wait 4000
     dump 快扫-5秒后
-    wait 5000
-    dump 快扫-10秒后
+    # 取消（对话框内「取消快扫」仍在，进度同屏）→ dump 进度应消失
+    click_label 取消快扫
+    wait 700
+    dump 快扫-取消后-进度应消失
 
-    # ── 自证 5：退出守卫（走真实关窗语义）──
+    # ── 自证 6：退出守卫（走真实关窗语义）──
     quit
     wait 600
     dump 请求退出后
@@ -281,11 +327,21 @@ impl Driver {
             .ctx
             .run_ui(input, |ui| self.app.ui(ui, &mut self.frame));
         // 收集本帧 accesskit 节点文本（下一帧的探针读取源）。
+        // 注意：`ui.label` 生成的 Role::Label 节点把文本放在 **value**
+        // 属性（egui response.rs 只在非 Label 角色用 label 属性），
+        // 因此 label() 为空时回退读 value()——否则侧栏纯文本行全部
+        // 探不到（65941bc 后侧栏正是纯文本为主）。
         self.labels.clear();
         if let Some(update) = out.platform_output.accesskit_update.take() {
             for (node_id, node) in update.nodes {
-                if let Some(label) = node.label() {
-                    self.labels.insert(node_id, label.to_owned());
+                let text = node
+                    .label()
+                    .map_or_else(|| node.value().map(|v| v.to_owned()), |l| Some(l.to_owned()));
+                if let Some(text) = text {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        self.labels.insert(node_id, text.to_owned());
+                    }
                 }
             }
         }
@@ -510,6 +566,10 @@ impl Driver {
         self.tick_with(|input| {
             input.events.push(egui::Event::PointerMoved(pos));
         });
+        // 多等一帧再按下：菜单弹层（Popup）在展开的下一帧才接受指针事件，
+        // 「移动 → 立即按下」时 press 落在弹层尚未注册的帧上，点击会
+        // 穿透到下层（表现为「点了菜单项但没反应、菜单反而关闭」）。
+        self.tick_default();
         self.tick_with(|input| {
             input.events.push(egui::Event::PointerButton {
                 pos,
@@ -530,10 +590,15 @@ impl Driver {
     }
 
     /// 拖拽（限定区域框选）：按下 → 逐段移动 → 抬起。
+    /// 与 [`Self::click`] 同理：先 hover 建立并等一帧让目标层稳定，
+    /// 再按下（否则 press 帧落在弹层/交互态切换的同一帧上会被忽略）。
     fn drag(&mut self, x1: f32, y1: f32, x2: f32, y2: f32) {
         let (a, b) = (egui::Pos2::new(x1, y1), egui::Pos2::new(x2, y2));
         self.tick_with(|input| {
             input.events.push(egui::Event::PointerMoved(a));
+        });
+        self.tick_default();
+        self.tick_with(|input| {
             input.events.push(egui::Event::PointerButton {
                 pos: a,
                 button: egui::PointerButton::Primary,
@@ -541,6 +606,11 @@ impl Driver {
                 modifiers: egui::Modifiers::default(),
             });
         });
+        // 按住原地两帧：egui 的「明显在拖」判定要求 press 之后的帧才成立
+        // （is_decidedly_dragging 在 press 帧恒 false），立刻移动会让
+        // potential_drag 的二义决策窗口被跳过，拖拽永远建立不起来。
+        self.tick_default();
+        self.tick_default();
         let steps = 6;
         for i in 1..=steps {
             let t = i as f32 / steps as f32;
@@ -549,6 +619,10 @@ impl Driver {
                 input.events.push(egui::Event::PointerMoved(pos));
             });
         }
+        // 释放：先发抬起（此时拖拽终点仍在指针位置上，drag_stopped 在
+        // 本帧成立），**下一帧**再让指针离开——同一帧内 release+Gone 会
+        // 让 egui 的拖拽判定把「停止」与「消失」合并，drag_stopped 丢失，
+        // 棋盘框选就成不了框。
         self.tick_with(|input| {
             input.events.push(egui::Event::PointerButton {
                 pos: b,
@@ -556,6 +630,8 @@ impl Driver {
                 pressed: false,
                 modifiers: egui::Modifiers::default(),
             });
+        });
+        self.tick_with(|input| {
             input.events.push(egui::Event::PointerGone);
         });
     }

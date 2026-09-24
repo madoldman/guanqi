@@ -33,7 +33,7 @@ use crate::ui;
 use crate::ui::{
     analysis::{AnalysisState, EngineStatus, Waker},
     analysis_panel::{self, LoadNotice},
-    curve, mini_board, new_game, overlay, settings, tree,
+    batch_scan, curve, mini_board, new_game, overlay, settings, tree,
 };
 
 /// 弃着终局加深评估的目标 visits：手上终态低于此值时自动发起加深
@@ -826,6 +826,17 @@ impl GuanqiApp {
                 self.batch_scan_open = true;
                 ui.close();
             }
+            // 「取消快扫」：仅在快扫进行中可用（原侧栏进度区的取消按钮
+            // 搬家入口）。侧栏进度卡是纯展示，取消动作归菜单；对话框里
+            // 也有同一动作的按钮，两处执行体相同。
+            let scanning = self.analysis.batch_progress().is_some();
+            let entry = ui.add_enabled(scanning, egui::Button::new("取消快扫"));
+            if !scanning {
+                entry.on_disabled_hover_text("当前没有进行中的快扫");
+            } else if entry.clicked() {
+                self.analysis.cancel_batch();
+                ui.close();
+            }
             ui.separator();
             // ---- 限定选点：区域开关 / 清除区域 / 清除排除列表 ----
             // 「清除排除列表」在原侧栏卡片里有独立按钮，搬家后必须仍
@@ -871,6 +882,31 @@ impl GuanqiApp {
                 } else if entry.clicked() {
                     self.analysis.clear_avoid();
                     ui.close();
+                }
+                // 逐条移除（原侧栏排除行尾「移除」按钮的等价入口）：
+                // 每行列出坐标，点击移除该条；侧栏「限定选点」卡展示的
+                // 是同一份清单，两边坐标一一对应。清单先克隆（排除项
+                // 至多几十条，量级极小），避免菜单闭包内同时持有只读
+                // 迭代借用与点击后的可变借用。
+                if avoid_count > 0 {
+                    ui.separator();
+                    ui.menu_button("移除排除项", |ui| {
+                        let size = self.board.size();
+                        let avoid: Vec<_> = self.analysis.limits().avoid.to_vec();
+                        for (i, (player, at)) in avoid.iter().enumerate() {
+                            if ui
+                                .add(egui::Button::new(format!(
+                                    "{} {}",
+                                    player.name(),
+                                    at.to_gtp(size)
+                                )))
+                                .clicked()
+                            {
+                                self.analysis.remove_avoid(i);
+                                ui.close();
+                            }
+                        }
+                    });
                 }
                 let has_any = has_region || avoid_count > 0;
                 let entry = ui.add_enabled(has_any, egui::Button::new("清除全部限制"));
@@ -2019,8 +2055,6 @@ impl eframe::App for GuanqiApp {
                     self.startup_notice.as_deref(),
                     &mut self.settings_open,
                     &mut self.overlay,
-                    &mut self.curve_open,
-                    &mut self.tree_open,
                     self.manual_revealed,
                     self.loaded.as_ref(),
                     comment,
@@ -2028,8 +2062,7 @@ impl eframe::App for GuanqiApp {
                     None,
                     &self.notices,
                     self.persist_notice.as_deref(),
-                    &mut self.play,
-                    &mut self.new_game_open,
+                    &self.play,
                     hopeless_text.as_deref(),
                     &doc_entries,
                 );
@@ -2054,99 +2087,13 @@ impl eframe::App for GuanqiApp {
             // 落子后重置该方读秒（读秒制口径：本手 M 秒内完成）；
             // 若构成双方连续弃着，对局结束——结果未知（本项目不做点目，
             // 不能拿引擎估计冒充结果），SGF 记 `?`（未知）。
-            analysis_panel::PanelAction::HumanPass => {
-                if self.play.mode && !self.play.finished(&self.board) {
-                    let mover = self.play.human;
-                    self.board.pass();
-                    self.play.clock.on_human_move(mover);
-                    if play::two_passes(&self.board) {
-                        self.finish_two_passes();
-                    }
-                }
-            }
-            // 人类认输：记录认输方并给出结果提示；之后自动应手停止。
-            // 结果写回元信息（任务 B：`B+R` / `W+R`，SGF 标准认输方
-            // 记 +R，胜方为对方）。
-            analysis_panel::PanelAction::HumanResign => {
-                if self.play.mode && !self.play.finished(&self.board) {
-                    let loser = self.play.human;
-                    self.play.resigned = Some(loser);
-                    let winner = loser.opposite();
-                    let result = format!("{}+R", result_letter(winner));
-                    let text = format!(
-                        "{}认输：{}（{}）。对局已结束，可继续复盘浏览。",
-                        loser.name(),
-                        play::resign_text(loser),
-                        result
-                    );
-                    self.finish_game(result, text, None);
-                }
-            }
-            // 引擎认输（无望提示区「让引擎认输」按钮）：兑现无望提示
-            // 「你可以判它认输」的承诺。与人类认输走同一条结束语义
-            // （finish_game 写 RE / 自动应手停止 / 复盘浏览），认输方 =
-            // 引擎一方，结果串按胜方换算（引擎执黑则人类胜 = `W+R`）。
-            analysis_panel::PanelAction::EngineResign => {
-                if self.play.mode && !self.play.finished(&self.board) {
-                    self.engine_resign();
-                }
-            }
-            // 确认「引擎无望」提示：只收起提示，不自动替引擎认输
-            // （是否认输交给同卡片上的「让引擎认输」按钮）。
-            analysis_panel::PanelAction::AckHopeless => {}
-            // 切换难度：立即生效（下一手应手即按新难度搜索）并持久化；
-            // 保存失败只提示，当前运行内仍按新难度对弈。
-            analysis_panel::PanelAction::SetDifficulty(d) => {
-                self.set_difficulty(d);
-            }
-            analysis_panel::PanelAction::OpenNewGame => {}
-            // 从当前手创建研究副本（前置条件由入口置灰与 assert 双重守卫）。
+            // 入口：「对局 → 弃着」菜单项（执行体从侧栏按钮搬家而来，
+            // 语义不变）。
             analysis_panel::PanelAction::CreateCopy => self.create_copy(),
             // 点侧栏列表项：切换到该文档（整体互换，零拷贝）。
             analysis_panel::PanelAction::SwitchDoc(number) => self.switch_doc(number),
-            // 丢弃指定副本；有研究成果时先弹确认框（无成果直接丢弃）。
-            analysis_panel::PanelAction::DropCopy(number) => {
-                // 编号即身份：发起确认时锁定该副本的研究手数（确认期间
-                // 用户可能继续改动，但文案取确认框弹出时刻的值即可）。
-                let research = self.doc_research(number).unwrap_or(0);
-                if research > 0 {
-                    self.pending_confirm = PendingConfirm::DropCopy { number };
-                } else {
-                    self.drop_copy(number);
-                }
-            }
-            analysis_panel::PanelAction::None => {}
-            // 限定选点：区域开关 / 排除增删 / 一键清除，全部转交 AnalysisState
-            // （限制变更会递增版本号，sync 检测后自动重发查询）。
-            analysis_panel::PanelAction::SetRegion(on) => {
-                if on.is_some() {
-                    // 开启只切模式；区域矩形等用户在棋盘上拖出。
-                    self.analysis.enable_region_mode();
-                } else {
-                    self.analysis.set_region(None);
-                }
-            }
-            // 策略热度图开关：转交 AnalysisState（want/sent 比对驱动重查）。
-            analysis_panel::PanelAction::SetWantPolicy(want) => {
-                self.analysis.set_want_policy(want);
-            }
-            // 候选点领地开关（opt-in includeMovesOwnership）：同一套
-            // want/sent 比对驱动重查；聚焦候选点不重发（切焦点只换
-            // 已到手的候选向量，见 overlay 模块文档）。
-            analysis_panel::PanelAction::SetWantMovesHeat(want) => {
-                self.analysis.set_want_moves_ownership(want);
-            }
             analysis_panel::PanelAction::ToggleAvoid { player, at } => {
                 self.analysis.toggle_avoid(player, at);
-            }
-            analysis_panel::PanelAction::RemoveAvoid(index) => {
-                self.analysis.remove_avoid(index);
-            }
-            analysis_panel::PanelAction::ClearAvoid => {
-                self.analysis.clear_avoid();
-            }
-            analysis_panel::PanelAction::ClearLimits => {
-                self.analysis.clear_limits();
             }
             // 沿候选主变前进（预览式）：只在谱上**已存在**的着法上导航。
             // 每手在当前节点的子分支里找与 PV 一致的着法（落点 + 行棋方
@@ -2156,50 +2103,13 @@ impl eframe::App for GuanqiApp {
             analysis_panel::PanelAction::AdvancePv { pv, .. } => {
                 self.handle_advance_pv(pv);
             }
-            // 整谱快扫：按侧栏配置批量分析（报告按 turnNumber 回填逐手
-            // 历史，曲线自动填满）。发起失败的提示走消息区。棋谱 RU 随
-            // 发起传入（快扫与交互分析的规则口径一致）。
-            analysis_panel::PanelAction::StartBatch => {
-                let game_rules =
-                    self.loaded.as_ref().and_then(|meta| meta.info.rules.as_deref());
-                if let Some(reason) =
-                    self.analysis.start_batch(&self.board, self.komi, game_rules)
-                {
-                    self.notices.push(analysis_panel::LoadNotice::Warn(reason));
-                }
-            }
-            // 整谱快扫配置编辑（起止 / visits / 单方 / 含变着 / 加深）：
-            // 转存进 AnalysisState，发起与预估共用同一份配置。
-            analysis_panel::PanelAction::SetBatchConfig(cfg) => {
-                self.analysis.set_batch_config(cfg);
-            }
-            // 取消整谱快扫：terminate 在飞块，提示由下一帧 take_batch_notice 落位。
-            analysis_panel::PanelAction::CancelBatch => {
-                self.analysis.cancel_batch();
-            }
             // 局后统计排行榜点击：跳转到该手（1 起手数 → go_to 的 0..=len
             // 口径直接对应：go_to(n) = 第 n 手之后的盘面）。跳转后局面变化
             // 由既有 sync 检测并自动发起新查询，曲线 / 棋盘定位随游标联动。
             analysis_panel::PanelAction::GotoTurn(turn) => {
                 self.board.go_to(turn);
             }
-            // 候选类显示门控切换（第 5 项）：只改显示判定，数据流与走子
-            // 决策不受影响。切回立即 / 延迟时清掉手动确认残留。
-            analysis_panel::PanelAction::SetGating(gating) => {
-                self.analysis.set_gating(gating);
-                if gating != crate::ui::analysis::CandidateGating::Manual {
-                    self.manual_revealed = false;
-                    self.manual_sig = None;
-                }
-            }
-            // 目数视角切换：转入 AnalysisState（作废快照 + want/sent 比对
-            // 重发查询；历史数据存储恒黑视角，两用不清空）。
-            analysis_panel::PanelAction::SetDisplayView(view) => {
-                self.analysis.set_display_view(view);
-            }
-            // 终局提示的「另存为…」：与菜单 / Ctrl+Shift+S 完全同一动作
-            // （同一发起函数，含 portal 不可用 / 等待中守卫）。
-            analysis_panel::PanelAction::SaveGame => self.save_file_dialog(),
+            analysis_panel::PanelAction::None => {}
         }
 
         // 偏好持久化（子项 1）：面板动作 / 复选框可能改了任何界面开关。
@@ -2363,6 +2273,40 @@ impl eframe::App for GuanqiApp {
                     self.persist_notice = Some(text);
                 }
                 self.analysis.start_engine(&self.engine_cfg, &self.waker);
+            }
+        }
+
+        // 整谱快扫对话框（「分析 → 整谱快扫…」入口）：设置 + 预估 +
+        // 发起同屏；进行中显示进度与取消。65941bc 建立了对话框模块与
+        // 菜单入口但漏了这里的绘制接线，入口打开后无窗可看——接线补齐。
+        // 配置改动在对话框内即时写回 AnalysisState（见 batch_scan 模块
+        // 文档），偏好持久化照旧生效。
+        if self.batch_scan_open {
+            let ctx = ui.ctx().clone();
+            let action = batch_scan::show(
+                &ctx,
+                &mut self.batch_scan_open,
+                &mut self.analysis,
+                &self.board,
+            );
+            match action {
+                batch_scan::BatchScanAction::Start => {
+                    // 与原侧栏「开始快扫」同一执行体：发起失败的提示走
+                    // 消息区。棋谱 RU 随发起传入（快扫与交互分析的规则
+                    // 口径一致）。
+                    let game_rules =
+                        self.loaded.as_ref().and_then(|meta| meta.info.rules.as_deref());
+                    if let Some(reason) =
+                        self.analysis.start_batch(&self.board, self.komi, game_rules)
+                    {
+                        self.notices.push(analysis_panel::LoadNotice::Warn(reason));
+                    }
+                }
+                batch_scan::BatchScanAction::Cancel => {
+                    // terminate 在飞块，提示由下一帧 take_batch_notice 落位。
+                    self.analysis.cancel_batch();
+                }
+                batch_scan::BatchScanAction::Close | batch_scan::BatchScanAction::None => {}
             }
         }
 

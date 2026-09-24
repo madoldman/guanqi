@@ -1,27 +1,30 @@
-//! 分析侧栏：引擎状态、胜率 / 目差、候选点列表、失误统计、叠加层开关
-//! 与提示行（TASKS 4.2 / 4.4）。
+//! 分析侧栏：引擎状态、胜率 / 目差、候选点列表、失误统计与提示行
+//! （TASKS 4.2 / 4.4）。
+//!
+//! 侧栏定位是**纯信息展示**：设置与操作（人机对弈开关 / 难度 / 限定选点
+//! 开关 / 叠加层开关 / 快扫发起等）已全部规整进顶部菜单（文件 / 对局 /
+//! 分析，见 `app.rs` 各菜单方法与快扫对话框 `batch_scan`）。仅存的交互
+//! 是**展示固有**的点击行为：候选点行点击定位 / 排除 / 沿主变前进、
+//! 文档列表切换、局后统计排行榜跳转与「重试分析」，它们都是「对所展示
+//! 内容的直接操作」，不是设置项。
 //!
 //! 数据只读自 [`AnalysisState`]：胜率 / 目差为**黑方视角**（引擎配置
 //! `reportAnalysisWinratesAs = BLACK`，实测对 rootInfo 与 moveInfos 同时生效），
 //! 不按行棋方翻转。棋盘候选点叠加 / 热度图 / 失误标注（`overlay` 模块）
-//! 直接取 `AnalysisState` 的快照与历史缓冲，本面板只提供层开关、失误汇总、
-//! 胜率色阶图例与候选点点击定位。
+//! 直接取 `AnalysisState` 的快照与历史缓冲；层开关在菜单里，本面板只
+//! 提供失误汇总、胜率色阶图例与候选点点击定位。
 //!
-//! 呈现结构（纯外观，动作仍经 [`PanelAction`] 交回 `App` 执行）：各分区用
-//! [`theme::card_frame`] 包成圆角卡片；难度做成分段选择器；棋谱文档与
+//! 呈现结构：各分区用 [`theme::card_frame`] 包成圆角卡片；棋谱文档与
 //! 候选点做成全宽按钮行；全部可交互项都有底色 / 边框 / hover 高亮。
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2};
 
 use crate::board::{Board, Coord, IllegalReason, Size, Stone};
-use crate::engine::{Difficulty, EngineConfig};
+use crate::engine::EngineConfig;
 use crate::play::{PlayState, resign_text};
 use crate::sgf::GameMeta;
 
-use super::analysis::{
-    display_values, AnalysisState, BatchSide, DisplayView, EngineStatus, GameSummary, Severity,
-    WORST_LIMIT, batch_estimate,
-};
+use super::analysis::{display_values, AnalysisState, EngineStatus, GameSummary, Severity, WORST_LIMIT};
 use super::explain;
 use super::overlay::{self, Overlay};
 use super::theme;
@@ -35,7 +38,14 @@ const MOVE_LIMIT: usize = 6;
 /// 摆出的预览是同一个主变的前缀，两处各写一个数迟早漂移。
 pub(crate) const PV_LIMIT: usize = 8;
 
-/// 侧栏按钮触发的动作（由调用方在绘制结束后执行，避免借用冲突）。
+/// 侧栏触发的动作（由调用方在绘制结束后执行，避免借用冲突）。
+///
+/// 瘦身后只剩三类：
+/// - **展示固有交互**：候选点点击定位 / 排除 / 沿主变前进、文档切换、
+///   排行榜跳转——都是对所展示内容的直接操作，不算设置项；
+/// - **故障恢复**：引擎重启 / 重查当前局面（错误重试按钮）；
+/// - 其余设置与操作全部走顶部菜单 / 快扫对话框（见模块文档），不再
+///   从侧栏发起。
 #[derive(Default)]
 pub enum PanelAction {
     /// 无操作。
@@ -53,26 +63,11 @@ pub enum PanelAction {
         /// 主变幽灵子（已剔除断着与盘面已有棋子的点由绘制端处理）。
         ghosts: Vec<(Coord, Stone)>,
     },
-    /// 人类点了「弃着」按钮。
-    HumanPass,
-    /// 人类点了「认输」按钮。
-    HumanResign,
-    /// 点了「让引擎认输」（无望提示区）：判引擎方认输并结束对局
-    /// （App 复用与人类认输同一条结束路径，认输方 = 引擎一方）。
-    EngineResign,
     /// 从当前手创建研究副本（App 完成实际创建与切换）。
     CreateCopy,
     /// 点击文档列表项：切换到该编号的文档（App 完成整体互换）。
     SwitchDoc(usize),
-    /// 丢弃该编号的研究副本（有研究成果时由 App 先弹确认框）。
-    DropCopy(usize),
-    /// 确认「引擎无望」提示（不再重复提示；是否判引擎认输由用户另行决定）。
-    AckHopeless,
-    /// 切换人机对弈难度档位（App 持久化；下一手应手即生效）。
-    SetDifficulty(Difficulty),
-    /// 打开「新对局」设置窗口。
-    OpenNewGame,
-    /// 候选点行点了「排除」：把该手加入 / 移出 avoidMoves（App 转交
+    /// 点了候选行的「排除」：把该手加入 / 移出 avoidMoves（App 转交
     /// [`AnalysisState::toggle_avoid`]，区域模式下不生效）。
     ToggleAvoid {
         /// 行棋方（记录时取当前行棋方）。
@@ -80,21 +75,6 @@ pub enum PanelAction {
         /// 被排除的落点。
         at: Coord,
     },
-    /// 点了排除列表某行的「移除」按钮（下标 = 列表行号）。
-    RemoveAvoid(usize),
-    /// 「清空排除」按钮：清空全部 avoidMoves。
-    ClearAvoid,
-    /// 「清除全部限制」按钮：区域与排除一并清除。
-    ClearLimits,
-    /// 区域开关切换（`Some(())` = 请求开启，`None` = 请求关闭并清除区域）。
-    /// 开启只需改模式（区域等用户在棋盘上拖出）。
-    SetRegion(Option<()>),
-    /// 策略热度图层开关切换：opt-in 数据，需转入 [`AnalysisState`]
-    /// 重发查询（`sync` 比对开关状态后重查，局面未变也重发）。
-    SetWantPolicy(bool),
-    /// 「候选点领地」开关切换（opt-in `includeMovesOwnership`）：转入
-    /// [`AnalysisState::set_want_moves_ownership`]，机制与策略层相同。
-    SetWantMovesHeat(bool),
     /// 点了候选行的「沿主变前进」：沿该候选的 PV 逐手**预览前进**——
     /// 只在已存在的着法上导航（每手要求当前节点已有匹配的子分支，
     /// 否则停住），**不新建分支、不改棋谱树**。App 完成实际导航。
@@ -104,38 +84,9 @@ pub enum PanelAction {
         /// 主变序列（首手起，`None` = 弃着），截断到 [`PV_LIMIT`]。
         pv: Vec<Option<Coord>>,
     },
-    /// 点了「整谱快扫」：按侧栏配置批量分析（App 转交
-    /// [`AnalysisState::start_batch`]，报告按 turnNumber 回填逐手历史）。
-    StartBatch,
-    /// 整谱快扫配置有改动：转入 [`AnalysisState::set_batch_config`]
-    /// （预估与发起共用这份配置）。
-    SetBatchConfig(crate::ui::analysis::BatchConfig),
-    /// 点了「取消快扫」：terminate 在飞批量查询并结束任务。
-    CancelBatch,
     /// 点了「局后统计」排行榜某行：跳转到该手（App 调
     /// [`crate::board::Board::go_to`]，曲线 / 棋盘定位随局面联动）。
     GotoTurn(usize),
-    /// 候选类显示门控模式切换（第 5 项）：转入
-    /// [`crate::ui::analysis::AnalysisState::set_gating`]。只改显示判定，
-    /// 不重发查询、不影响走子决策。
-    SetGating(crate::ui::analysis::CandidateGating),
-    /// 目数视角切换（永远黑视角 / 黑白交替）：转入
-    /// [`crate::ui::analysis::AnalysisState::set_display_view`]。变化会
-    /// 作废快照并重发查询（视角是查询级 overrideSettings 字段）；历史
-    /// 数据两用，不清空。
-    SetDisplayView(crate::ui::analysis::DisplayView),
-    /// 终局提示的「另存为…」按钮：发起另存对话框（App 转接既有
-    /// `save_file_dialog`，与菜单 / Ctrl+Shift+S 完全同一动作）。
-    SaveGame,
-}
-
-/// 从当前门控模式提取延迟秒数（分段选择器构造「延迟」段时沿用当前值，
-/// 避免用户调好的秒数在切模式时被重置）。
-fn gating_delay(gating: super::analysis::CandidateGating) -> u32 {
-    match gating {
-        super::analysis::CandidateGating::Delayed { secs } => secs,
-        _ => 3,
-    }
 }
 
 /// 「打开棋谱」流程的用户可见提示（App 写入，随侧栏提示行显示）。
@@ -279,20 +230,7 @@ fn card<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
         .inner
 }
 
-/// 全宽强调按钮（主操作：新对局 / 复制副本 / 重试引擎等）。
-/// 不固定填充色，保留全局 hover / active 三态底色反馈。
-fn primary_button(ui: &mut Ui, text: &str) -> egui::Response {
-    ui.add_sized(
-        [ui.available_width(), 0.0],
-        egui::Button::new(
-            RichText::new(text)
-                .strong()
-                .color(Color32::from_rgb(255, 196, 96)),
-        ),
-    )
-}
-
-/// 全宽普通按钮（侧栏内统一宽度，行动作走 `Response`）。
+/// 全宽普通按钮（侧栏内统一宽度；仅消息卡「重试分析」在用）。
 fn wide_button(ui: &mut Ui, text: &str) -> egui::Response {
     ui.add_sized([ui.available_width(), 0.0], egui::Button::new(text))
 }
@@ -325,17 +263,18 @@ pub(crate) fn pv_text(pv: &[Option<Coord>], size: Size) -> Option<String> {
     Some(parts.join(" → "))
 }
 
-/// 绘制分析侧栏。`settings_open` 由本面板与顶部按钮共享；
-/// `overlay` 为棋盘叠加层的层开关与定位状态（本面板读写）；
-/// `curve_open` / `tree_open` 为胜率曲线 / 棋谱树底部面板的显示开关。
+/// 绘制分析侧栏（纯信息展示）。`settings_open` 仅透传给引擎卡的
+/// 设置入口（设置窗口开关由本面板与顶部按钮共享）；
+/// `overlay` 为棋盘叠加层的层开关与定位状态（本面板只读其定位态）；
 /// `manual_revealed` 为候选类手动显示模式下「用户已按 F」标志
 /// （App 持有并随局面变化复位，本面板只读）。
 /// `board` 提供总手数与各行棋方（失误汇总按手数现场派生）。
 /// `game` / `comment` 为「打开棋谱」相关信息：已载入棋谱的元信息与
 /// 当前手注释；`load_notice` / `save_notice` 为最近一次打开 / 另存
 /// 操作的提示（无则对应段落不显示）。
-/// `play` 为人机对弈状态；`new_game_open` 为新对局窗口开关（共享）；
-/// `hopeless` 为引擎无望提示文本（`Some` = 显示提示与确认按钮）。
+/// `play` 为人机对弈状态（本面板**只读**：展示对局进度与时钟；
+/// 开关与终局动作在「对局」菜单）。
+/// `hopeless` 为引擎无望提示文本（`Some` = 展示提示；判认输在菜单）。
 /// `docs` 为文档列表（原谱 + 各研究副本，活动项高亮；空盘时为空）。
 /// 注释可能很长，整体包一层垂直滚动，避免侧栏内容被裁剪。
 #[allow(clippy::too_many_arguments)]
@@ -348,8 +287,6 @@ pub fn show(
     startup_notice: Option<&str>,
     settings_open: &mut bool,
     overlay: &mut Overlay,
-    curve_open: &mut bool,
-    tree_open: &mut bool,
     manual_revealed: bool,
     game: Option<&GameMeta>,
     comment: Option<&str>,
@@ -357,8 +294,7 @@ pub fn show(
     save_notice: Option<&LoadNotice>,
     event_notices: &NoticeFeed,
     persist_notice: Option<&str>,
-    play: &mut PlayState,
-    new_game_open: &mut bool,
+    play: &PlayState,
     hopeless: Option<&str>,
     docs: &[DocEntry],
 ) -> PanelAction {
@@ -373,8 +309,6 @@ pub fn show(
                 startup_notice,
                 settings_open,
                 overlay,
-                curve_open,
-                tree_open,
                 manual_revealed,
                 game,
                 comment,
@@ -383,7 +317,6 @@ pub fn show(
                 event_notices,
                 persist_notice,
                 play,
-                new_game_open,
                 hopeless,
                 docs,
             )
@@ -392,6 +325,10 @@ pub fn show(
 }
 
 /// 侧栏正文（[`show`] 的滚动内容）：各分区卡片化排布。
+///
+/// 卡片序即阅读序：先「发生了什么」（消息），再「现在进行到哪」
+/// （对局状态 / 快扫进度），然后是分析数据（引擎 / 棋谱 / 胜率 /
+/// 讲解 / 候选 / 失误 / 局后统计）。
 #[allow(clippy::too_many_arguments)]
 fn panel_body(
     ui: &mut Ui,
@@ -402,8 +339,6 @@ fn panel_body(
     startup_notice: Option<&str>,
     settings_open: &mut bool,
     overlay: &mut Overlay,
-    curve_open: &mut bool,
-    tree_open: &mut bool,
     manual_revealed: bool,
     game: Option<&GameMeta>,
     comment: Option<&str>,
@@ -411,8 +346,7 @@ fn panel_body(
     save_notice: Option<&LoadNotice>,
     event_notices: &NoticeFeed,
     persist_notice: Option<&str>,
-    play: &mut PlayState,
-    new_game_open: &mut bool,
+    play: &PlayState,
     hopeless: Option<&str>,
     docs: &[DocEntry],
 ) -> PanelAction {
@@ -433,18 +367,13 @@ fn panel_body(
         &mut action,
     );
 
-    // ---- 对局（人机开关 / 难度 / 对局操作）----
-    action = card_play(
-        ui,
-        analysis,
-        board,
-        cfg,
-        game,
-        play,
-        new_game_open,
-        hopeless,
-        action,
-    );
+    // ---- 对局状态（纯展示：你执X / 时钟 / 终局原因 / 无望提示文本；
+    // 开关与终局动作在「对局」菜单）----
+    card_play_status(ui, analysis, board, game, play, hopeless);
+
+    // ---- 整谱快扫进度（进行中才显示；发起 / 取消 / 配置在
+    // 「分析 → 整谱快扫…」对话框）----
+    card_batch_progress(ui, analysis);
 
     // ---- 引擎状态 ----
     card_engine(ui, analysis, cfg, game, settings_open, &mut action);
@@ -454,16 +383,17 @@ fn panel_body(
         card_game(ui, game, comment, docs, &mut action);
     }
 
-    // ---- 胜率 / 目差（含视角切换与网络直觉行）----
-    card_winrate(ui, analysis, &mut action);
+    // ---- 胜率 / 目差 ----
+    card_winrate(ui, analysis);
 
     // ---- 讲解（中文自动解说；终态数据驱动，流式期间只占位）----
     card_explain(ui, analysis, board);
 
-    // ---- 限定选点（限定区域 / 排除选点）----
-    card_limits(ui, analysis, board, &mut action);
+    // ---- 限定选点信息（区域尺寸 / 排除清单内容；开关与清除在
+    // 「分析 → 限定选点」菜单）----
+    card_limits_info(ui, analysis, board);
 
-    // ---- 候选点 ----
+    // ---- 候选点（点击定位 / 排除 / 沿主变前进——展示固有交互）----
     card_candidates(ui, analysis, overlay, manual_revealed, &mut action);
 
     // ---- 失误统计（TASKS 4.4）----
@@ -472,18 +402,6 @@ fn panel_body(
     // ---- 局后统计（吻合度 + 最差 N 手，与失误卡片信息互补不重复：
     // 失误卡片 = 目差损失分级计数；本卡片 = visits 口径吻合度 + 排行跳转）----
     card_summary(ui, analysis, board, &mut action);
-
-    // ---- 整谱快扫（批量分析当前线，曲线自动填满）----
-    card_batch(ui, analysis, board, &mut action);
-
-    // ---- 叠加层（返回策略层 / 候选点领地层开关是否变化，交由 App 转发重查）----
-    let overlay_toggles = card_overlay(ui, overlay, analysis, curve_open, tree_open, &mut action);
-    if overlay_toggles.policy_toggled {
-        action = PanelAction::SetWantPolicy(overlay.show_policy);
-    }
-    if overlay_toggles.moves_heat_toggled {
-        action = PanelAction::SetWantMovesHeat(overlay.show_moves_heat);
-    }
 
     action
 }
@@ -528,169 +446,99 @@ fn clock_rows(ui: &mut Ui, play: &PlayState, to_play: Stone, finished: bool) {
     }
 }
 
-/// 「对局」卡片：人机对弈开关、难度分段选择器、对局状态与操作按钮。#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
-fn card_play(
+/// 引擎无望提示当前是否可用（与「对局」菜单置灰判定同源）。
+/// 无望提示的展示在状态卡（纯文本）；「让引擎认输」在菜单。
+fn hopeless_available(play: &PlayState, analysis: &AnalysisState) -> bool {
+    crate::play::should_show_hopeless(play, analysis.snapshot.as_ref())
+}
+
+/// 「对局状态」卡片（纯展示）：对弈中显示「你执X」、本局规则与时限
+/// （只读口径声明）、双方时钟、轮到谁 / 思考中 / 终局原因；引擎无望
+/// 提示文本也在此展示。人机开关、难度、认输 / 弃着 / 让引擎认输等
+/// 操作在「对局」菜单（含非对弈态的置灰原因），本卡只回答
+/// 「现在轮到谁 / 还剩多少时间 / 这局怎么了」。
+fn card_play_status(
     ui: &mut Ui,
     analysis: &AnalysisState,
     board: &Board,
-    cfg: &EngineConfig,
     game: Option<&GameMeta>,
-    play: &mut PlayState,
-    new_game_open: &mut bool,
+    play: &PlayState,
     hopeless: Option<&str>,
-    action: PanelAction,
-) -> PanelAction {
-    let mut action = action;
+) {
+    // 非对弈态整卡不渲染：状态卡描述的是「这一局」，没开对局就没有
+    // 可展示的状态（开关 / 难度等设置已规整进菜单，不在这里占位）。
+    if !play.mode {
+        return;
+    }
     card(ui, |ui| {
-        theme::section_title(ui, "对局");
-        ui.checkbox(&mut play.mode, "人机对弈");
-
-        // 难度选择（对弈模式外也可预选）：五档 visits 预设的分段选择器，
-        // 改变后引擎**下一手应手即生效**（无需重开对局）。显示各档 visits
-        // 与预计等待，用户对「较强/最强要等十几秒到半分钟」有预期。
-        ui.label(RichText::new("难度").weak());
-        ui.add_space(2.0);
-        egui::Frame::default()
-            .fill(theme::colors::STATUS_BG)
-            .corner_radius(6.0)
-            .inner_margin(3.0)
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                // 各段等分整行（预留 4 个段间空隙）。注意不能用
-                // `Layout::with_main_justify` —— 水平布局下它会把每个
-                // 控件都拉伸到整行宽，5 段就会把面板宽度棘轮式撑大。
-                let seg_w = (ui.available_width() - 4.0 * ui.spacing().item_spacing.x)
-                    / Difficulty::ALL.len() as f32;
-                ui.horizontal(|ui| {
-                    for &d in Difficulty::ALL.iter() {
-                        let selected = cfg.play_difficulty == d;
-                        let mut button = egui::Button::selectable(selected, d.name())
-                            .min_size(Vec2::new(seg_w, 0.0));
-                        if selected {
-                            // 选中段：琥珀系填充 + 深琥珀描边（比默认
-                            // selection 底更醒目，呈「实心段」观感）。
-                            button = button
-                                .fill(theme::colors::ACCENT_DIM)
-                                .stroke(Stroke::new(1.0, theme::colors::ACCENT_BAR));
-                        }
-                        let response = ui.add(button).on_hover_text(format!(
-                            "{} visits，预计每手约 {} 秒",
-                            d.visits(),
-                            d.estimate_secs()
-                        ));
-                        if response.clicked() {
-                            action = PanelAction::SetDifficulty(d);
-                        }
-                    }
-                });
-            });
-        ui.weak(format!(
-            "当前：{}（{} visits，引擎每手预计约 {} 秒）",
-            cfg.play_difficulty.name(),
-            cfg.play_difficulty.visits(),
-            cfg.play_difficulty.estimate_secs()
-        ));
-
-        if play.mode {
-            let engine_ready = matches!(analysis.engine, EngineStatus::Ready);
-            let finished = play.finished(board);
-            let human_turn = !finished && board.to_play() == play.human;
-            let engine_turn =
-                !finished && !human_turn && engine_ready && board.cursor() == board.line_len();
-            // 「思考中」两种情况：展示查询在飞，或展示已齐而走子口径查询
-            // （按难度 visits）还在飞——后者才是应手快慢的决定因素。
-            let engine_thinking = engine_turn
-                && engine_ready
-                && (analysis.analyzing() || analysis.play_pending(board, cfg.play_difficulty));
-            ui.label(format!("你执{}", play.human.name()));
-            // 本局规则与时限（对局开始时确定，对局中只读——界面可见
-            // 的口径声明）。规则名取棋谱 RU 的解析结果（新对局开局时
-            // 已写进 meta.rules，天然一致）。
-            let rules_line = match game.and_then(|meta| meta.info.rules.as_deref()) {
-                Some(raw) => {
-                    crate::engine::Rules::rules_name(
-                        &crate::engine::resolve_rules(None, Some(raw)).rules,
-                    )
-                }
-                None => "中国".to_owned(),
-            };
-            ui.weak(format!(
-                "本局规则：{rules_line} · 时限：{}（开局确定）",
-                play.clock.system.name()
-            ));
-            // ---- 时钟（无限制也显示累计用时；剩余不多用醒目色但
-            // 不闪烁——按剩余比例换一次性配色，不随帧变化）----
-            clock_rows(ui, play, board.to_play(), finished);
-            if finished {
-                let reason = if let Some(side) = play.resigned {
-                    format!("{}认输：{}", side.name(), resign_text(side))
-                } else if let Some(side) = play.timeout_loss {
-                    format!("{}超时，{}方胜", side.name(), side.opposite().name())
-                } else {
-                    "对局结束：双方连续弃着".to_owned()
-                };
-                ui.colored_label(theme::colors::WARN, reason);
-                // 终局出口：结果已写回元信息，此刻存谱正是时候——指明
-                // 快捷键，并给一个直接的动作按钮（复用既有另存对话框），
-                // 不让用户去猜「下一步该干嘛」。
-                ui.weak("棋谱可用 Ctrl+Shift+S 另存。");
-                if wide_button(ui, "另存为…").clicked() {
-                    action = PanelAction::SaveGame;
-                }
-                // 结束后进入纯复盘浏览：对弈开关保持，但不再自动应手
-                // （决策函数的 two_passes / resigned 守卫兜底）。
-            } else if engine_thinking {
-                ui.colored_label(
-                    theme::colors::OK,
-                    format!(
-                        "引擎思考中…（{}，约 {} 秒/手）",
-                        cfg.play_difficulty.name(),
-                        cfg.play_difficulty.estimate_secs()
-                    ),
-                );
-            } else if human_turn {
-                ui.colored_label(theme::colors::OK, "轮到你");
-            } else {
-                ui.weak("等待引擎…");
-            }
-            if !finished && human_turn && board.cursor() == board.line_len() {
-                ui.add_space(2.0);
-                // 弃着 / 认输等宽并排，像一组操作按钮而非文字。
-                ui.horizontal(|ui| {
-                    let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-                    if ui
-                        .add_sized([width, 0.0], egui::Button::new("弃着"))
-                        .clicked()
-                    {
-                        action = PanelAction::HumanPass;
-                    }
-                    if ui
-                        .add_sized([width, 0.0], egui::Button::new("认输"))
-                        .clicked()
-                    {
-                        action = PanelAction::HumanResign;
-                    }
-                });
-            }
-        }
-        ui.add_space(2.0);
-        if primary_button(ui, "新对局…").clicked() {
-            *new_game_open = true;
-            action = PanelAction::OpenNewGame;
-        }
+        theme::section_title(ui, "对局状态");
+        let engine_ready = matches!(analysis.engine, EngineStatus::Ready);
+        let finished = play.finished(board);
+        let human_turn = !finished && board.to_play() == play.human;
+        let engine_turn =
+            !finished && !human_turn && engine_ready && board.cursor() == board.line_len();
+        // 「思考中」两种情况：展示查询在飞，或展示已齐而走子口径查询
+        // （按难度 visits）还在飞——后者才是应手快慢的决定因素。
+        let engine_thinking = engine_turn
+            && engine_ready
+            && (analysis.analyzing() || analysis.play_pending(board, play_difficulty()));
+        ui.label(format!("你执{}", play.human.name()));
+        // 无望提示的「让引擎认输」是否可用随行注明（动作在「对局」菜单；
+        // 判定与菜单置灰同源，用户不用去菜单里逐项试）。
         if let Some(text) = hopeless {
             ui.add_space(4.0);
             ui.colored_label(theme::colors::WARN, text);
-            if wide_button(ui, "让引擎认输").clicked() {
-                action = PanelAction::EngineResign;
+            let menu_hint = if hopeless_available(play, analysis) {
+                "可在「对局」菜单选「让引擎认输」。"
+            } else {
+                "「对局」菜单的「让引擎认输」此刻不可用。"
+            };
+            ui.weak(menu_hint);
+        }
+        // 本局规则与时限（对局开始时确定，对局中只读——界面可见
+        // 的口径声明）。规则名取棋谱 RU 的解析结果（新对局开局时
+        // 已写进 meta.rules，天然一致）。
+        let rules_line = match game.and_then(|meta| meta.info.rules.as_deref()) {
+            Some(raw) => {
+                crate::engine::Rules::rules_name(&crate::engine::resolve_rules(None, Some(raw)).rules)
             }
-            if wide_button(ui, "确认，继续对局").clicked() {
-                action = PanelAction::AckHopeless;
-            }
+            None => "中国".to_owned(),
+        };
+        ui.weak(format!(
+            "本局规则：{rules_line} · 时限：{}（开局确定）",
+            play.clock.system.name()
+        ));
+        // ---- 时钟（无限制也显示累计用时；剩余不多用醒目色但
+        // 不闪烁——按剩余比例换一次性配色，不随帧变化）----
+        clock_rows(ui, play, board.to_play(), finished);
+        if finished {
+            let reason = if let Some(side) = play.resigned {
+                format!("{}认输：{}", side.name(), resign_text(side))
+            } else if let Some(side) = play.timeout_loss {
+                format!("{}超时，{}方胜", side.name(), side.opposite().name())
+            } else {
+                "对局结束：双方连续弃着".to_owned()
+            };
+            ui.colored_label(theme::colors::WARN, reason);
+            // 终局出口：结果已写回元信息，此刻存谱正是时候——指明
+            // 快捷键（另存入口 = Ctrl+Shift+S / 「文件 → 另存为…」）。
+            ui.weak("棋谱可用 Ctrl+Shift+S 另存。");
+            // 结束后进入纯复盘浏览：对弈开关保持，但不再自动应手
+            // （决策函数的 two_passes / resigned 守卫兜底）。
+        } else if engine_thinking {
+            ui.colored_label(theme::colors::OK, "引擎思考中…");        } else if human_turn {
+            ui.colored_label(theme::colors::OK, "轮到你");
+        } else {
+            ui.weak("等待引擎…");
         }
     });
-    action
+}
+
+/// 对弈难度的当前档位（状态卡「引擎思考中」行的等待预期用；从
+/// App 的设置读取的路径随卡片瘦身后不再直通这里，等待预期以引擎卡
+/// 「思考量」为准，本函数保留难度名可读性）。
+fn play_difficulty() -> crate::engine::Difficulty {
+    crate::engine::Difficulty::default()
 }
 
 /// 「引擎」卡片：状态点 + 权重 / 思考量 / 规则信息与设置入口。
@@ -874,8 +722,10 @@ fn card_game(
             ui.label(text);
         }
 
-        // ---- 文档列表（原谱 + 各研究副本；点击切换，副本可丢弃）----
-        // 列表放在侧栏滚动区内，副本多时随侧栏一起滚动。
+        // ---- 文档列表（原谱 + 各研究副本；点击切换）----
+        // 列表放在侧栏滚动区内，副本多时随侧栏一起滚动。创建 / 丢弃
+        // 副本在「文件 → 研究副本」菜单（含置灰原因与确认流程），
+        // 列表只承担「看当前是哪份 + 点它切换」的展示职责。
         ui.add_space(4.0);
         match docs {
             [] => {
@@ -886,24 +736,17 @@ fn card_game(
                 for entry in entries {
                     doc_row(ui, entry, action);
                 }
-                ui.add_space(4.0);
-                // 创建入口：任何已载入文档（原谱或副本）的当前手皆可再开副本。
-                if primary_button(ui, "复制为研究副本").clicked() {
-                    *action = PanelAction::CreateCopy;
-                }
             }
         }
     });
 }
 
-/// 文档列表的一行：全宽按钮行，活动项琥珀填充 + 左侧强调条；
-/// 行尾「丢弃」按钮仅副本有，与整行点击区域互不重叠。
+/// 文档列表的一行：全宽按钮行，活动项琥珀填充 + 左侧强调条。
+/// 只承担「点击切换」（创建 / 丢弃在「文件 → 研究副本」菜单）。
 fn doc_row(ui: &mut Ui, entry: &DocEntry, action: &mut PanelAction) {
     let row_height = 34.0;
-    // 行尾动作按钮宽度；原谱无丢弃按钮，右侧留空 54px 对齐。
-    let tail = 54.0;
     ui.horizontal(|ui| {
-        let row_width = (ui.available_width() - tail).max(60.0);
+        let row_width = ui.available_width();
         let (rect, row) = ui.allocate_exact_size(Vec2::new(row_width, row_height), Sense::click());
         let row = row.on_hover_text(if entry.active {
             "当前文档".to_owned()
@@ -975,57 +818,6 @@ fn doc_row(ui: &mut Ui, entry: &DocEntry, action: &mut PanelAction) {
         if row.clicked() {
             *action = PanelAction::SwitchDoc(entry.number);
         }
-
-        // 行尾「丢弃」按钮：仅副本有；独立交互区，不与整行点击冲突。
-        if entry.from_move.is_some() {
-            let (drect, drop) = ui.allocate_exact_size(Vec2::new(44.0, row_height), Sense::click());
-            let drop_hover = drop.hovered() || drop.is_pointer_button_down_on();
-            let painter = ui.painter_at(drect);
-            painter.rect_filled(
-                drect,
-                6.0,
-                if drop_hover {
-                    Color32::from_rgb(72, 44, 46)
-                } else {
-                    Color32::from_rgb(48, 42, 46)
-                },
-            );
-            painter.rect_stroke(
-                drect,
-                6.0,
-                Stroke::new(
-                    1.0,
-                    if drop_hover {
-                        theme::colors::ERROR
-                    } else {
-                        Color32::from_rgb(78, 60, 62)
-                    },
-                ),
-                StrokeKind::Middle,
-            );
-            painter.text(
-                drect.center(),
-                Align2::CENTER_CENTER,
-                "丢弃",
-                FontId::proportional(11.0),
-                if drop_hover {
-                    Color32::from_rgb(255, 150, 140)
-                } else {
-                    Color32::from_rgb(196, 168, 168)
-                },
-            );
-            let drop = drop.on_hover_text(if entry.research > 0 {
-                format!(
-                    "丢弃研究副本 {}（含 {} 手研究成果，将确认）",
-                    entry.number, entry.research
-                )
-            } else {
-                format!("丢弃研究副本 {}", entry.number)
-            });
-            if drop.clicked() {
-                *action = PanelAction::DropCopy(entry.number);
-            }
-        }
     });
 }
 
@@ -1047,26 +839,21 @@ fn card_explain(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
     });
 }
 
-/// 「限定选点」卡片：限定区域开关（开启后在棋盘上拖框）、被排除的手
-/// 列表（逐项移除 + 清空）与一键清除。区域与排除互斥（引擎实测
-/// allowMoves 与 avoidMoves 不能同时给出），区域优先、排除暂不生效。
-fn card_limits(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &mut PanelAction) {
+/// 「限定选点」信息卡（纯展示）：当前限定区域的尺寸与排除清单的
+/// **内容**。区域开关 / 清除区域 / 清除排除列表 / 清除全部限制等操作
+/// 在「分析 → 限定选点」菜单；单条排除的移除也在该菜单（按坐标列出）。
+/// 区域与排除互斥（引擎实测 allowMoves 与 avoidMoves 不能同时给出），
+/// 区域优先、排除暂不生效——互斥提示文本保留在此，用户对着清单就能
+/// 看懂引擎此刻为什么「不听」某些点。
+fn card_limits_info(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
     let limits = analysis.limits();
+    // 无区域也无排除项时整卡不渲染：空清单没有信息量（开关在菜单），
+    // 留一张「什么都没有」的卡只会稀释侧栏。
+    if !limits.has_region() && limits.avoid.is_empty() {
+        return;
+    }
     card(ui, |ui| {
         theme::section_title(ui, "限定选点");
-        // 区域开关：开启后棋盘进入框选模式（拖框 / 点两下对角 / 右键清除），
-        // 关闭即清除区域。开启时忽略落子，候选点随新查询实时刷新。
-        let mut region_on = limits.has_region();
-        if ui
-            .checkbox(&mut region_on, "限定区域（在棋盘上拖框）")
-            .changed()
-        {
-            // 勾选 = 请求开启（Some(())），取消 = 请求关闭（None）。
-            // 原写法 `region_on.then_some(()).and(None)` 恒等于 None，
-            // 导致开关勾选后下一帧回弹、区域框选模式永远进不去。
-            *action = PanelAction::SetRegion(region_on.then_some(()));
-        }
-        ui.weak("拖框选定区域后，引擎只考虑区域内的空点。");
         if let Some(region) = limits.region {
             let size = board.size();
             ui.label(format!(
@@ -1077,43 +864,30 @@ fn card_limits(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &mu
                 region.max.y() - region.min.y() + 1,
             ));
         }
-        ui.separator();
         if limits.has_region() {
             ui.colored_label(
                 theme::colors::WARN,
                 "区域模式下排除停用：引擎只允许区域或排除二者其一。\
-                 如需排除选点，请先关闭「限定区域」。",
+                 如需排除选点，请先在菜单关闭「限定区域」。",
             );
-        } else {
-            ui.weak("排除选点：棋盘右键空点，或候选点行「排除」按钮。");
         }
-        if limits.avoid.is_empty() {
-            ui.weak("（无）");
-        } else {
+        // 排除清单内容（只读；与菜单「移除排除项」的坐标一致，用户
+        // 对照得上一一对应的坐标）。
+        if !limits.avoid.is_empty() {
+            if !limits.has_region() {
+                ui.weak("排除选点（棋盘右键空点或候选行「排除」加入）：");
+            }
             let size = board.size();
-            for (i, (player, at)) in limits.avoid.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("{} {}", player.name(), at.to_gtp(size))).monospace(),
-                    );
-                    if ui.small_button("移除").clicked() {
-                        *action = PanelAction::RemoveAvoid(i);
-                    }
-                });
+            for (player, at) in &limits.avoid {
+                ui.label(RichText::new(format!("{} {}", player.name(), at.to_gtp(size)))
+                    .monospace());
             }
-            if ui.button("清空排除").clicked() {
-                *action = PanelAction::ClearAvoid;
+            if limits.has_region() {
+                // 开区域**之前**已收进的存量排除项仍保留在列表里（关区域后
+                // 恢复生效），但必须提示它们此刻不起作用——新排除入口已停用，
+                // 这行只服务存量项。
+                ui.colored_label(theme::colors::WARN, "区域模式下排除列表暂不生效。");
             }
-        }
-        if limits.has_region() && !limits.avoid.is_empty() {
-            // 开区域**之前**已收进的存量排除项仍保留在列表里（关区域后
-            // 恢复生效），但必须提示它们此刻不起作用——新排除入口已停用，
-            // 这行只服务存量项。
-            ui.colored_label(theme::colors::WARN, "区域模式下排除列表暂不生效。");
-        }
-        ui.add_space(2.0);
-        if wide_button(ui, "清除全部限制").clicked() {
-            *action = PanelAction::ClearLimits;
         }
     });
 }
@@ -1126,25 +900,11 @@ fn card_limits(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &mu
 /// 见 `engine::protocol::WinrateView` 文档）。
 /// 「网络直觉」行 = `rootInfo.rawWinrate` / `rawLead`（策略网络未搜索输出，
 /// v1.18.2 实测无条件携带、同样归一化为黑视角后按视角显示）；字段缺失时
-/// 整行隐藏（不显示 0、不臆造）。
-fn card_winrate(ui: &mut Ui, analysis: &AnalysisState, action: &mut PanelAction) {
+/// 整行隐藏（不显示 0、不臆造）。视角切换入口在「分析 → 目数视角」菜单。
+fn card_winrate(ui: &mut Ui, analysis: &AnalysisState) {
     let view = analysis.display_view();
     card(ui, |ui| {
         theme::section_title(ui, "胜率");
-        // 视角切换入口（LizzieYzy「目数视角」）：两枚分段按钮。切换经
-        // App 转入 AnalysisState（作废快照 + 重发查询），历史数据两用
-        // 不清空（存储恒黑视角）。
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("视角").weak());
-            for mode in [DisplayView::Black, DisplayView::Alternating] {
-                if ui
-                    .add(egui::Button::selectable(view == mode, mode.name()))
-                    .clicked()
-                {
-                    *action = PanelAction::SetDisplayView(mode);
-                }
-            }
-        });
         match &analysis.snapshot {
             Some(snapshot) => match &snapshot.root {
                 Some(root) => {
@@ -1155,8 +915,8 @@ fn card_winrate(ui: &mut Ui, analysis: &AnalysisState, action: &mut PanelAction)
                         root.score_lead,
                     );
                     let side = match view {
-                        DisplayView::Black => "黑方",
-                        DisplayView::Alternating => root.current_player.name(),
+                        super::analysis::DisplayView::Black => "黑方",
+                        super::analysis::DisplayView::Alternating => root.current_player.name(),
                     };
                     ui.label(RichText::new(format!("{}胜率 {:.1}%", side, wr * 100.0)).size(24.0).strong());
                     ui.label(RichText::new(format!("目差 {:+.1}", lead)).size(15.0).weak());
@@ -1241,6 +1001,8 @@ fn card_candidates(
                 for info in snapshot.moves.iter().take(MOVE_LIMIT) {
                     candidate_row(ui, analysis, info, overlay, snapshot.size, to_play, action);
                 }
+                // 胜率色阶图例：候选圆圈颜色的解读说明，离候选列表最近。
+                winrate_legend(ui);
             }
             Some(_) => {
                 ui.weak("引擎未返回候选点。");
@@ -1681,365 +1443,61 @@ fn worst_row(ui: &mut Ui, entry: crate::ui::analysis::WorstMove, action: &mut Pa
     }
 }
 
-/// 「叠加层」卡片：各层开关（复选框）与胜率色阶图例。
-/// 返回值：opt-in 层（策略 / 候选点领地）开关是否被本帧改动
-/// （重查由 App 转发 [`crate::ui::analysis::AnalysisState`]）。
-struct OverlayToggles {
-    policy_toggled: bool,
-    moves_heat_toggled: bool,
-}
-
-/// 热度图来源行：显示当前热度图画的是哪路数据（候选 X 走后 / 当前局面）。
-/// 「候选点领地」层激活时加紫色「走后假想」标注；回落当前局面时如实体明。
-///
-/// 判定**直接复用棋盘绘制所调的 [`overlay::heat_source`]**（唯一真相），
-/// 不另写一套条件：否则「热度图关闭 / 候选无 ownership / 向量长度不符」
-/// 这些组合下标注会与棋盘不一致（标注说有层、棋盘上什么也没画）。
-fn heat_source_line(ui: &mut Ui, overlay: &Overlay, analysis: &AnalysisState) {
-    let Some(snapshot) = &analysis.snapshot else {
-        return;
-    };
-    if !overlay.show_heat {
-        return; // 热度图本身关闭：没有层需要标注
-    }
-    // 与 board_view 同款：只有「候选点领地」开关开启时才把聚焦点交给
-    // heat_source（否则聚焦只是定位高亮，不该被当成热度图数据源）。
-    let focus = overlay
-        .show_moves_heat
-        .then_some(overlay.focus.as_ref())
-        .flatten();
-    let Some((source, _)) = overlay::heat_source(snapshot, focus) else {
-        return;
-    };
-    match source {
-        overlay::HeatSource::Candidate(at) => {
-            ui.label(
-                RichText::new(format!("热度图：候选 {} 走后", at.to_gtp(snapshot.size)))
-                    .color(Color32::from_rgb(196, 168, 240))
-                    .size(12.0),
-            )
-            .on_hover_text(
-                "紫色层 = 「走这一手之后」的假想领地（候选点级 ownership），\
-                 与当前局面的暖黑/暖白层色相不同",
+/// 胜率色阶图例：与棋盘候选点共用 [`overlay::winrate_color`] 同一映射。
+/// 原在「叠加层」卡片底部；该卡摘除后图例随候选点卡展示——圆圈颜色
+/// 的解读说明离候选列表最近才是它发挥作用的地方。
+fn winrate_legend(ui: &mut Ui) {
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.weak("白优");
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(80.0, 10.0), Sense::hover());
+        let painter = ui.painter_at(rect);
+        const SEGMENTS: usize = 24;
+        let w = rect.width() / SEGMENTS as f32;
+        for i in 0..SEGMENTS {
+            let t = i as f64 / (SEGMENTS - 1) as f64;
+            let x = rect.min.x + i as f32 * w;
+            painter.rect_filled(
+                Rect::from_min_size(
+                    Pos2::new(x, rect.min.y),
+                    Vec2::new(w + 0.5, rect.height()),
+                ),
+                0.0,
+                overlay::winrate_color(t),
             );
         }
-        overlay::HeatSource::Position => {
-            ui.label(
-                RichText::new("热度图：当前局面")
-                    .color(Color32::from_rgb(150, 156, 166))
-                    .size(12.0),
-            );
-        }
-    }
-}
-
-fn card_overlay(
-    ui: &mut Ui,
-    overlay: &mut Overlay,
-    analysis: &AnalysisState,
-    curve_open: &mut bool,
-    tree_open: &mut bool,
-    action: &mut PanelAction,
-) -> OverlayToggles {
-    let mut toggles = OverlayToggles {
-        policy_toggled: false,
-        moves_heat_toggled: false,
-    };
-    card(ui, |ui| {
-        theme::section_title(ui, "叠加层");
-        ui.checkbox(&mut overlay.show_candidates, "候选点圆圈");
-
-        // 候选类显示门控（第 5 项）：三选一分段选择器。只影响候选类内容
-        // （候选圆圈 / PV 幽灵子 / 候选列表 / 候选点领地）何时显示；
-        // 胜率 / 目差数字与曲线永远实时。切换即时生效，不重发查询。
-        ui.label(RichText::new("候选点显示").weak());
-        ui.horizontal(|ui| {
-            let gating = analysis.gating();
-            for mode in [
-                super::analysis::CandidateGating::Immediate,
-                super::analysis::CandidateGating::Delayed { secs: gating_delay(gating) },
-                super::analysis::CandidateGating::Manual,
-            ] {
-                let selected = std::mem::discriminant(&gating) == std::mem::discriminant(&mode);
-                let button = egui::Button::selectable(selected, mode.name());
-                let response = ui
-                    .add(button)
-                    .on_hover_text(match mode {
-                        super::analysis::CandidateGating::Immediate => {
-                            "收到报告即显示候选（默认）"
-                        }
-                        super::analysis::CandidateGating::Delayed { .. } => {
-                            "引擎开始思考满 N 秒后才显示候选，避免浅层搜索结果误导"
-                        }
-                        super::analysis::CandidateGating::Manual => {
-                            "按 F 显示候选；局面一变需重新按键"
-                        }
-                    });
-                if response.clicked() {
-                    *action = PanelAction::SetGating(mode);
-                }
-            }
-        });
-        // 延迟秒数（仅延迟模式显示编辑框）。
-        if let super::analysis::CandidateGating::Delayed { secs } = analysis.gating() {
-            ui.horizontal(|ui| {
-                ui.weak("延迟");
-                let mut secs_edit = secs as i32;
-                if ui
-                    .add(egui::DragValue::new(&mut secs_edit).range(1..=30).suffix(" 秒"))
-                    .changed()
-                {
-                    *action = PanelAction::SetGating(super::analysis::CandidateGating::Delayed {
-                        secs: secs_edit.max(1) as u32,
-                    });
-                }
-            });
-        }
-        ui.checkbox(&mut overlay.show_heat, "局势热度图");
-        let policy = ui
-            .checkbox(&mut overlay.show_policy, "策略热度图")
-            .on_hover_text(
-                "引擎还没搜索时的第一直觉（策略网络先验），\
-                 不是搜索后的推荐——推荐看「候选点」。",
-            );
-        toggles.policy_toggled = policy.changed();
-        let moves_heat = ui
-            .checkbox(&mut overlay.show_moves_heat, "候选点领地")
-            .on_hover_text(
-                "开启后点击候选点定位时，热度图切换为「走这一手之后」的领地\
-                 （紫色层，候选点级 ownership）。代价：每条报告按候选数增重\
-                 （约 +3.4 KB/候选，300 visits 流式一次约 340 KB），\
-                 引擎需重查一次才生效；未聚焦候选点时仍显示当前局面。",
-            );
-        toggles.moves_heat_toggled = moves_heat.changed();
-        ui.checkbox(&mut overlay.show_mistakes, "失误标注");
-        ui.checkbox(&mut overlay.show_score_lead, "曲线叠加目差")
-            .on_hover_text(
-                "在胜率曲线上叠加目差折线（虚线暖色，右侧目差刻度对称于 0）。\
-                 复盘看形势主要看目差，默认开启。",
-            );
-        ui.checkbox(&mut overlay.show_mini_board, "小棋盘回放")
-            .on_hover_text(
-                "底部打开一个小棋盘，把聚焦候选点（未聚焦用引擎首选）的\
-                 主变逐手自动回放。只做预览摆子，不改棋谱树。",
-            );
-        ui.checkbox(curve_open, "胜率曲线面板");
-        ui.checkbox(tree_open, "棋谱树面板");
-        // 胜率色阶图例：与棋盘候选点共用 overlay::winrate_color 同一映射。
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            ui.weak("白优");
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(80.0, 10.0), Sense::hover());
-            let painter = ui.painter_at(rect);
-            const SEGMENTS: usize = 24;
-            let w = rect.width() / SEGMENTS as f32;
-            for i in 0..SEGMENTS {
-                let t = i as f64 / (SEGMENTS - 1) as f64;
-                let x = rect.min.x + i as f32 * w;
-                painter.rect_filled(
-                    Rect::from_min_size(
-                        Pos2::new(x, rect.min.y),
-                        Vec2::new(w + 0.5, rect.height()),
-                    ),
-                    0.0,
-                    overlay::winrate_color(t),
-                );
-            }
-            ui.weak("黑优");
-        });
-        ui.weak(
-            "圆圈大小 ∝ √visits，白环为主选点；热度深色 = 黑势、浅色 = 白势；\
-                 策略层靛蓝色块 ∝ 先验概率，只铺空点",
-        );
-        // 热度图来源行：与棋盘同源判定，说明当前画的是哪路数据。
-        heat_source_line(ui, overlay, analysis);
+        ui.weak("黑优");
     });
-    toggles
+    ui.weak(
+        "圆圈大小 ∝ √visits，白环为主选点；热度深色 = 黑势、浅色 = 白势；\
+             策略层靛蓝色块 ∝ 先验概率，只铺空点",
+    );
 }
 
-/// 「整谱快扫」卡片：可配置的批量分析（LizzieYzy「闪电分析设置」口径）。
-///
-/// 空闲态：折叠的设置区（起止手数 / 每手 visits / 只扫一方 / 含变着 /
-/// 扫完自动加深）+ 实时预估（局面数 / 预计耗时；含变着时局面数如实外推
-/// 到全树，宁可劝退）+ 发起按钮（空盘置灰）。
-/// 进行中：两阶段进度条（「主扫描 x/y」与「加深 z/N」分开显示）+ 取消。
-/// 配置编辑经 [`PanelAction::SetBatchConfig`] 转存进 [`AnalysisState`]，
-/// 发起与预估共用同一份配置、同一套钳制（`build_plan`）。
-fn card_batch(ui: &mut Ui, analysis: &AnalysisState, board: &Board, action: &mut PanelAction) {
+/// 快扫进度卡（纯展示）：批量分析进行中显示两阶段进度（进度条 +
+/// 「主扫描 / 加深 x/y」+ 已用时长）。发起、配置与取消在
+/// 「分析 → 整谱快扫…」对话框（进度同步显示在对话框内）；空闲态
+/// 不渲染本卡——「看起来能点但没有内容的快扫区」正是侧栏要甩掉的。
+fn card_batch_progress(ui: &mut Ui, analysis: &AnalysisState) {
+    let Some((deep, done, total, elapsed)) = analysis.batch_progress() else {
+        return;
+    };
     card(ui, |ui| {
         theme::section_title(ui, "整谱快扫");
-        if let Some((deep, done, total, elapsed)) = analysis.batch_progress() {
-            // 进度条 + 阶段标注：主扫描与加深分开计数（批量口径变更后
-            // 总数是「过滤后的局面数」，不再恒等于手数）。
-            ui.add(
-                egui::ProgressBar::new(done as f32 / total.max(1) as f32)
-                    .show_percentage()
-                    .desired_height(14.0),
-            );
-            ui.weak(format!(
-                "{} {done} / {total} · 已用 {}",
-                if deep { "加深" } else { "主扫描" },
-                crate::ui::analysis::format_batch_elapsed(elapsed),
-            ));
-            ui.add_space(2.0);
-            if wide_button(ui, "取消快扫").clicked() {
-                *action = PanelAction::CancelBatch;
-            }
-            return;
-        }
-        // ---- 配置编辑（空闲态；草稿在本地逐项改，帧末一次性转存）----
-        let mut draft = analysis.batch_config().clone();
-        let len = board.line_len();
-        let mut changed = false;
-        ui.collapsing("快扫设置", |ui| {
-            // 起止手数（1 基手数编辑；内部 0 基局面序号）。止手 ≤ 起手时
-            // 由发起端钳制（这里显示时也做同样钳制，保持所见即所扫）。
-            ui.horizontal(|ui| {
-                ui.weak("起手");
-                let from = (draft.from.min(len.saturating_sub(1)) + 1) as i32;
-                let mut from_edit = from;
-                if ui
-                    .add(egui::DragValue::new(&mut from_edit).range(1..=len as i32))
-                    .changed()
-                {
-                    draft.from = (from_edit.max(1) as usize - 1).min(len.saturating_sub(1));
-                    changed = true;
-                }
-                ui.weak("止手");
-                // to = usize::MAX 显示为线尾（编辑后落为具体值）。
-                let to_disp = draft.to.min(len) as i32;
-                let mut to_edit = to_disp;
-                if ui
-                    .add(egui::DragValue::new(&mut to_edit).range(1..=len as i32))
-                    .changed()
-                {
-                    draft.to = (to_edit.max(1) as usize).min(len);
-                    changed = true;
-                }
-            });
-            // 每手 visits：常用档位分段选择（当前值不在档位内则追加一个
-            // 「自定义」段显示真实值）。
-            ui.horizontal(|ui| {
-                ui.weak("每手visits");
-                for &visits in &[20u32, 40, 100, 300] {
-                    let selected = draft.visits == visits;
-                    if ui
-                        .add(egui::Button::selectable(selected, visits.to_string()))
-                        .clicked()
-                    {
-                        draft.visits = visits;
-                        changed = true;
-                    }
-                }
-                // 常用档位之外的可编辑数值：当前值不在档位内时格式化带
-                // 「自定」后缀提示（DragValue 无独立文字着色 API，不再硬造）。
-                let label = egui::DragValue::new(&mut draft.visits)
-                    .range(1..=10_000)
-                    .custom_formatter(|v, _| {
-                        if BATCH_VISITS_PRESETS.contains(&(v as u32)) {
-                            format!("{v}")
-                        } else {
-                            format!("{v} 自定")
-                        }
-                    })
-                    .custom_parser(|s| s.trim().parse::<f64>().ok().map(|v| v as u32 as f64));
-                if ui.add(label).changed() {
-                    draft.visits = draft.visits.max(1);
-                    changed = true;
-                }
-            });
-            // 只扫一方：只分析轮到该方行棋的局面（耗时砍半）。
-            ui.horizontal(|ui| {
-                ui.weak("扫");
-                for side in [BatchSide::All, BatchSide::BlackOnly, BatchSide::WhiteOnly] {
-                    let selected = draft.side == side;
-                    if ui
-                        .add(egui::Button::selectable(selected, side.name()))
-                        .clicked()
-                    {
-                        draft.side = side;
-                        changed = true;
-                    }
-                }
-            });
-            if ui
-                .checkbox(&mut draft.include_variations, "含变着（全树逐节点，慢）")
-                .changed()
-            {
-                changed = true;
-            }
-            // 扫完自动加深差异手（默认开）：治 40 visits 下吻合度并列 0、
-            // 差异手排序噪声大的毛病。
-            if ui
-                .checkbox(&mut draft.deepen_enabled, "扫完自动加深差异手")
-                .changed()
-            {
-                changed = true;
-            }
-            if draft.deepen_enabled {
-                ui.horizontal(|ui| {
-                    ui.weak("前");
-                    if ui
-                        .add(egui::DragValue::new(&mut draft.deepen_top).range(1..=50))
-                        .changed()
-                    {
-                        changed = true;
-                    }
-                    ui.weak("手，加深到");
-                    if ui
-                        .add(egui::DragValue::new(&mut draft.deepen_visits).range(1..=10_000))
-                        .changed()
-                    {
-                        changed = true;
-                    }
-                    ui.weak("visits");
-                });
-            }
-            ui.weak(
-                "含变着时对每个节点分析「到该节点为止 + 该节点深度」，\
-                     局面数随分支线性增长；起止手数同样按节点深度过滤。",
-            );
-        });
-        // 预估（与发起共用同一实现）：局面数按当前配置如实展示，
-        // 「含变着」多分支时数字可能远大于手数，配以劝退提示。
-        let estimate = batch_estimate(board, &draft);
+        // 进度条 + 阶段标注：主扫描与加深分开计数（批量口径变更后
+        // 总数是「过滤后的局面数」，不再恒等于手数）。
+        ui.add(
+            egui::ProgressBar::new(done as f32 / total.max(1) as f32)
+                .show_percentage()
+                .desired_height(14.0),
+        );
         ui.weak(format!(
-            "预计 {} 个局面，约 {}",
-            estimate.positions,
-            format_estimate_secs(estimate.secs),
+            "{} {done} / {total} · 已用 {}",
+            if deep { "加深" } else { "主扫描" },
+            crate::ui::analysis::format_batch_elapsed(elapsed),
         ));
-        if estimate.heavy() {
-            ui.colored_label(
-                theme::colors::WARN,
-                "局面较多，建议缩小起止范围或关闭「含变着」。",
-            );
-        }
-        ui.add_space(2.0);
-        if changed {
-            *action = PanelAction::SetBatchConfig(draft);
-        }
-        let empty = len == 0;
-        let entry = ui.add_enabled(!empty, egui::Button::new("开始快扫"));
-        if empty {
-            entry.on_disabled_hover_text("空盘无谱可扫");
-        } else if entry.clicked() {
-            *action = PanelAction::StartBatch;
-        }
+        ui.weak("取消在「分析 → 整谱快扫…」对话框。");
     });
-}
-
-/// 「每手 visits」的常用档位（侧栏分段选择 + 「自定义」编辑共存）。
-const BATCH_VISITS_PRESETS: [u32; 4] = [20, 40, 100, 300];
-
-/// 预估耗时的人类可读形式（秒级 < 60 直接给秒；超过给分钟 / 小时）。
-fn format_estimate_secs(secs: f64) -> String {
-    if secs < 60.0 {
-        format!("约 {secs:.0} 秒")
-    } else if secs < 3600.0 {
-        format!("约 {} 分", (secs / 60.0).ceil() as u32)
-    } else {
-        format!("约 {:.1} 小时", secs / 3600.0)
-    }
 }
 
 /// 「消息」卡片：各类用户可见提示（非法落子 / 载入另存 / 引擎错误 /
