@@ -24,7 +24,7 @@
 
 pkgname=guanqi
 pkgver=0.1.0
-pkgrel=2
+pkgrel=3
 pkgdesc='观棋 —— KataGo 围棋 AI 引擎图形前端'
 arch=('x86_64')
 license=('MIT')
