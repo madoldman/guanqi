@@ -41,6 +41,7 @@ use crate::ui::{
 // 应用接线；父模块的私有字段对子模块天然可见，无需提升可见性。
 mod dialog;
 mod doc;
+mod export;
 mod io;
 mod menu;
 mod play_flow;
@@ -191,6 +192,10 @@ pub struct GuanqiApp {
     /// 偏好（界面开关 / 窗口几何）脏标记 + 防抖截止时刻：改动后停稳
     /// [`PREFS_SAVE_DEBOUNCE`] 才落盘，退出时无条件补写（子项 1/2 共用）。
     prefs_dirty_since: Option<Instant>,
+    /// `egui::Context` 的留档克隆（复盘报告的棋盘图水印需要经
+    /// `ctx.fonts_mut` 光栅化中文字形；对话框结果在 `logic` 帧处理，
+    /// 那里没有 `Ui`，故在构造期留一份。`Context` 是 `Arc` 克隆，廉价）。
+    report_ctx: egui::Context,
 }
 
 /// 等待中的对话框用途：打开与保存各自独立接结果，互不串线。
@@ -202,6 +207,8 @@ pub enum PendingDialog {
     Open,
     /// 等待用户确认另存位置。
     Save,
+    /// 等待用户确认复盘报告的导出位置（阶段 21 #6）。
+    ExportReport,
 }
 
 /// 目录记忆的槽位（打开 / 另存各记各的，见 `remember_dir`）。
@@ -440,6 +447,7 @@ impl GuanqiApp {
             close_sent: false,
             last_viewport_commands: std::cell::RefCell::new(Vec::new()),
             prefs_dirty_since: None,
+            report_ctx: cc.egui_ctx.clone(),
         }
     }
 

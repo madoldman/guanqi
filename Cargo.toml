@@ -12,6 +12,9 @@ eframe = "0.36"
 egui = "0.36"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 复盘报告的棋盘图 PNG 编码（阶段 21 #6）。全项目唯一图像编码依赖：
+# 只做编码（棋盘图自绘 RGBA），不引入 image 这类全家桶。
+png = "0.18"
 
 [profile.release]
 lto = true

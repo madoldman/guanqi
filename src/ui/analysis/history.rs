@@ -322,4 +322,49 @@ impl AnalysisState {
         }
         notes
     }
+
+    /// 差异手报告条目（复盘报告导出用，[`super::super::report`]
+    /// [`DiagramEntry`](crate::ui::report::DiagramEntry) 的取数端）：
+    /// 排行榜 Top N 逐手给出实战点 / 引擎首选。实战点来自棋盘记录
+    /// （弃着 = `None`）；**首选查走子前局面的候选表**——与
+    /// [`Self::game_summary`] / [`Self::move_annotations`] 同款滚动签名
+    /// （第 i 手的候选表键 = 走 i 手之前的前缀签名），表缺失 / 首选为
+    /// 弃着 / 表为空都记 `None`（不臆造坐标）。`board_size` 随条目存储，
+    /// 报告侧换算 GTP 坐标无需再借棋盘。
+    pub fn diagram_entries(&self, board: &Board) -> Vec<crate::ui::report::DiagramEntry> {
+        let size = board.size();
+        let summary = self.game_summary(board);
+        // 滚动签名与 game_summary 同款：进入第 i 轮时 sig = 走子前局面
+        // （候选表键），hash_record 一步后滚到走子后（供下一轮作键）。
+        let mut sig = 0xcbf2_9ce4_8422_2325;
+        let mut best_by_turn: HashMap<usize, Option<Coord>> = HashMap::new();
+        for (i, record) in board.line_records().iter().enumerate() {
+            let best = self
+                .candidates
+                .get(&sig)
+                .and_then(|snap| snap.best)
+                .map(|(at, _)| at);
+            best_by_turn.insert(i + 1, best);
+            hash_record(&mut sig, record);
+        }
+        summary
+            .worst
+            .iter()
+            .filter_map(|worst| {
+                let record = board.record_at(worst.turn - 1)?;
+                Some(crate::ui::report::DiagramEntry {
+                    turn: worst.turn,
+                    board_size: size,
+                    player: record.player,
+                    actual: match record.action {
+                        Action::Place(at) => Some(at),
+                        Action::Pass => None,
+                    },
+                    best: best_by_turn.get(&worst.turn).copied().flatten(),
+                    severity: worst.severity,
+                    score_loss: worst.score_loss,
+                })
+            })
+            .collect()
+    }
 }

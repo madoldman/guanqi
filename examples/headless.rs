@@ -504,6 +504,15 @@ impl Driver {
                     .map_err(|e| format!("load 失败：{e}{}", label()))?,
                 "save" => self.inject_file_pick(guanqi::app::PendingDialog::Save, rest)
                     .map_err(|e| format!("save 失败：{e}{}", label()))?,
+                // 导出复盘报告（阶段 21 #6）：与菜单入口同一执行体
+                // （export_report_dialog 发起 → 注入 ExportReport picked）。
+                // 比菜单点击可靠：不依赖弹层坐标与时机。
+                "export" => {
+                    self.app.export_report_dialog_pub();
+                    self.tick_default();
+                    self.inject_file_pick(guanqi::app::PendingDialog::ExportReport, rest)
+                        .map_err(|e| format!("export 失败：{e}{}", label()))?;
+                }
                 "dump" => {
                     let snap = self.app.state_snapshot();
                     println!("[dump {rest}] {}", snap.to_json());

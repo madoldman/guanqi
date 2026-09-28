@@ -10,6 +10,8 @@ pub mod explain;
 pub mod mini_board;
 pub mod new_game;
 pub mod overlay;
+pub mod report;
+pub mod report_image;
 pub mod settings;
 pub mod theme;
 pub mod tree;

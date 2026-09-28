@@ -124,7 +124,7 @@ pub(super) fn save_file_dialog_then(&mut self, then: PostSaveAction) {
 
 /// 对话框发起前的公共守卫：portal 不可用 / 已有对话框在等待时
 /// 返回提示（等待中的对话框不区分用途——任一在等都不允许叠加）。
-fn dialog_guard(&self) -> Option<LoadNotice> {
+pub(super) fn dialog_guard(&self) -> Option<LoadNotice> {
     if let Some(reason) = &self.portal_unavailable {
         return Some(LoadNotice::Warn(format!("文件对话框不可用：{reason}")));
     }
@@ -147,6 +147,19 @@ pub(super) fn on_portal_event(&mut self, kind: PendingDialog, event: PortalEvent
                 self.load_game(path);
             }
             PortalEvent::Cancelled => {} // 用户取消：静默，界面保持原状
+            PortalEvent::Failed(err) => {
+                self.notices.push(LoadNotice::Failed(err.to_string()));
+            }
+        },
+        PendingDialog::ExportReport => match event {
+            PortalEvent::Picked(path) => {
+                // 导出位置同样记进「另存目录」槽位：报告通常与棋谱、
+                // 另存的 SGF 放在同一批目录里。
+                self.remember_dir(OpenSaveDir::Save, &path);
+                self.export_report(path);
+            }
+            // 用户取消导出：静默（无回调动作需要清理）。
+            PortalEvent::Cancelled => {}
             PortalEvent::Failed(err) => {
                 self.notices.push(LoadNotice::Failed(err.to_string()));
             }

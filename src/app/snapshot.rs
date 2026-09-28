@@ -104,9 +104,47 @@ pub struct StateSnapshot {
     pub toggles: Toggles,
     /// 当前生效贴目。
     pub komi: f64,
+    /// 局后统计（复盘报告导出的数据源，与侧栏卡片同一
+    /// [`AnalysisState::game_summary`] 计算）：报告数值对照的取证源。
+    pub game_summary: Option<GameSummaryDump>,
     /// 最近发出的 viewport 命令（读取即清空；与驱动「dump 后清」的旧
     /// 语义一致）。
     pub viewport_commands: Vec<String>,
+}
+
+/// 局后统计的取证形态（dump 用；字段与 [`GameSummary`] 一一对应，
+/// worst 全量带出供报告逐项比对）。
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct GameSummaryDump {
+    /// 当前线总手数。
+    pub total: usize,
+    /// 黑 / 白已分析手数。
+    pub analyzed_black: usize,
+    pub analyzed_white: usize,
+    /// 黑 / 白吻合度。
+    pub match_black: f64,
+    pub match_white: f64,
+    /// 黑 / 白样本是否达标。
+    pub enough_black: bool,
+    pub enough_white: bool,
+    /// 黑 / 白「深度分析」手数（构成判定线 DEEP_VISITS_THRESHOLD）。
+    pub deep_black: usize,
+    pub deep_white: usize,
+    /// 差异手排行榜（胜率损失降序）。
+    pub worst: Vec<WorstMoveDump>,
+}
+
+/// 差异手一行的取证形态。
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct WorstMoveDump {
+    pub turn: usize,
+    pub player: String,
+    pub winrate_loss: f64,
+    pub score_loss: f64,
+    pub severity: String,
+    pub match_ratio: f64,
 }
 
 /// 引擎最近一次读数（展示快照的根信息）。
@@ -353,6 +391,32 @@ impl GuanqiApp {
                 new_game_open: self.new_game_open,
             },
             komi: self.komi,
+            game_summary: self.loaded.as_ref().map(|_| {
+                let summary = self.analysis.game_summary(&self.board);
+                GameSummaryDump {
+                    total: summary.total,
+                    analyzed_black: summary.analyzed_black,
+                    analyzed_white: summary.analyzed_white,
+                    match_black: summary.match_black,
+                    match_white: summary.match_white,
+                    enough_black: summary.enough_black,
+                    enough_white: summary.enough_white,
+                    deep_black: summary.deep_black,
+                    deep_white: summary.deep_white,
+                    worst: summary
+                        .worst
+                        .iter()
+                        .map(|w| WorstMoveDump {
+                            turn: w.turn,
+                            player: w.player.name().to_owned(),
+                            winrate_loss: w.winrate_loss,
+                            score_loss: w.score_loss,
+                            severity: format!("{:?}", w.severity),
+                            match_ratio: w.match_ratio,
+                        })
+                        .collect(),
+                }
+            }),
             viewport_commands: std::mem::take(
                 &mut *self.last_viewport_commands.borrow_mut(),
             )
@@ -397,6 +461,24 @@ impl StateSnapshot {
                     })).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>(),
             },
+        });
+        let game_summary = self.game_summary.as_ref().map(|g| {
+            serde_json::json!({
+                "total": g.total,
+                "analyzed_black": g.analyzed_black,
+                "analyzed_white": g.analyzed_white,
+                "match_black": g.match_black,
+                "match_white": g.match_white,
+                "enough_black": g.enough_black,
+                "enough_white": g.enough_white,
+                "deep_black": g.deep_black,
+                "deep_white": g.deep_white,
+                "worst": g.worst.iter().map(|w| serde_json::json!({
+                    "turn": w.turn, "player": w.player,
+                    "winrate_loss": w.winrate_loss, "score_loss": w.score_loss,
+                    "severity": w.severity, "match_ratio": w.match_ratio,
+                })).collect::<Vec<_>>(),
+            })
         });
         serde_json::json!({
             "source": self.source,
@@ -449,6 +531,7 @@ impl StateSnapshot {
                 "new_game_open": self.toggles.new_game_open,
             },
             "komi": self.komi,
+            "game_summary": game_summary,
             "viewport_commands": self.viewport_commands,
         })
         .to_string()

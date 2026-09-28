@@ -45,6 +45,27 @@ pub(super) fn file_menu(&mut self, ui: &mut egui::Ui) {
             self.save_file_dialog();
             ui.close();
         }
+        // ---- 导出复盘报告（阶段 21 #6）：未载入棋谱置灰并说明原因 ----
+        // 复盘报告的内容是「当前棋谱的局后统计 + 差异手棋盘图」，新对局
+        // 的统计属于「本盘」（与局后统计写回 SGF 的边界一致），故以
+        // 「是否已载入棋谱」而非「线上有无手数」为准——空盘谱载入后也
+        // 能导出（报告如实写「尚无分析数据」）。
+        let report_disabled = if self.loaded.is_none() {
+            Some("未载入棋谱，无复盘可导出")
+        } else {
+            None
+        };
+        let mut entry = ui.add_enabled(
+            report_disabled.is_none(),
+            egui::Button::new("导出复盘报告…"),
+        );
+        if let Some(reason) = report_disabled {
+            entry = entry.on_disabled_hover_text(reason.to_owned());
+        }
+        if entry.clicked() {
+            self.export_report_dialog();
+            ui.close();
+        }
         ui.separator();
         ui.menu_button("研究副本", |ui| {
             // 仅空盘置灰（原谱 / 任意副本里都可再开副本）。
