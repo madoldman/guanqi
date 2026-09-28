@@ -238,6 +238,28 @@ impl AnalysisState {
             } => {
                 // 批量在飞时报告先按批量 id 归属：批量查询与常规查询的 id
                 // 空间互斥（引擎按 id 回传），命中批量即只回填历史不落快照。
+                // 参照打分（refscan，阶段 22.3）是第三个独立 id 归属：命中
+                // 即回填打分结果表，同样不落展示快照。
+                if self
+                    .ref_scan
+                    .as_ref()
+                    .is_some_and(|job| job.active.as_ref().is_some_and(|chunk| chunk.id == id))
+                {
+                    let Some(mut job) = self.ref_scan.take() else {
+                        return;
+                    };
+                    let chunk_done = Self::on_ref_scan_report(self, &mut job, id, report);
+                    self.ref_scan = Some(job);
+                    if chunk_done {
+                        // 块收齐：关闭在飞并立即派发下一块（sync 每帧的
+                        // 派发与完成判定兜底推进，这里先派少空转一帧）。
+                        if let Some(job) = self.ref_scan.as_mut() {
+                            job.active = None;
+                        }
+                        self.dispatch_ref_scan_chunk();
+                    }
+                    return;
+                }
                 if self
                     .batch
                     .as_ref()

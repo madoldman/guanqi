@@ -58,12 +58,18 @@ mod display;
 mod history;
 mod limits;
 mod query;
+mod refscan;
 mod thinking;
 mod types;
 
 use query::{Inflight, Stage, TerminalEval};
 use limits::LimitsEpoch;
 use thinking::ThinkingLog;
+
+pub use refscan::{
+    ref_scan_plan_digest_of, RefContinuationScore, RefNodeScore, RefScanResults,
+    REFSCAN_MAX_MOVE_NO, REFSCAN_OUTDATED_SCORE, REFSCAN_OUTDATED_WINRATE, REFSCAN_VISITS,
+};
 
 pub use types::{
     loss_from_points, move_block_text, result_block_text, stats_block_text, terminal_result_string,
@@ -180,6 +186,17 @@ pub struct AnalysisState {
     batch_config: BatchConfig,
     /// 批量刚结束时的用户提示（完成 / 取消），侧栏读取后由 App 清除。
     batch_notice: Option<String>,
+    /// 参照库打分任务（阶段 22.3；`Some` = 进行中）。与整谱快扫（
+    /// [`Self::batch`]）完全独立的批处理：状态不与当前对局耦合（参照
+    /// 与对局正交，打分期间用户照常复盘），报告按树内路径回填进
+    /// [`Self::ref_scan_results`]。调度模式（组间串行、切块、心跳、
+    /// terminate）复用快扫，见 `refscan` 模块文档。
+    ref_scan: Option<refscan::RefScanJob>,
+    /// 参照库打分的已完成结果（按树内路径键）。**本会话内保存、换参照
+    /// 即清空**（`detach_ref_scan`），不做持久化。
+    ref_scan_results: refscan::RefScanResults,
+    /// 参照库打分刚结束时的用户提示（完成 / 取消 / 换参照清空）。
+    ref_scan_notice: Option<String>,
     /// 候选类显示的门控模式（第 5 项）。只影响绘制路径的取数判定，
     /// 不影响任何数据接收与走子决策（见 [`CandidateGating`] 文档）。
     gating: CandidateGating,
@@ -267,6 +284,9 @@ impl AnalysisState {
             batch: None,
             batch_config: BatchConfig::default(),
             batch_notice: None,
+            ref_scan: None,
+            ref_scan_results: HashMap::new(),
+            ref_scan_notice: None,
             gating: CandidateGating::Immediate,
             want_rules: None,
             sent_rules: None,
@@ -400,6 +420,23 @@ impl AnalysisState {
                 if complete {
                     self.finish_batch(true);
                 }
+            }
+        }
+        // ---- 参照库打分（独立批处理；调度与快扫同款，状态互不相干）----
+        // 卡死兜底（同一心跳口径）→ 派发 → 完成判定（派发完 + 收齐）。
+        if let Some(job) = self.ref_scan.as_ref()
+            && job.stalled()
+        {
+            self.finish_ref_scan(false);
+        }
+        if self.ref_scan.is_some() {
+            self.dispatch_ref_scan_chunk();
+            if let Some(job) = self.ref_scan.as_ref()
+                && job.chain >= job.plan.chains.len()
+                && job.done >= job.plan.positions
+                && job.active.is_none()
+            {
+                self.finish_ref_scan(true);
             }
         }
         // 限制版本变化（设置区域 / 排除 / 清除）即使局面未变也要重发查询：
@@ -594,6 +631,9 @@ impl AnalysisState {
         {
             handle.terminate(chunk.id);
         }
+        // 参照打分与对局正交（载谱不换参照），任务本身照跑；但收尾提示
+        // 里的「换参照清空」口径不在此触发（那是 detach_ref_scan 的职责，
+        // 由参照加载 / 卸载路径调用）。
         self.batch_notice = None;
         self.analyzed_sig = None;
         self.snapshot = None;

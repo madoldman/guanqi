@@ -107,6 +107,13 @@ pub struct GuanqiApp {
     /// 整谱快扫设置对话框是否打开（菜单「分析 → 整谱快扫…」的入口，
     /// 从侧栏卡片搬家而来：设置与预估同屏，看完预估再决定发起）。
     batch_scan_open: bool,
+    /// 参照库打分对话框是否打开（菜单「分析 → 参照库打分…」的入口，
+    /// 阶段 22.3：范围确认 + 预估同屏；无参照时菜单入口已置灰）。
+    ref_scan_open: bool,
+    /// 参照库打分的手数范围上限（对话框可编辑；默认
+    /// [`crate::ui::analysis::REFSCAN_MAX_MOVE_NO`]，不持久化——范围是
+    /// 「这一次扫描」的参数，与快扫配置的持久化定位不同）。
+    ref_scan_max: usize,
     /// 另存时是否写逐手注释块（「分析」菜单开关，随 ui_prefs 持久化；
     /// 默认开）。只影响「另存为」的写回内容，不改任何分析数据流。
     annotate_moves: bool,
@@ -446,6 +453,8 @@ impl GuanqiApp {
             settings,
             settings_open: false,
             batch_scan_open: false,
+            ref_scan_open: false,
+            ref_scan_max: crate::ui::analysis::REFSCAN_MAX_MOVE_NO,
             annotate_moves: prefs.annotate_moves,
             startup_notice,
             persist_notice: None,
@@ -988,6 +997,47 @@ impl eframe::App for GuanqiApp {
             }
         }
 
+        // 参照库打分对话框（「分析 → 参照库打分…」入口，阶段 22.3）：
+        // 范围确认 + 预估同屏；发起与取消走 AnalysisState 的独立批处理。
+        if self.ref_scan_open {
+            let ctx = ui.ctx().clone();
+            let game_rules =
+                self.loaded.as_ref().and_then(|meta| meta.info.rules.as_deref());
+            // 无参照时窗口内不能画正文（预估 / 发起都要参照）：直接收起
+            // （正常路径菜单入口已置灰，这里是防御）。
+            if let Some(reference) = self.reference.as_ref() {
+                let action = ui::ref_scan::show(
+                    &ctx,
+                    &mut self.ref_scan_open,
+                    &mut self.analysis,
+                    reference,
+                    &mut self.ref_scan_max,
+                    self.komi,
+                    game_rules,
+                );
+                match action {
+                    ui::ref_scan::RefScanAction::Start => {
+                        if let Err(reason) = self.analysis.start_ref_scan(
+                            reference.tree(),
+                            reference.size(),
+                            self.komi,
+                            game_rules,
+                            self.ref_scan_max,
+                        ) {
+                            self.notices.push(analysis_panel::LoadNotice::Warn(reason));
+                        }
+                    }
+                    ui::ref_scan::RefScanAction::Cancel => {
+                        self.analysis.cancel_ref_scan();
+                    }
+                    ui::ref_scan::RefScanAction::Close
+                    | ui::ref_scan::RefScanAction::None => {}
+                }
+            } else {
+                self.ref_scan_open = false;
+            }
+        }
+
         // 破坏性动作确认框（丢弃副本 / 带副本研究载谱 / 开新局）：
         // 模态小窗，确认才执行原动作；取消即清除，保持现状。
         if !matches!(self.pending_confirm, PendingConfirm::None) {
@@ -1201,6 +1251,10 @@ impl eframe::App for GuanqiApp {
         self.refresh_terminal_result();
         // 整谱快扫结束提示（完成 / 取消 / 局面变化自动取消）落位到消息区。
         if let Some(notice) = self.analysis.take_batch_notice() {
+            self.notices.push(analysis_panel::LoadNotice::Ok(notice));
+        }
+        // 参照库打分结束提示（完成 / 取消 / 换参照清空）落位到消息区。
+        if let Some(notice) = self.analysis.take_ref_scan_notice() {
             self.notices.push(analysis_panel::LoadNotice::Ok(notice));
         }
         // 规则解析提示（未识别的 RU 串已按默认规则分析）落位到消息区。

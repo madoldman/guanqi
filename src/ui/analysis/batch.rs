@@ -25,12 +25,15 @@ pub const BATCH_VISITS: u32 = 40;
 pub(crate) const INTERACTIVE_PRIORITY: i32 = 10;
 
 /// 批量查询优先级：缺省 0（低于 [`INTERACTIVE_PRIORITY`]，排队即可）。
-const BATCH_PRIORITY: i32 = 0;
+/// 参照打分（`refscan`）复用同一档：同为后台批量，交互查询随时可插队。
+pub(super) const BATCH_PRIORITY: i32 = 0;
 
 /// 整谱快扫的分块大小（一次 `analyzeTurns` 的手数）：实测 40 visits 约
 /// 0.94s/手，20 手一块 ≈ 19 秒，取消响应与进度刷新粒度都足够；块间串行
 /// （引擎 search tree 跨查询缓存还能让相邻块的重叠局面加速）。
-const BATCH_CHUNK: usize = 20;
+/// 参照打分（`refscan`）复用同一块大小（同为「极大链 + turns」的
+/// `analyzeTurns` 查询，块粒度口径天然一致）。
+pub(super) const BATCH_CHUNK: usize = 20;
 
 // ---- 整谱快扫配置（LizzieYzy「闪电分析设置」的移植口径）----
 
@@ -288,8 +291,9 @@ impl BatchEstimate {
 }
 
 /// 单局面耗时外推依据：b18 OpenCL、threads=1 实测 40 visits ≈ 0.94s/手
-/// （[`BATCH_VISITS`] 文档引用的实测），按 visits 线性放大。
-const BATCH_SECS_PER_HAND_AT_40: f64 = 0.94;
+/// （[`BATCH_VISITS`] 文档引用的实测），按 visits 线性放大。参照打分
+/// 的预估复用同一实测基准（同引擎同档 visits，吞吐同源）。
+pub(super) const BATCH_SECS_PER_HAND_AT_40: f64 = 0.94;
 
 /// 预估总耗时（主扫描 + 可选加深；加深按「前 N 手 × 走子前后两端」的
 /// 最坏情况计）。单线程口径，多线程实际更快——预估偏高是有意的。
@@ -421,6 +425,13 @@ impl AnalysisState {
     pub fn start_batch(&mut self, board: &Board, komi: f64, game_rules: Option<&str>) -> Option<String> {
         if self.batch.is_some() {
             return Some("整谱快扫已在进行中。".to_owned());
+        }
+        // 与参照打分互斥（对称守卫，口径见 `refscan` 模块文档）：两者都
+        // 吃引擎队列，同时跑会把批量排队拖到不可用。
+        if self.ref_scan.is_some() {
+            return Some("参照库打分正在进行中，无法同时发起整谱快扫（两者共用引擎）。\
+                         请先取消或等待打分完成。"
+                .to_owned());
         }
         if !matches!(self.engine, EngineStatus::Ready) {
             return Some("引擎未就绪，无法开始整谱快扫。".to_owned());
@@ -609,8 +620,12 @@ impl AnalysisState {
     /// 查询一致，快扫曲线才能与交互分析的曲线同源比较）。`turn 0` 即
     /// 预设局面，因此摆子必须一并带上（turn 编号以真实着法计，摆子不占
     /// turn），否则含摆子谱的快扫曲线整体错位。
+    ///
+    /// `pub(super)`：参照打分（`refscan`）的「极大链 + turns」查询与本
+    /// 函数同构（同一组装口径：摆子随查询、批量优先级、不开流式），
+    /// 只读复用、不改快扫行为。
     #[allow(clippy::too_many_arguments)]
-    fn send_batch_query(
+    pub(super) fn send_batch_query(
         handle: &mut Engine,
         size: Size,
         komi: f64,

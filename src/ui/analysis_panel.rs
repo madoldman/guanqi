@@ -25,7 +25,8 @@ use crate::play::{PlayState, resign_text};
 use crate::sgf::GameMeta;
 
 use super::analysis::{
-    display_values, AnalysisState, EngineStatus, GameSummary, Severity, ThinkingEntryRef, WORST_LIMIT,
+    display_values, AnalysisState, EngineStatus, GameSummary, RefNodeScore, Severity,
+    ThinkingEntryRef, WORST_LIMIT,
 };
 use super::explain;
 use super::overlay::{self, Overlay};
@@ -543,6 +544,12 @@ fn panel_body(
     // ---- 参照（阶段 22）：外部定式库 / 死活题谱的命中与偏离提示 ----
     // 未加载参照时不占地方（一行简短状态），见 card_reference 文档。
     card_reference(ui, reference, solving);
+
+    // ---- 参照打分区块（阶段 22.3）：进度 / 已淘汰分支 Top N / 明细 ----
+    // 挂在参照卡片之下（同一主题域）。无论是否已加载参照都调用：
+    // 「换参照即清空」后结果为空，区块只显示一行说明而非整卡消失——
+    // 「这个功能存在、结果在此」比「卡片忽有忽无」更可发现。
+    card_ref_scan(ui, analysis, reference.is_some(), solving);
 
     if !solving {
         // ---- 限定选点信息（区域尺寸 / 排除清单内容；开关与清除在
@@ -1099,6 +1106,161 @@ fn card_reference(ui: &mut Ui, reference: Option<&ReferenceView>, solving: bool)
             }
         }
     });
+}
+
+/// 「参照打分」区块（阶段 22.3）：AI 对参照库的批量评估结果。
+///
+/// 展示口径：
+/// - 进行中：进度条 + done/total（快扫进度卡同款）；
+/// - 已有结果：「被 AI 淘汰」分支 Top N（按已知最大目差差距降序），
+///   每行 = 节点手数 + 库中续法 vs 引擎首选 + 差距；点击展开该节点
+///   全部续法的评估明细；
+/// - 文案自证：**这是 AI 对库的评估，不是库本身的对错**（「已淘汰」=
+///   引擎评估显著劣于引擎首选，不是「这手棋人类不能下」）。
+/// - 结果只在本会话内保存，换参照即清空（AnalysisState 生命周期）。
+fn card_ref_scan(ui: &mut Ui, analysis: &AnalysisState, has_ref: bool, solving: bool) {
+    // 进行中：进度 + 提示（不依赖 has_ref——取消动作在菜单 / 对话框）。
+    if let Some((done, total, elapsed)) = analysis.ref_scan_progress() {
+        card(ui, |ui| {
+            theme::section_title(ui, "参照打分");
+            ui.add(
+                egui::ProgressBar::new(done as f32 / total.max(1) as f32)
+                    .show_percentage()
+                    .desired_height(14.0),
+            );
+            ui.weak(format!(
+                "已评估 {done} / {total} 节点 · 已用 {}（取消在「分析」菜单）",
+                crate::ui::analysis::format_batch_elapsed(elapsed),
+            ));
+        });
+        return;
+    }
+    // 无结果：按原因给一行说明（未加载参照 / 未扫过 / 解题模式）。
+    let Some(results) = analysis.ref_scan_results() else {
+        if solving {
+            return; // 解题模式下连说明都不占位（打分结果含续法 = 剧透面）。
+        }
+        if !has_ref {
+            ui.weak("参照打分：未加载参照文件（「分析 → 参照库打分…」）。");
+        } else {
+            ui.weak("参照打分：还没有结果（「分析 → 参照库打分…」可发起）。");
+        }
+        return;
+    };
+    card(ui, |ui| {
+        theme::section_title(ui, "参照打分");
+        ui.weak("AI 对库的评估，不是库本身的对错（结果随换参照清空）。");
+        // 被淘汰分支 Top N（已知最大目差差距降序；差距按行棋方视角，
+        // 「引擎未列出」按哨兵参与排序但不参与数值展示）。
+        let mut ranked: Vec<&RefNodeScore> = results
+            .values()
+            .filter(|score| score.outdated_count() > 0)
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.rank_gap()
+                .partial_cmp(&a.rank_gap())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.move_no.cmp(&b.move_no))
+        });
+        if ranked.is_empty() {
+            ui.add_space(2.0);
+            ui.colored_label(
+                theme::colors::OK,
+                "扫描完成：库中没有续法被 AI 判为显著劣于引擎首选。",
+            );
+            return;
+        }
+        ui.add_space(2.0);
+        ui.weak(format!(
+            "被 AI 淘汰的分支（{outdated}/{total} 节点），按差距前 {show}：",
+            outdated = ranked.len(),
+            total = results.len(),
+            show = ranked.len().min(REFSCAN_TOP),
+        ));
+        for score in ranked.iter().take(REFSCAN_TOP) {
+            ref_scan_row(ui, score);
+        }
+    });
+}
+
+/// 「被淘汰分支 Top N」的展示条数（侧栏空间有限；完整明细逐条可展开，
+/// 不受此限）。
+const REFSCAN_TOP: usize = 5;
+
+/// 一条被淘汰分支行：节点手数 + 摘要（库中续法 vs 引擎首选 + 差距），
+/// 点击展开该节点全部续法的评估明细（再点收起）。
+fn ref_scan_row(ui: &mut Ui, score: &RefNodeScore) {
+    let head = format!(
+        "第 {} 手：{}",
+        score.move_no,
+        score.tail.join(" → "),
+    );
+    // 摘要：库中最差续法 vs 引擎首选（差距取已知最大）。
+    let worst = score
+        .continuations
+        .iter()
+        .filter(|c| c.outdated)
+        .max_by(|a, b| {
+            a.gap.unwrap_or(0.0)
+                .partial_cmp(&b.gap.unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    let best_text = score
+        .best
+        .as_ref()
+        .map(|(at, _, _)| at.clone())
+        .unwrap_or_else(|| "—".to_owned());
+    let summary = match worst {
+        Some(cont) => format!(
+            "库走 {}，引擎首选 {best_text}，差 {}",
+            cont.text,
+            cont.gap_text(),
+        ),
+        None => "库中续法均被引擎排除".to_owned(),
+    };
+    let detail_id = ui.id().with("refscan_row").with(&score.path);
+    let showing = detail_memory(ui, detail_id);
+    let coll = egui::CollapsingHeader::new(RichText::new(&head).size(12.5).strong())
+        .id_salt(detail_id)
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(&summary).size(12.0));
+            });
+            ui.weak(format!(
+                "引擎首选 {}（visits {}）",
+                best_text, score.visits,
+            ));
+            // 全部续法明细（含未被淘汰的，对照展示）。
+            for cont in &score.continuations {
+                let color = if cont.outdated {
+                    theme::colors::WARN
+                } else {
+                    theme::colors::OK
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "· {}：{}（{}）",
+                            cont.text,
+                            cont.eval_text(),
+                            cont.gap_text(),
+                        ))
+                        .size(11.5)
+                        .color(color)
+                        .monospace(),
+                    );
+                });
+            }
+        });
+    let _ = showing;
+    let _ = coll;
+}
+
+/// 折叠记忆（egui CollapsingHeader 自带跨帧状态，此处占位以满足未来
+/// 「明细展开态进 dump」的取证扩展；当前直接用 egui 内建记忆）。
+fn detail_memory(_ui: &mut Ui, _id: egui::Id) -> bool {
+    false
 }
 
 /// 「解题」卡片（阶段 22.2）：解题模式的常驻信息（题面 / 留痕 / 答案）。

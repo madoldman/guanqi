@@ -352,6 +352,38 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
             self.analysis.cancel_batch();
             ui.close();
         }
+        // ---- 参照库打分（阶段 22.3）：AI 对库的评估，不是库本身的对错。
+        // 无参照时置灰并说明原因；发起在对话框（范围确认 + 预估耗时）。----
+        let ref_disabled = if self.reference.is_none() {
+            Some("未加载参照文件——可在「文件 → 打开参照文件…」加载定式库 / 题谱。")
+        } else {
+            None
+        };
+        let mut entry = ui.add_enabled(
+            ref_disabled.is_none(),
+            egui::Button::new("参照库打分…"),
+        );
+        if let Some(reason) = ref_disabled {
+            entry = entry.on_disabled_hover_text(reason);
+        } else {
+            entry = entry.on_hover_text(
+                "用引擎逐个评估参照库里有续法的局面，标出已被 AI 淘汰的分支。\n\
+                 这是 AI 对库的评估，不是库本身的对错。",
+            );
+        }
+        if ref_disabled.is_none() && entry.clicked() {
+            self.ref_scan_open = true;
+            ui.close();
+        }
+        // 「取消参照打分」：仅在打分进行中可用（与「取消快扫」同款入口）。
+        let scanning = self.analysis.ref_scan_progress().is_some();
+        let entry = ui.add_enabled(scanning, egui::Button::new("取消参照打分"));
+        if !scanning {
+            entry.on_disabled_hover_text("当前没有进行中的参照库打分");
+        } else if entry.clicked() {
+            self.analysis.cancel_ref_scan();
+            ui.close();
+        }
         // ---- 另存写回：逐手注释开关（随 ui_prefs 持久化）----
         // 归「分析」菜单而非另存对话框：portal 另存对话框是系统原生
         // 窗口塞不进自绘控件，且注释是分析产物的写出口径，与分析设置

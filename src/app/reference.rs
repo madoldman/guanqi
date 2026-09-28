@@ -94,6 +94,9 @@ impl GuanqiApp {
                 )));
             }
             Ok(reference) => {
+                // 结果生命周期出口：换参照即清空打分结果（取消在飞任务、
+                // 清结果表——旧结果描述的是「上一份库」，无从对号）。
+                self.analysis.detach_ref_scan();
                 let size = reference.size();
                 let entries = reference.entry_count();
                 let nodes = reference.move_node_count();
@@ -129,6 +132,8 @@ impl GuanqiApp {
     /// 卸载参照（无参照时静默：菜单入口已置灰，快捷路径不提示）。
     pub(super) fn unload_reference(&mut self) {
         if self.reference.take().is_some() {
+            // 结果生命周期出口：卸载即清空打分结果（同「换参照即清空」）。
+            self.analysis.detach_ref_scan();
             self.notices
                 .push(LoadNotice::Ok("已卸载参照文件。".to_owned()));
         }

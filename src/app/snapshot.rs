@@ -115,6 +115,8 @@ pub struct StateSnapshot {
     pub board_area: std::cell::RefCell<Option<egui::Rect>>,
     /// 参照文件状态与当前局面命中情况（阶段 22；`None` = 未加载参照）。
     pub reference: Option<ReferenceSnapshot>,
+    /// 参照库打分状态（阶段 22.3；`None` = 本会话无结果且无在飞任务）。
+    pub ref_scan: Option<RefScanSnapshot>,
     /// 解题模式是否开启（阶段 22.2；不剧透总闸的原始状态）。
     pub solving: bool,
     /// 解题模式「已查看答案」留痕。
@@ -273,6 +275,56 @@ pub struct RefHitSnapshot {
     pub region: String,
 }
 
+/// 参照库打分的取证形态（阶段 22.3；headless dump 用）。
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct RefScanSnapshot {
+    /// 在飞任务进度：`(已完成, 总节点数, 已用秒)`；`None` = 空闲。
+    pub progress: Option<(usize, usize, f64)>,
+    /// 在飞任务的计划摘要：`(链数, 每链 turns 数, 总节点数, 摆子数)`。
+    /// 转置 / 多分支库的「极大链分解是否正确」的验证数据源。
+    pub plan: Option<(usize, Vec<usize>, usize, usize)>,
+    /// 已完成节点的评分明细（每节点：路径、手数、首选、各续法的
+    /// 评估 / 差距 / 是否判淘汰）。
+    pub results: Vec<RefNodeScoreDump>,
+    /// 会被判淘汰的节点数（与 results 同源，报告核对用）。
+    pub outdated_nodes: usize,
+}
+
+/// 一个被扫节点的评分取证形态。
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct RefNodeScoreDump {
+    /// 树内路径（下标串）。
+    pub path: String,
+    /// 库内手数。
+    pub move_no: usize,
+    /// 展示尾部。
+    pub tail: Vec<String>,
+    /// 行棋方（`B` / `W`）。
+    pub to_play: String,
+    /// 引擎首选：`(落点, 黑方胜率, 黑方目差)`；无候选为 `None`。
+    pub best: Option<(String, f64, f64)>,
+    /// 各库中续法的评估。
+    pub continuations: Vec<RefContinuationDump>,
+    /// 引擎搜索量。
+    pub visits: u64,
+}
+
+/// 一条续法评估的取证形态。
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct RefContinuationDump {
+    /// 库中续法展示串。
+    pub text: String,
+    /// 引擎评估 `(黑方胜率, 黑方目差)`；`None` = 引擎未列出。
+    pub eval: Option<(f64, f64)>,
+    /// 行棋方视角目差差距；`None` = 引擎未列出（无从计算）。
+    pub gap: Option<f64>,
+    /// 是否判「已被 AI 淘汰」。
+    pub outdated: bool,
+}
+
 /// 思考过程记录的取证快照（阶段 21 #2；headless dump 用）。
 #[doc(hidden)]
 #[derive(Clone, Debug)]
@@ -351,6 +403,45 @@ impl GuanqiApp {
     #[doc(hidden)]
     pub fn unload_reference_pub(&mut self) {
         self.unload_reference();
+    }
+
+    /// 发起参照库打分（headless 工具的 `refscan on` 落点；与对话框
+    /// 「开始打分」同一执行体，规则 / 贴目口径一致）。
+    #[doc(hidden)]
+    pub fn start_ref_scan_pub(
+        &mut self,
+        max_move_no: usize,
+    ) -> Result<(), String> {
+        let Some(reference) = self.reference.as_ref() else {
+            return Err("未加载参照文件".to_owned());
+        };
+        let tree = reference.tree();
+        let size = reference.size();
+        let game_rules = self
+            .loaded
+            .as_ref()
+            .and_then(|meta| meta.info.rules.as_deref());
+        self.analysis
+            .start_ref_scan(tree, size, self.komi, game_rules, max_move_no)
+    }
+
+    /// 取消参照库打分（headless 工具的 `refscan off` 落点）。
+    #[doc(hidden)]
+    pub fn cancel_ref_scan_pub(&mut self) {
+        self.analysis.cancel_ref_scan();
+    }
+
+    /// 离线构造扫描计划并打印摘要（headless 工具的 `refscan plan` 落点；
+    /// 不发起任务——「计划是否正确分解」的验证与「实际执行」解耦）。
+    #[doc(hidden)]
+    pub fn ref_scan_plan_digest_pub(
+        &self,
+        max_move_no: usize,
+    ) -> Option<(usize, Vec<usize>, usize, usize)> {
+        let reference = self.reference.as_ref()?;
+        let (chains, turns, positions, setup) =
+            crate::ui::analysis::ref_scan_plan_digest_of(reference.tree(), reference.size(), max_move_no);
+        Some((chains, turns, positions, setup))
     }
 
     /// 退出收尾（headless 工具跑完脚本后调用）：与 eframe 运行时退出
@@ -575,6 +666,50 @@ impl GuanqiApp {
             solving: self.solving_mode,
             answer_shown: self.answer_shown,
             judge_notice: self.last_judge_notice(),
+            ref_scan: {
+                // 打分取证：进度 / 计划摘要 / 结果明细三段。results 排序
+                // 稳定（按手数）便于 diff；空结果且无任务 = None。
+                let results = self.analysis.ref_scan_results();
+                let progress = self.analysis.ref_scan_progress();
+                if results.is_none() && progress.is_none() {
+                    None
+                } else {
+                    let mut nodes: Vec<RefNodeScoreDump> = results
+                        .map(|m| m.values())
+                        .into_iter()
+                        .flatten()
+                        .map(|score| RefNodeScoreDump {
+                            path: score.path.iter().map(ToString::to_string).collect::<Vec<_>>().join("-"),
+                            move_no: score.move_no,
+                            tail: score.tail.clone(),
+                            to_play: score.to_play.name().to_owned(),
+                            best: score.best.clone(),
+                            continuations: score
+                                .continuations
+                                .iter()
+                                .map(|cont| RefContinuationDump {
+                                    text: cont.text.clone(),
+                                    eval: cont.eval,
+                                    gap: cont.gap,
+                                    outdated: cont.outdated,
+                                })
+                                .collect(),
+                            visits: score.visits,
+                        })
+                        .collect();
+                    nodes.sort_by_key(|n| n.move_no);
+                    Some(RefScanSnapshot {
+                        progress: progress
+                            .map(|(done, total, elapsed)| (done, total, elapsed.as_secs_f64())),
+                        plan: self.analysis.ref_scan_plan_digest(),
+                        outdated_nodes: nodes
+                            .iter()
+                            .filter(|n| n.continuations.iter().any(|c| c.outdated))
+                            .count(),
+                        results: nodes,
+                    })
+                }
+            },
             board_rect: self.board_area.borrow().as_ref().map(|r| {
                 [r.left(), r.top(), r.right(), r.bottom()]
             }),
@@ -723,6 +858,41 @@ impl StateSnapshot {
             "mini_board_panel": self.solving_hidden.mini_board_panel,
             "reference_details": self.solving_hidden.reference_details,
         });
+        let ref_scan = self.ref_scan.as_ref().map(|rs| {
+            // 三层再拆（同 reference 的理由：宏展开深度）。
+            let plan = rs.plan.as_ref().map(|(chains, turns, positions, setup)| {
+                serde_json::json!({
+                    "chains": chains, "turns_per_chain": turns,
+                    "positions": positions, "setup_stones": setup,
+                })
+            });
+            let results = rs.results.iter().map(|node| {
+                serde_json::json!({
+                    "path": node.path, "move_no": node.move_no,
+                    "tail": node.tail, "to_play": node.to_play,
+                    "best": node.best.as_ref().map(|(at, wr, lead)| serde_json::json!({
+                        "at": at, "winrate": wr, "score_lead": lead,
+                    })),
+                    "visits": node.visits,
+                    "continuations": node.continuations.iter().map(|cont| serde_json::json!({
+                        "text": cont.text,
+                        "eval": cont.eval.map(|(wr, lead)| serde_json::json!({
+                            "winrate": wr, "score_lead": lead,
+                        })),
+                        "gap": cont.gap,
+                        "outdated": cont.outdated,
+                    })).collect::<Vec<_>>(),
+                })
+            }).collect::<Vec<_>>();
+            serde_json::json!({
+                "progress": rs.progress.map(|(done, total, secs)| serde_json::json!({
+                    "done": done, "total": total, "elapsed_secs": secs,
+                })),
+                "plan": plan,
+                "outdated_nodes": rs.outdated_nodes,
+                "results": results,
+            })
+        });
         serde_json::json!({
             "source": self.source,
             "size": self.size,
@@ -777,6 +947,7 @@ impl StateSnapshot {
             "game_summary": game_summary,
             "viewport_commands": self.viewport_commands,
             "reference": reference,
+            "ref_scan": ref_scan,
             "solving": self.solving,
             "answer_shown": self.answer_shown,
             "judge_notice": self.judge_notice,

@@ -516,6 +516,49 @@ impl Driver {
                     self.app.unload_reference_pub();
                     self.tick_default();
                 }
+                // 参照库打分（阶段 22.3）：
+                //   refscan on [max]  发起打分（可选手数范围上限，默认 30）
+                //   refscan off       取消打分
+                //   refscan plan [max]  离线打印扫描计划（链数/每链 turns/节点数/摆子数）
+                "refscan" => {
+                    let (sub, arg) = rest.split_once(' ').unwrap_or((rest, ""));
+                    match sub {
+                        "on" => {
+                            let max = arg.trim().parse::<usize>().unwrap_or(
+                                guanqi::ui::analysis::REFSCAN_MAX_MOVE_NO,
+                            );
+                            let started = self.app.start_ref_scan_pub(max);
+                            self.tick_default();
+                            if let Err(reason) = started {
+                                println!("[refscan] 发起失败：{reason}");
+                            }
+                        }
+                        "off" => {
+                            self.app.cancel_ref_scan_pub();
+                            self.tick_default();
+                        }
+                        "plan" => {
+                            let max = arg.trim().parse::<usize>().unwrap_or(
+                                guanqi::ui::analysis::REFSCAN_MAX_MOVE_NO,
+                            );
+                            match self.app.ref_scan_plan_digest_pub(max) {
+                                Some((chains, turns, positions, setup)) => println!(
+                                    "[refscan-plan] 链数 {chains}，每链 turns {:?}，\
+                                     总节点数 {positions}，根摆子数 {setup}（范围 ≤ {max} 手）",
+                                    turns,
+                                ),
+                                None => println!("[refscan-plan] 无参照（先 ref <sgf>）"),
+                            }
+                            self.tick_default();
+                        }
+                        other => {
+                            return Err(format!(
+                                "refscan 参数非法：{other}（on / off / plan）{}",
+                                label()
+                            ));
+                        }
+                    }
+                }
                 // 解题模式（阶段 22.2）：solve on|off = 开关（菜单同一
                 // 执行体）；solve retry = 重试本题（恢复题谱初始含摆子）；
                 // solve answer = 看答案（显示参照续法并留痕）。
