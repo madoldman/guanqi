@@ -1,5 +1,9 @@
 # Maintainer: 刘传玉
-# 观棋 —— KataGo 围棋 AI 引擎图形前端（本地打包，暂不提交 AUR）
+# 观棋 —— KataGo 围棋 AI 引擎图形前端
+#
+# 用途：**仅本地构建与安装验证**。作者 2026-09-28 定案：RPM / DEB 打包与 AUR 上传均不做，
+# 本 PKGBUILD 不作为对外分发渠道推进（验证 release 构建、离线依赖打包、
+# 运行时依赖声明、桌面集成是否成立）。
 #
 # 打包方式（实际构建在仓库外进行，例如 /home/madoldman/build/guanqi-pkg/）：
 #   1) 生成源码包（仓库根目录执行。用 git archive：只打包已提交内容，
@@ -19,8 +23,8 @@
 #      之类的字符串抽查确认新功能确实进了包。
 #
 # 共用资源：桌面入口与图标位于仓库 `resources/`（`resources/guanqi.desktop`、
-# `resources/icons/guanqi.svg` 与各尺寸 PNG）—— 放仓库共用目录而非本目录，
-# 供后续 RPM / DEB 等打包方式复用；本 PKGBUILD 从源码包内引用它们。
+# `resources/icons/guanqi.svg` 与各尺寸 PNG）—— 放仓库共用目录而非打包目录，
+# 使资源不与某个打包方式绑死；本 PKGBUILD 从源码包内引用它们。
 
 pkgname=guanqi
 pkgver=0.1.0
@@ -58,7 +62,7 @@ optdepends=(
 )
 
 # 本地源：源码 tarball（含 resources/ 下的桌面入口与图标）+ 离线依赖 tarball。
-# 注意：源码 tarball 由工作树生成，源码有任何改动都要重新生成并更新下面的第一个 sha256。
+# 注意：源码包由 `git archive` 生成（只含已提交内容），有新提交就要重新生成并更新第一个 sha256。
 source=(
   "guanqi-$pkgver.tar.gz"
   'vendor.tar.gz'
@@ -95,7 +99,7 @@ package() {
   cd "guanqi-$pkgver"
   # 主程序（用户端只拿预编译二进制，不接触 cargo/crates.io）
   install -Dm755 "$srcdir/target/release/guanqi" "$pkgdir/usr/bin/guanqi"
-  # 桌面入口与图标：来自源码包内的共用资源目录 resources/（RPM / DEB 亦复用同一批文件）
+  # 桌面入口与图标：来自源码包内的共用资源目录 resources/
   install -Dm644 "resources/guanqi.desktop" "$pkgdir/usr/share/applications/guanqi.desktop"
   install -Dm644 "resources/icons/guanqi.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/guanqi.svg"
   local _s
