@@ -1460,6 +1460,12 @@ impl AnalysisState {
         &self.engine_warnings
     }
 
+    /// 最近一次实际发出的查询原文（含真实 id；headless 验证工具取证用，
+    /// 见 [`crate::engine::Engine::last_request`]）。引擎未启动时 `None`。
+    pub fn last_query(&self) -> Option<&str> {
+        self.handle.as_ref().and_then(|handle| handle.last_request())
+    }
+
     /// 引擎 stderr 最近几行（`LOG_TAIL_LINES` 条以内；诊断缓冲，当前
     /// 侧栏只显示最后一行，此切片供错误态展开展示）。
     pub fn log_tail_slice(&self) -> impl Iterator<Item = &str> {

@@ -196,6 +196,10 @@ pub struct Engine {
     /// 不缓存——它只管转发，缓存放消费侧可同时覆盖「读线程转发」与
     /// 「退出时取尾」两个时机，无需加锁。
     stderr_tail: std::collections::VecDeque<String>,
+    /// 最近一次**实际写入引擎 stdin** 的查询原文（含真实 id）。
+    /// 仅供 headless 验证工具从结构化快照取证（验证「发出的字段名与
+    /// 引擎认的字段名一致」这类问题）；发送走的是同一字符串，无行为差异。
+    last_request: Option<String>,
 }
 
 /// [`EngineEvent::Exited`] 携带的 stderr 尾行数：崩溃原因几乎总在最后
@@ -244,6 +248,7 @@ impl Engine {
             startup_timeout_emitted: false,
             exit_reported: false,
             stderr_tail: std::collections::VecDeque::with_capacity(STDERR_TAIL_LINES),
+            last_request: None,
         })
     }
 
@@ -263,7 +268,11 @@ impl Engine {
             deadline: Instant::now() + timeout,
             timeout,
         });
-        if let Err(e) = self.process.write_line(&query.encode(id)) {
+        // 先编码再留档：留档字符串与送往 stdin 的字符串**同一份**
+        // （验证工具据它核对实际发出的字段名，见字段文档）。
+        let line = query.encode(id);
+        self.last_request = Some(line.clone());
+        if let Err(e) = self.process.write_line(&line) {
             self.pending.remove(&id);
             self.push_external(EngineEvent::Failed(e));
         }
@@ -273,6 +282,12 @@ impl Engine {
     /// 终止在飞的查询（局面变化时调用；引擎会为该查询补发终态报告）。
     pub fn terminate(&mut self, id: QueryId) {
         self.send_control(ControlRequest::Terminate(id));
+    }
+
+    /// 最近一次实际写入引擎 stdin 的查询原文（含真实 id；headless
+    /// 验证工具经结构化快照取证，见字段文档）。
+    pub fn last_request(&self) -> Option<&str> {
+        self.last_request.as_deref()
     }
 
     /// 终止全部在飞查询。

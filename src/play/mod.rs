@@ -282,10 +282,13 @@ pub fn engine_winrate(engine: Stone, snapshot: &Snapshot) -> Option<f64> {
     })
 }
 
-/// 引擎「无望」提示是否应当给出：走子口径终态报告里引擎方胜率 ≤ 5%，
-/// 且本次对局尚未提示过。提示**不自动认输**——是否判引擎认输由人类确认。
-pub fn should_show_hopeless(state: &PlayState, snapshot: Option<&Snapshot>) -> bool {
-    if !state.mode || state.resigned.is_some() || state.hopeless_shown {
+/// 引擎方（人类对手）此刻是否已被判定「无望」：走子口径终态报告里引擎
+/// 方胜率 ≤ 5%。**不看「已提示」标记**——这是「让引擎认输」入口的
+/// 可用性口径，只要对局进行中且条件持续成立，入口就应持续可用
+/// （修复：此前菜单误用 [`should_show_hopeless`]，提示展示的同一帧把
+/// `hopeless_shown` 置 true 后入口被永久禁用）。
+pub fn engine_hopeless(state: &PlayState, snapshot: Option<&Snapshot>) -> bool {
+    if !state.mode || state.resigned.is_some() {
         return false;
     }
     snapshot.is_some_and(|s| {
@@ -293,9 +296,24 @@ pub fn should_show_hopeless(state: &PlayState, snapshot: Option<&Snapshot>) -> b
     })
 }
 
+/// 引擎「无望」提示是否应当给出：条件成立（[`engine_hopeless`]）且本次
+/// 对局尚未提示过（一次性）。提示**不自动认输**——是否判引擎认输由
+/// 人类确认。
+pub fn should_show_hopeless(state: &PlayState, snapshot: Option<&Snapshot>) -> bool {
+    !state.hopeless_shown && engine_hopeless(state, snapshot)
+}
+
 /// 标记无望提示已给过（界面展示该提示时调用）。
 pub fn mark_hopeless_shown(state: &mut PlayState) {
     state.hopeless_shown = true;
+}
+
+impl PlayState {
+    /// 「无望提示已给过」标记（headless 验证工具经结构化快照取证用；
+    /// 展示逻辑一律走 [`should_show_hopeless`] 与 [`mark_hopeless_shown`]）。
+    pub fn hopeless_shown(&self) -> bool {
+        self.hopeless_shown
+    }
 }
 
 /// 认输结果文本（`side` 为认输方）。

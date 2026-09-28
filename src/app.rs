@@ -779,10 +779,12 @@ impl GuanqiApp {
         }
     }
 
-    /// 引擎无望提示当前是否可用（与侧栏提示区的判定同源，供菜单置灰
-    /// 决策；**不**消费「已提示」标记——真正的消费在 `ui` 的提示区）。
+    /// 引擎方「无望」条件当前是否成立（「让引擎认输」入口的启用依据）。
+    /// 与**一次性的提示展示**（`should_show_hopeless`，消费「已提示」
+    /// 标记）刻意分开：入口可用性随局面持续成立，不因「提示已给过」
+    /// 而失效。
     fn hopeless_now(&self) -> bool {
-        play::should_show_hopeless(&self.play, self.analysis.snapshot.as_ref())
+        play::engine_hopeless(&self.play, self.analysis.snapshot.as_ref())
     }
 
     /// 人类认输（菜单入口；与侧栏「认输」按钮执行体完全相同）。
@@ -2787,10 +2789,35 @@ pub struct StateSnapshot {
     pub transient_error: Option<String>,
     /// 最近一条引擎日志（诊断用）。
     pub last_log: Option<String>,
+    /// 引擎「顶层未知字段」警告的展示文本（按字段名去重；空 = 无警告）。
+    /// 验证「发出的字段名引擎是否认识」的关键旁证（引擎对未知顶层字段
+    /// 会发 warning 且静默忽略，字段拼错时这里必有记录）。
+    pub engine_warnings: Vec<String>,
+    /// 最近一次**实际写入引擎 stdin** 的查询原文（含真实 id）。用于
+    /// 核对「发出的 JSON 字段名」与引擎语义（headless 验证工具取证）。
+    pub last_query: Option<String>,
+    /// 当前快照里带候选级 ownership 的候选数（`includeMovesOwnership`
+    /// 生效与否的直接证据）。
+    pub moves_with_ownership: usize,
+    /// 首个带候选级 ownership 的候选的数组长度（= size²）。
+    pub moves_ownership_len: Option<usize>,
+    /// 当前快照里带 `pvVisits` 的候选数（`includePVVisits` 生效与否的
+    /// 直接证据）。
+    pub moves_with_pv_visits: usize,
+    /// 首个带 `pvVisits` 的候选的数组长度（= 该候选 PV 长度）。
+    pub pv_visits_len: Option<usize>,
     /// 对弈模式是否开启。
     pub play_mode: bool,
     /// 人类执子（`B` / `W`）。
     pub human: String,
+    /// 「引擎方无望（人类大优）」判定：与「让引擎认输」菜单项的启用
+    /// 条件同源（[`crate::play::engine_hopeless`]）。`true` = 菜单项
+    /// 此刻应可用。
+    pub hopeless: bool,
+    /// 「无望提示已给过」标记（[`crate::play::PlayState::hopeless_shown`]）。
+    /// 提示是一次性的，而菜单入口的可用性不该被它消费——两者并列取证
+    /// 可判别「条件从未满足」与「满足过但入口被标记污染」。
+    pub hopeless_shown: bool,
     /// 认输方（`B` / `W`）；对局因认输结束时非空。
     pub resigned: Option<String>,
     /// 超时判负方；与认输并列的独立终局路径。
@@ -2919,6 +2946,42 @@ impl GuanqiApp {
                 .map_or(0, |snap| snap.moves.len()),
             transient_error: self.analysis.transient_error.clone(),
             last_log: self.analysis.last_log.clone(),
+            engine_warnings: self
+                .analysis
+                .engine_warnings()
+                .iter()
+                .map(|w| w.text.clone())
+                .collect(),
+            last_query: self.analysis.last_query().map(str::to_owned),
+            moves_with_ownership: self.analysis.snapshot.as_ref().map_or(0, |snap| {
+                snap.moves.iter().filter(|m| m.ownership.is_some()).count()
+            }),
+            moves_ownership_len: self
+                .analysis
+                .snapshot
+                .as_ref()
+                .and_then(|snap| {
+                    snap.moves
+                        .iter()
+                        .find_map(|m| m.ownership.as_ref().map(|v| v.len()))
+                }),
+            moves_with_pv_visits: self.analysis.snapshot.as_ref().map_or(0, |snap| {
+                snap.moves.iter().filter(|m| m.pv_visits.is_some()).count()
+            }),
+            pv_visits_len: self
+                .analysis
+                .snapshot
+                .as_ref()
+                .and_then(|snap| {
+                    snap.moves
+                        .iter()
+                        .find_map(|m| m.pv_visits.as_ref().map(|v| v.len()))
+                }),
+            hopeless: crate::play::engine_hopeless(
+                &self.play,
+                self.analysis.snapshot.as_ref(),
+            ),
+            hopeless_shown: self.play.hopeless_shown(),
             play_mode: self.play.mode,
             human: self.play.human.name().to_owned(),
             resigned: self.play.resigned.map(|s| s.name().to_owned()),
@@ -2970,6 +3033,19 @@ impl StateSnapshot {
     /// 单行 JSON 序列化（`serde_json` 已在依赖树内；库类型本身不派生
     /// serde，序列化面集中在这里，格式化与展示仍归 examples 工具）。
     pub fn to_json(&self) -> String {
+        // 取证字段单独成一个子对象：`json!` 宏按顶层键数递归展开，顶层键
+        // 加到一定数量会撞编译器的宏递归上限（本宏原本已接近），拆成第二
+        // 个宏调用后各自的展开深度独立，无需提高 crate 的 recursion_limit。
+        let probe = serde_json::json!({
+            "engine_warnings": self.engine_warnings,
+            "last_query": self.last_query,
+            "moves_with_ownership": self.moves_with_ownership,
+            "moves_ownership_len": self.moves_ownership_len,
+            "moves_with_pv_visits": self.moves_with_pv_visits,
+            "pv_visits_len": self.pv_visits_len,
+            "hopeless": self.hopeless,
+            "hopeless_shown": self.hopeless_shown,
+        });
         serde_json::json!({
             "source": self.source,
             "size": self.size,
@@ -2988,6 +3064,7 @@ impl StateSnapshot {
             "candidates": self.candidates,
             "transient_error": self.transient_error,
             "last_log": self.last_log,
+            "probe": probe,
             "play_mode": self.play_mode,
             "human": self.human,
             "resigned": self.resigned,

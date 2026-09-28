@@ -481,10 +481,11 @@ fn clock_rows(ui: &mut Ui, play: &PlayState, to_play: Stone, finished: bool) {
     }
 }
 
-/// 引擎无望提示当前是否可用（与「对局」菜单置灰判定同源）。
+/// 引擎无望条件当前是否成立（「对局」菜单「让引擎认输」入口的启用判定；
+/// 与一次性提示的展示判定分开，见 `play::engine_hopeless`）。
 /// 无望提示的展示在状态卡（纯文本）；「让引擎认输」在菜单。
 fn hopeless_available(play: &PlayState, analysis: &AnalysisState) -> bool {
-    crate::play::should_show_hopeless(play, analysis.snapshot.as_ref())
+    crate::play::engine_hopeless(play, analysis.snapshot.as_ref())
 }
 
 /// 「对局状态」卡片（纯展示）：对弈中显示「你执X」、本局规则与时限
