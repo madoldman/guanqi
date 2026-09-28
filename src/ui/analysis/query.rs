@@ -12,6 +12,7 @@ use crate::engine::{
 use super::batch::INTERACTIVE_PRIORITY;
 use super::display::DisplayView;
 use super::limits::move_rules_of;
+use super::thinking;
 use super::types::{position_sig, EngineStatus, Snapshot};
 use super::{AnalysisState, Waker, LOG_TAIL_LINES, REPORT_EVERY_SECS};
 
@@ -365,12 +366,23 @@ impl AnalysisState {
             return; // 旧查询被 terminate 后的补发终态：局面已变，丢弃
         }
         let (stage, turn, started) = (inflight.stage, inflight.turn, inflight.started);
-        let mut moves = report.move_infos;
+        let moves = report.move_infos;
+        let root = report.root_info;
         // 候选表快照在 moves 被 move 进快照前提取（终态才用得到，
         // 但提前提取成本可忽略：表长 ≤ 候选数）。
         let (candidates, candidates_total, candidates_best) = Self::candidates_from(&moves);
-        moves.sort_by_key(|info| info.order);
-        let root = report.root_info;
+        // 思考过程记录：**只记中间报告**（终态照旧写快照 / 逐手历史——
+        // 记录只描述过程，终态是结果），且只在展示口径（走子不开流式，
+        // 本就无中间报告；条件冗余但语义显式）。放在 moves 被 move 进
+        // 快照之前，借引用蒸馏，O(1) 分配 / 条，不拖慢报告路径。
+        if stage == Stage::Analysis && !is_final {
+            let entry = thinking::ThinkingEntry::from_report(
+                started.elapsed(),
+                root.as_ref().map_or(0, |root| root.visits),
+                &moves,
+            );
+            self.thinking.record(entry);
+        }
         let snapshot = Snapshot {
             turn,
             size: board.size(),
@@ -547,6 +559,12 @@ impl AnalysisState {
         // 展示口径开启流式中间报告（边搜边刷新界面）；走子口径只认终态。
         if stage.streaming() {
             query.report_during_search_every = Some(REPORT_EVERY_SECS);
+            // 新的展示查询开始：思考记录清空重记（它描述的是「这一次
+            // 搜索」，见 `thinking` 模块文档）。放在 `stage.streaming()`
+            // 判断内 = 只有开流式的查询重置记录；走子口径与批量查询
+            // （都不经此分支）绝不误清——对弈时「先 Play 后补展示」，
+            // 若 Play 也清，展示查询的记录会在落位前被走子查询抹掉。
+            self.thinking.begin_search();
         }
         // 选点限制（限定区域 / 排除选点）随查询发给引擎，展示与走子口径
         // 都受限（区域模式研究局部时，引擎应手也应在局部走才自然）。

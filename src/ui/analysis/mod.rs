@@ -58,10 +58,12 @@ mod display;
 mod history;
 mod limits;
 mod query;
+mod thinking;
 mod types;
 
 use query::{Inflight, Stage, TerminalEval};
 use limits::LimitsEpoch;
+use thinking::ThinkingLog;
 
 pub use types::{
     loss_from_points, move_block_text, result_block_text, stats_block_text, terminal_result_string,
@@ -75,6 +77,7 @@ pub(crate) use display::display_values;
 pub use display::{CandidateGating, DisplayView};
 pub use limits::{AnalysisLimits, Region};
 pub use query::EngineWarning;
+pub use thinking::{Stability, ThinkingEntryRef};
 pub use batch::{
     batch_estimate, format_batch_elapsed, BatchConfig, BatchEstimate, BatchSide, BATCH_VISITS,
 };
@@ -225,6 +228,12 @@ pub struct AnalysisState {
     /// 「入口加的」与「用户手动右键 / 候选行加的」。`None` = 入口当前
     /// 未排除任何手（或已被用户从菜单手动移除，见 `avoid_top_pinned`）。
     avoid_pin: Option<(Stone, Coord)>,
+    /// 当前展示查询的**思考过程记录**（流式中间报告蒸馏的时间线 + 稳定
+    /// 性读数，见 [`thinking`] 模块文档）。只描述「这一次搜索」：新的展示
+    /// 查询发出即清空重记（`request` 内），换谱 / 新对局随 `reset` 清空；
+    /// 走子口径（不开流式）与批量查询（独立口径）不经过本字段。容量
+    /// [`THINKING_CAP`] 条，超限丢最早。
+    thinking: ThinkingLog,
 }
 
 
@@ -269,6 +278,7 @@ impl AnalysisState {
             rules_notice_slot: std::cell::Cell::new(None),
             terminal_eval: None,
             avoid_pin: None,
+            thinking: ThinkingLog::default(),
         }
     }
 
@@ -490,6 +500,34 @@ impl AnalysisState {
         }
     }
 
+    // ---- 思考过程记录与回放（阶段 21 #2）----
+
+    /// 当前查询的思考记录条数（0 = 本次无思考过程：对弈走子查询 / 快扫
+    /// / 树缓存秒回都属此类，侧栏如实显示，不区分原因）。
+    pub fn thinking_len(&self) -> usize {
+        self.thinking.len()
+    }
+
+    /// 回放游标取一条思考记录：`index` 为时间线内下标，越界返回 `None`。
+    /// 滑杆拖到哪显示哪；「最新一条」由调用方用
+    /// `index + 1 == thinking_len()` 判定。
+    pub fn thinking_entry(&self, index: usize) -> Option<ThinkingEntryRef<'_>> {
+        self.thinking.get(index).map(|entry| ThinkingEntryRef {
+            elapsed: entry.elapsed,
+            visits: entry.visits,
+            best: entry.best,
+            top: &entry.top,
+            top_len: entry.top_len,
+        })
+    }
+
+    /// 结论稳定性读数（首选翻转次数与最后翻转耗时，见 [`Stability`]）。
+    /// 门控隐藏选点时读数**仍然可显示**：它不含任何具体选点，
+    /// 与「不剧透」不冲突（翻转次数本身不告诉用户该走哪里）。
+    pub fn thinking_stability(&self) -> Stability {
+        self.thinking.stability()
+    }
+
     // ---- 终局评估（双方弃着终局的 RE 依据）----
 
     /// 请求对当前局面做终局评估（App 在双方弃着终局时调用）：现有终态
@@ -565,6 +603,9 @@ impl AnalysisState {
         self.play_snapshot = None;
         self.play_sig = None;
         self.terminal_eval = None;
+        // 思考过程随谱走：换谱 / 新对局后旧记录描述的是别的局面与查询，
+        // 保留只会误导（新查询发出时也会清，这里提前清保口径一致）。
+        self.thinking.clear();
     }
 
     /// 退出时优雅关闭引擎进程（`App::on_exit` 调用）。

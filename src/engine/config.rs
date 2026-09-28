@@ -73,6 +73,8 @@ pub struct UiPrefs {
     pub curve_open: bool,
     /// 棋谱树底部面板。
     pub tree_open: bool,
+    /// 侧栏「思考过程」卡片（稳定性读数 + 时间轴回放，阶段 21 #2）。
+    pub thinking_open: bool,
     /// ---- 候选类显示门控（立即 / 延迟 N 秒 / 手动）----
     /// `immediate` / `delayed` / `manual`；未识别值由加载层回退
     /// `immediate` 并提示（见 `load_settings` 的逐字段容错）。
@@ -125,6 +127,10 @@ impl Default for UiPrefs {
             show_mini_board: false,
             curve_open: true,
             tree_open: false,
+            // 思考过程卡片默认开：内容轻、不占棋盘空间，且「结论怎么
+            // 形成的」是分析结果的一部分——默认可见与「分析数据随搜索
+            // 实时刷新」的定位一致（用户嫌多可一键关）。
+            thinking_open: true,
             candidate_gating: "immediate".to_owned(),
             gating_delay_secs: 3,
             display_view: "black".to_owned(),

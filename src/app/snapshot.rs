@@ -65,6 +65,9 @@ pub struct StateSnapshot {
     /// 根盘面的预设摆子（GTP 坐标，黑 / 白两组）：与查询里的
     /// `initialStones` 逐点对照取证用。
     pub root_setup: (Vec<String>, Vec<String>),
+    /// 思考过程记录（阶段 21 #2）：条数、稳定性读数与全部条目的蒸馏
+    /// （验证记录增长 / cap / 稳定性复算 / 门控联动 / 清空路径的取证源）。
+    pub thinking: ThinkingSnapshot,
     /// 对弈模式是否开启。
     pub play_mode: bool,
     /// 人类执子（`B` / `W`）。
@@ -122,6 +125,38 @@ pub struct EngineReads {
     pub score_lead: f64,
 }
 
+/// 思考过程记录的取证快照（阶段 21 #2；headless dump 用）。
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct ThinkingSnapshot {
+    /// 记录条数。
+    pub count: usize,
+    /// 首选翻转次数（增量维护，见 `analysis::thinking`）。
+    pub flips: u32,
+    /// 最后一次翻转的耗时（秒）；从未翻转为 `None`。
+    pub last_flip_secs: Option<f32>,
+    /// 稳定性文案（与侧栏同一 `Stability::text`，对账用）。
+    pub stability_text: String,
+    /// 全部条目的蒸馏（按时间线序）。
+    pub entries: Vec<ThinkingEntryDump>,
+}
+
+/// 一条思考记录的取证形态。
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct ThinkingEntryDump {
+    /// 距查询发出的耗时（秒）。
+    pub secs: f32,
+    /// 该时刻根节点 visits。
+    pub visits: u64,
+    /// 当时首选（GTP 坐标；弃着 / 无候选为 `None`）。
+    pub best: Option<String>,
+    /// 首选黑方胜率 [0,1]。
+    pub best_wr: Option<f64>,
+    /// 前几名概要（GTP 坐标, 胜率, visits）。
+    pub top: Vec<(String, f64, u64)>,
+}
+
 /// 面板 / 窗口开关集合（dump 用）。
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
@@ -137,6 +172,8 @@ pub struct Toggles {
     /// 底部面板。
     pub curve_open: bool,
     pub tree_open: bool,
+    /// 侧栏「思考过程」卡片开关。
+    pub thinking_open: bool,
     /// 浮动窗口。
     pub settings_open: bool,
     pub new_game_open: bool,
@@ -243,6 +280,36 @@ impl GuanqiApp {
                     white.iter().map(|c| c.to_gtp(self.board.size())).collect::<Vec<_>>(),
                 )
             },
+            thinking: {
+                let stability = self.analysis.thinking_stability();
+                let count = self.analysis.thinking_len();
+                let entries = (0..count)
+                    .filter_map(|i| self.analysis.thinking_entry(i))
+                    .map(|entry| ThinkingEntryDump {
+                        secs: entry.elapsed.as_secs_f32(),
+                        visits: entry.visits,
+                        best: entry.best.map(|(at, _)| at.to_gtp(self.board.size())),
+                        best_wr: entry.best.map(|(_, wr)| wr),
+                        top: entry
+                            .top
+                            .iter()
+                            .take(entry.top_len)
+                            .filter_map(|slot| {
+                                slot.map(|(at, wr, visits)| {
+                                    (at.to_gtp(self.board.size()), wr, visits)
+                                })
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                ThinkingSnapshot {
+                    count,
+                    flips: stability.flips,
+                    last_flip_secs: stability.last_flip.map(|d| d.as_secs_f32()),
+                    stability_text: stability.text(),
+                    entries,
+                }
+            },
             hopeless: crate::play::engine_hopeless(
                 &self.play,
                 self.analysis.snapshot.as_ref(),
@@ -281,6 +348,7 @@ impl GuanqiApp {
                 show_mini_board: self.overlay.show_mini_board,
                 curve_open: self.curve_open,
                 tree_open: self.tree_open,
+                thinking_open: self.thinking_open,
                 settings_open: self.settings_open,
                 new_game_open: self.new_game_open,
             },
@@ -314,6 +382,21 @@ impl StateSnapshot {
             "hopeless": self.hopeless,
             "hopeless_shown": self.hopeless_shown,
             "root_setup": { "black": self.root_setup.0, "white": self.root_setup.1 },
+            "thinking": {
+                "count": self.thinking.count,
+                "flips": self.thinking.flips,
+                "last_flip_secs": self.thinking.last_flip_secs,
+                "stability_text": self.thinking.stability_text,
+                "entries": self.thinking.entries.iter().map(|e| serde_json::json!({
+                    "secs": e.secs,
+                    "visits": e.visits,
+                    "best": e.best,
+                    "best_wr": e.best_wr,
+                    "top": e.top.iter().map(|(at, wr, v)| serde_json::json!({
+                        "at": at, "wr": wr, "visits": v,
+                    })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+            },
         });
         serde_json::json!({
             "source": self.source,
@@ -361,6 +444,7 @@ impl StateSnapshot {
                 "show_mini_board": self.toggles.show_mini_board,
                 "curve_open": self.toggles.curve_open,
                 "tree_open": self.toggles.tree_open,
+                "thinking_open": self.toggles.thinking_open,
                 "settings_open": self.toggles.settings_open,
                 "new_game_open": self.toggles.new_game_open,
             },

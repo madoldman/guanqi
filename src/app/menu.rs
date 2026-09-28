@@ -591,10 +591,15 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
                 }
             }
         });
-        // ---- 底部面板：胜率曲线 / 棋谱树（小棋盘归叠加层，不重复）----
+        // ---- 底部面板：胜率曲线 / 棋谱树（小棋盘归叠加层，不重复）；
+        // 思考过程卡片在侧栏（内容轻：一行读数 + 滑杆 + 几行概要，
+        // 侧栏卡片比底部薄面板更合身），开关也放这里便于集中找到 ----
         ui.menu_button("面板", |ui| {
             ui.checkbox(&mut self.curve_open, "胜率曲线");
             ui.checkbox(&mut self.tree_open, "棋谱树");
+            ui.checkbox(&mut self.thinking_open, "思考过程卡片").on_hover_text(
+                "侧栏显示本次分析的稳定性读数与时间轴回放（首选翻转、何时稳定）",
+            );
         });
     });
 }

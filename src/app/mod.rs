@@ -85,6 +85,9 @@ pub struct GuanqiApp {
     curve_open: bool,
     /// 棋谱树底部面板是否显示（面板隐藏时不创建，零开销）。
     tree_open: bool,
+    /// 侧栏「思考过程」卡片是否显示（阶段 21 #2；隐藏时不渲染卡片，
+    /// 零开销。开关在「分析 → 面板」，随 ui_prefs 持久化）。
+    thinking_open: bool,
     /// 棋谱树控件跨帧状态（布局缓存与自动滚动记忆）。
     tree_ui: tree::TreeUi,
     /// 小棋盘 PV 回放状态机（第 6 项；开关在叠加层卡片，默认关）。
@@ -401,6 +404,7 @@ impl GuanqiApp {
             },
             curve_open: prefs.curve_open,
             tree_open: prefs.tree_open,
+            thinking_open: prefs.thinking_open,
             tree_ui: tree::TreeUi::default(),
             mini_board: mini_board::MiniBoard::default(),
             tree_epoch: 0,
@@ -537,6 +541,7 @@ impl GuanqiApp {
             show_mini_board: overlay.show_mini_board,
             curve_open: self.curve_open,
             tree_open: self.tree_open,
+            thinking_open: self.thinking_open,
             candidate_gating: match self.analysis.gating() {
                 crate::ui::analysis::CandidateGating::Immediate => "immediate".to_owned(),
                 crate::ui::analysis::CandidateGating::Delayed { secs } => {
@@ -675,6 +680,7 @@ impl eframe::App for GuanqiApp {
                     &self.play,
                     hopeless_text.as_deref(),
                     &doc_entries,
+                    self.thinking_open,
                 );
             });
         match panel_action {

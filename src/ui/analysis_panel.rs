@@ -24,7 +24,9 @@ use crate::engine::EngineConfig;
 use crate::play::{PlayState, resign_text};
 use crate::sgf::GameMeta;
 
-use super::analysis::{display_values, AnalysisState, EngineStatus, GameSummary, Severity, WORST_LIMIT};
+use super::analysis::{
+    display_values, AnalysisState, EngineStatus, GameSummary, Severity, ThinkingEntryRef, WORST_LIMIT,
+};
 use super::explain;
 use super::overlay::{self, Overlay};
 use super::theme;
@@ -332,6 +334,7 @@ pub fn show(
     play: &PlayState,
     hopeless: Option<&str>,
     docs: &[DocEntry],
+    thinking_open: bool,
 ) -> PanelAction {
     egui::ScrollArea::vertical()
         .show(ui, |ui| {
@@ -354,6 +357,7 @@ pub fn show(
                 play,
                 hopeless,
                 docs,
+                thinking_open,
             )
         })
         .inner
@@ -384,6 +388,7 @@ fn panel_body(
     play: &PlayState,
     hopeless: Option<&str>,
     docs: &[DocEntry],
+    thinking_open: bool,
 ) -> PanelAction {
     let mut action = PanelAction::None;
 
@@ -430,6 +435,12 @@ fn panel_body(
 
     // ---- 候选点（点击定位 / 排除 / 沿主变前进——展示固有交互）----
     card_candidates(ui, analysis, overlay, manual_revealed, &mut action);
+
+    // ---- 引擎思考过程（阶段 21 #2：稳定性读数 + 时间轴回放；
+    // `thinking_open` 为「分析 → 面板」里的开关，与曲线 / 棋谱树同款）----
+    if thinking_open {
+        card_thinking(ui, analysis, manual_revealed);
+    }
 
     // ---- 失误统计（TASKS 4.4）----
     card_mistakes(ui, analysis, board);
@@ -1652,5 +1663,152 @@ fn player_line(name: &Option<String>, rank: &Option<String>) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join(" "),
         ),
+    }
+}
+
+/// 「思考过程」卡片（阶段 21 #2）：当前展示查询的结论稳定性读数 +
+/// 时间轴回放。数据源为流式中间报告的蒸馏记录（`analysis::thinking`），
+/// 一条 = 一次「引擎当时怎么想」的快照。
+///
+/// **门控联动（本卡与门控机制最重要的交互）**：候选类内容被门控隐藏时
+/// （延迟未到 / 手动未按 F），卡片**不显示任何选点**——首选与前几名
+/// 概要都属于「剧透」，只保留耗时 / visits 等非选点信息；稳定性读数
+/// 不含具体选点（翻转次数不告诉用户该走哪里），照常显示。判定函数与
+/// 候选卡 / 棋盘叠加层同源（`candidates_visible`），口径绝不漂移。
+///
+/// 回放交互：滑杆拖动即回放该时刻的蒸馏数据；拖到最右（或未动过）
+/// 跟随最新报告。回放游标存 egui memory（按卡片 Id 键控），不进
+/// `AnalysisState`——它是纯显示状态，换局面 / 新查询后随记录清空自然
+/// 失效（游标被钳制到新长度，无需专门清理）。
+fn card_thinking(ui: &mut Ui, analysis: &AnalysisState, manual_revealed: bool) {
+    card(ui, |ui| {
+        theme::section_title(ui, "思考过程");
+        let count = analysis.thinking_len();
+        if count == 0 {
+            // 无记录：对弈走子查询 / 快扫 / 树缓存秒回都属此类，如实说明
+            // 而不区分原因（区分原因需要暴露内部口径，没必要）。
+            ui.weak("本次无思考过程——常规分析进行中会在这里记录引擎的中间结论。");
+            return;
+        }
+        // 稳定性读数：不含选点，门控隐藏时照常显示。
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(analysis.thinking_stability().text()).strong());
+            ui.weak(format!("（{count} 条记录）"));
+        });
+
+        // 门控判定：与候选卡同源。未放行时隐藏全部选点信息（含回放），
+        // 只显示非选点的耗时 / visits 读数，文案如实说明隐藏原因。
+        if !analysis.candidates_visible(manual_revealed) {
+            ui.add_space(2.0);
+            match analysis.gating() {
+                super::analysis::CandidateGating::Delayed { secs } => {
+                    ui.weak(format!(
+                        "选点信息延迟 {secs} 秒显示（与候选点同口径）；visits / 耗时实时刷新。"
+                    ));
+                }
+                super::analysis::CandidateGating::Manual => {
+                    ui.colored_label(
+                        Color32::from_rgb(150, 156, 166),
+                        "选点信息已隐藏——按 F 显示（手动模式，与候选点同口径）。",
+                    );
+                }
+                super::analysis::CandidateGating::Immediate => {}
+            }
+            // 门控期间的替代读数：最新一条的耗时与 visits（无选点）。
+            if let Some(latest) = analysis.thinking_entry(count - 1) {
+                ui.weak(format!(
+                    "最新：{:.1} 秒 · {} visits",
+                    latest.elapsed.as_secs_f32(),
+                    latest.visits,
+                ));
+            }
+            return;
+        }
+
+        // 回放游标：egui memory 按卡片 Id 键控；越界（新查询后记录更短）
+        // 时钳回最新，滑到最右 = 跟随最新。
+        let cursor_id = ui.id().with("thinking_cursor");
+        let mut cursor = ui
+            .ctx()
+            .data_mut(|d| d.get_temp::<usize>(cursor_id).unwrap_or(usize::MAX));
+        if cursor >= count {
+            cursor = count - 1;
+        }
+        ui.add_space(2.0);
+        let cursor_label = format!("{}/{}", cursor + 1, count);
+        ui.horizontal(|ui| {
+            ui.weak("回放");
+            ui.add_sized(
+                [ui.available_width(), 0.0],
+                egui::Slider::new(&mut cursor, 0..=count - 1)
+                    .show_value(false)
+                    .text(cursor_label),
+            )
+            .on_hover_text("拖动回放本次搜索的中间报告：每格 = 一条引擎中间结论（约每 0.5 秒一条）；拖到最右 = 跟随最新");
+        });
+        // 存回游标（本帧拖动后的值；下一帧取用）。
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(cursor_id, cursor));
+
+        // 当前游标条目的详情（Some = 门控放行后才走到这里，选点可显示）。
+        if let Some(entry) = analysis.thinking_entry(cursor) {
+            entry_details(ui, entry, board_size(analysis));
+        }
+        let latest = cursor + 1 == count;
+        if latest {
+            ui.weak("（跟随最新）");
+        } else {
+            ui.weak("（回放中，拖回最右跟随最新）");
+        }
+    });
+}
+
+/// 当前棋盘尺寸（思考记录详情的 GTP 坐标换算用）：从展示快照取——
+/// 记录与快照同源同局面；无快照时不该走到这里（有记录必有快照），
+/// 兜底 19 路只是防御，显示坐标极小概率错一尺寸。
+fn board_size(analysis: &AnalysisState) -> crate::board::Size {
+    analysis
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.size)
+        .unwrap_or_else(|| crate::board::Size::new(19).expect("19 为固定合法尺寸"))
+}
+
+/// 一条思考记录的详情：耗时 / visits / 首选（+胜率）/ 前几名概要。
+/// 胜率一律黑视角直读——记录为存储口径（恒黑视角），且未存行棋方
+/// （蒸馏取舍），黑白交替视角下无从换算，臆造翻转比少一个换算更糟。
+fn entry_details(ui: &mut Ui, entry: ThinkingEntryRef<'_>, size: crate::board::Size) {
+    ui.add_space(2.0);
+    info_line(ui, "耗时", &format!("{:.1} 秒", entry.elapsed.as_secs_f32()));
+    info_line(ui, "visits", &entry.visits.to_string());
+    let coord_text = |at: crate::board::Coord| at.to_gtp(size);
+    match entry.best {
+        Some((at, wr)) => {
+            info_line(
+                ui,
+                "当时首选",
+                &format!("{}（黑方 {:.1}%）", coord_text(at), wr * 100.0),
+            );
+        }
+        None => {
+            info_line(ui, "当时首选", "弃着（或引擎暂无候选）");
+        }
+    }
+    // 前几名概要：一行排开（回放时对比首选与次选的 visits 差最直观）。
+    if entry.top_len > 0 {
+        let parts: Vec<String> = entry
+            .top
+            .iter()
+            .take(entry.top_len)
+            .filter_map(|slot| {
+                slot.map(|(at, wr, visits)| {
+                    format!("{} {:.1}% ({})", coord_text(at), wr * 100.0, visits)
+                })
+            })
+            .collect();
+        info_line(ui, "前几名", &parts.join(" · ")).on_hover_text(
+            "该时刻搜索量前几名的候选：落点 黑方胜率 (该分支 visits)。\n\
+             visits 差越大 = 引擎对首选越笃定；差距缩小往往是翻转前兆。",
+        );
     }
 }
