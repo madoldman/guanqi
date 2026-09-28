@@ -1015,6 +1015,9 @@ struct BatchJob {
     /// 发起时的棋盘尺寸与贴目（块间跨帧，随查询重发）。
     size: Size,
     komi: f64,
+    /// 发起时的预设摆子（`root_setup()` 快照）：每块批量查询都随 moves
+    /// 一并发出，取值口径见 `send_batch_query`。
+    setup: Vec<(Stone, Coord)>,
     /// 发起时解析生效的规则规范名（整谱快扫与交互分析同口径）。
     rules: String,
     /// 发起时的目数视角（随查询发给引擎）。
@@ -2008,6 +2011,14 @@ impl AnalysisState {
             watch: board.records().to_vec(),
             size: board.size(),
             komi,
+            setup: {
+                let (black, white) = board.root_setup();
+                black
+                    .into_iter()
+                    .map(|at| (Stone::Black, at))
+                    .chain(white.into_iter().map(|at| (Stone::White, at)))
+                    .collect()
+            },
             // 规则 / 视角在发起时刻定格：任务存续期间口径不变（局面一变
             // 即取消，不存在口径漂移窗口）。
             rules: self.effective_rules(game_rules),
@@ -2098,6 +2109,7 @@ impl AnalysisState {
                         handle,
                         job.size,
                         job.komi,
+                        &job.setup,
                         &path,
                         &turns,
                         job.config.visits,
@@ -2143,6 +2155,7 @@ impl AnalysisState {
             handle,
             job.size,
             job.komi,
+            &job.setup,
             &path,
             &turns,
             job.config.deepen_visits,
@@ -2162,12 +2175,15 @@ impl AnalysisState {
     /// 发送一条批量查询（共用组装：路径 → moves，analyzeTurns，批量
     /// 优先级，不开流式、不要 ownership/policy——批量只填曲线与吻合度
     /// 候选表，省 60%+ 报告体积）。规则 / 视角随查询带上（口径与交互
-    /// 查询一致，快扫曲线才能与交互分析的曲线同源比较）。
+    /// 查询一致，快扫曲线才能与交互分析的曲线同源比较）。`turn 0` 即
+    /// 预设局面，因此摆子必须一并带上（turn 编号以真实着法计，摆子不占
+    /// turn），否则含摆子谱的快扫曲线整体错位。
     #[allow(clippy::too_many_arguments)]
     fn send_batch_query(
         handle: &mut Engine,
         size: Size,
         komi: f64,
+        setup: &[(Stone, Coord)],
         path: &[MoveRecord],
         turns: &[usize],
         visits: u32,
@@ -2179,6 +2195,7 @@ impl AnalysisState {
             .map(|record| (record.player, record.action))
             .collect();
         let mut query = AnalysisQuery::new(size, moves);
+        query.initial_stones = setup.to_vec();
         query.komi = komi;
         query.max_visits = Some(visits);
         query.analyze_turns = Some(turns.to_vec());
@@ -2689,6 +2706,16 @@ impl AnalysisState {
             .map(|record| (record.player, record.action))
             .collect();
         let mut query = AnalysisQuery::new(board.size(), moves);
+        // 预设摆子（让子 / 摆子谱的 AB/AW）随查询发给引擎：`records()` 按
+        // 设计只含预设之后的真实着法，摆子不在 moves 里，漏发它引擎看到的
+        // 就是另一个（少子、先后手错位）局面。从根盘面反推（同一事实来源，
+        // 见 `Board::root_setup`）；空盘局为空、线上省略字段。
+        let (setup_black, setup_white) = board.root_setup();
+        query.initial_stones = setup_black
+            .into_iter()
+            .map(|at| (Stone::Black, at))
+            .chain(setup_white.into_iter().map(|at| (Stone::White, at)))
+            .collect();
         query.komi = komi;
         // 规则：设置显式指定 > 棋谱 RU 宽容映射 > 默认 chinese。解析出的
         // 恒为规范名（绝不把 SGF 原始串发给引擎）；解析提示已由

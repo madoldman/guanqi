@@ -2806,6 +2806,9 @@ pub struct StateSnapshot {
     pub moves_with_pv_visits: usize,
     /// 首个带 `pvVisits` 的候选的数组长度（= 该候选 PV 长度）。
     pub pv_visits_len: Option<usize>,
+    /// 根盘面的预设摆子（GTP 坐标，黑 / 白两组）：与查询里的
+    /// `initialStones` 逐点对照取证用。
+    pub root_setup: (Vec<String>, Vec<String>),
     /// 对弈模式是否开启。
     pub play_mode: bool,
     /// 人类执子（`B` / `W`）。
@@ -2977,6 +2980,13 @@ impl GuanqiApp {
                         .iter()
                         .find_map(|m| m.pv_visits.as_ref().map(|v| v.len()))
                 }),
+            root_setup: {
+                let (black, white) = self.board.root_setup();
+                (
+                    black.iter().map(|c| c.to_gtp(self.board.size())).collect::<Vec<_>>(),
+                    white.iter().map(|c| c.to_gtp(self.board.size())).collect::<Vec<_>>(),
+                )
+            },
             hopeless: crate::play::engine_hopeless(
                 &self.play,
                 self.analysis.snapshot.as_ref(),
@@ -3036,6 +3046,8 @@ impl StateSnapshot {
         // 取证字段单独成一个子对象：`json!` 宏按顶层键数递归展开，顶层键
         // 加到一定数量会撞编译器的宏递归上限（本宏原本已接近），拆成第二
         // 个宏调用后各自的展开深度独立，无需提高 crate 的 recursion_limit。
+        // 根盘面摆子（headless 取证「查询里的 initialStones 是否与谱一致」）
+        // 已在 `state_snapshot` 填入 self.root_setup，这里直接引用。
         let probe = serde_json::json!({
             "engine_warnings": self.engine_warnings,
             "last_query": self.last_query,
@@ -3045,6 +3057,7 @@ impl StateSnapshot {
             "pv_visits_len": self.pv_visits_len,
             "hopeless": self.hopeless,
             "hopeless_shown": self.hopeless_shown,
+            "root_setup": { "black": self.root_setup.0, "white": self.root_setup.1 },
         });
         serde_json::json!({
             "source": self.source,

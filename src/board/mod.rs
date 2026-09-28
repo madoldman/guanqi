@@ -363,6 +363,30 @@ impl Board {
         }
     }
 
+    /// 根节点的预设摆子（黑、白两组坐标，根盘面遍历序）。
+    ///
+    /// 发给引擎 `initialStones` / 写回 SGF `AB`/`AW` 的数据来源。从根盘面
+    /// **直接反推**而非另存摆子列表：摆子允许无气块、且 `AE` 清除在结果
+    /// 盘面上不留痕迹（见 [`Board::linear_prefix`] 文档），只有根盘面本体
+    /// 才是无损事实。空盘局两组皆空。
+    pub fn root_setup(&self) -> (Vec<Coord>, Vec<Coord>) {
+        let grid = &self.nodes[0].grid;
+        let mut black = Vec::new();
+        let mut white = Vec::new();
+        for (index, stone) in grid.iter().enumerate() {
+            match stone {
+                Some(Stone::Black) => black.push(Coord::from_index(self.size, index).expect(
+                    "根盘面下标来自 size² 的遍历，from_index 必然成功",
+                )),
+                Some(Stone::White) => white.push(Coord::from_index(self.size, index).expect(
+                    "根盘面下标来自 size² 的遍历，from_index 必然成功",
+                )),
+                None => {}
+            }
+        }
+        (black, white)
+    }
+
     /// **全树**着法总数（含弃着，不含根节点）；与当前线无关。
     /// 界面手数分母请用 [`Board::line_len`]。
     pub fn move_count(&self) -> usize {

@@ -18,6 +18,18 @@
 //!   会立刻返回（实测 <0.1s），上层据此避免重复查询。
 //! - `ownership` 为 opt-in；排列与 [`crate::board::Coord::index`] 一致
 //!   （`y*size + x`，`y=0` 为顶行），正值 = 黑势。
+//! - **预设摆子 `initialStones`**（v1.18.2 实测，9 路手工报文对照）：
+//!   - 格式为 `[["B","E5"],["W","D4"]]` 形态的「颜色 × GTP 坐标」二元组
+//!     数组（GTP 坐标与 `moves` 同口径，列字母跳 `I`）；字段名拼错会触发
+//!     顶层未知字段警告（同下文 warning 条目），格式正确则无任何告警；
+//!   - **行棋方不需要单独字段**：引擎按 `moves` 的行棋方序列推断，
+//!     `moves[0]` 的颜色即第一手真实着法的行棋方（让子「白先」只需
+//!     moves[0] 为白）；`moves` 为空时从摆子数量差推断（9 黑 0 白 ⇒
+//!     currentPlayer=W，符合让子规则）；
+//!   - `moves` **允许同色连续**（对照实测：黑连摆 9 手 + 白 1 手的纯
+//!     moves 查询与 initialStones 摆子查询实质同值）——但本项目的摆子
+//!     仍必须走 initialStones：`records()` 按设计只含真实着法，把摆子
+//!     塞进 moves 会污染手数 / 签名等一切上层口径。
 //! - **视角字段 `overrideSettings.reportAnalysisWinratesAs`**（查询级，
 //!   v1.18.2 实测有效，对照报文见 [`WinrateView`]）：
 //!   - cfg 的 `reportAnalysisWinratesAs = BLACK` 可被它逐查询覆盖；
@@ -142,8 +154,9 @@ impl std::fmt::Display for QueryId {
 
 /// 一次分析请求。
 ///
-/// `moves` 为从初始盘面（恒空盘）到被分析局面的完整手数记录；
-/// 弃着用 [`Action::Pass`] 表示（序列化为 GTP 的 `"pass"`）。
+/// `moves` 为从初始盘面（`initial_stones` 摆出的预设局面）到被分析局面
+/// 的真实着法记录；弃着用 [`Action::Pass`] 表示（序列化为 GTP 的
+/// `"pass"`）。预设摆子**不在** `moves` 里，经 `initial_stones` 单独传达。
 #[derive(Clone, Debug)]
 pub struct AnalysisQuery {
     /// 棋盘尺寸。
@@ -152,7 +165,10 @@ pub struct AnalysisQuery {
     pub komi: f64,
     /// KataGo 规则串（如 `chinese` / `japanese` / `korean`），默认 `chinese`。
     pub rules: String,
-    /// 完整手数（行棋方 + 着法），按时间顺序。
+    /// 初始盘面上的预设摆子（让子 / 摆子谱的 `AB` / `AW`），按时间顺序。
+    /// 空盘局为空（线上省略字段，见 [`WireQuery::initial_stones`]）。
+    pub initial_stones: Vec<(Stone, Coord)>,
+    /// 真实着法（行棋方 + 着法），按时间顺序；不含预设摆子。
     pub moves: Vec<(Stone, Action)>,
     /// 查询级思考量上限；`None` 则省略字段、沿用 cfg 中的 `maxVisits`。
     /// 实测可覆盖 cfg 值。
@@ -255,12 +271,13 @@ impl MoveRule {
 }
 
 impl AnalysisQuery {
-    /// 构造查询：默认贴目 7.5、中国规则、黑视角、只分析最终局面。
+    /// 构造查询：默认贴目 7.5、中国规则、黑视角、只分析最终局面、空盘。
     pub fn new(board_size: Size, moves: Vec<(Stone, Action)>) -> Self {
         Self {
             board_size,
             komi: 7.5,
             rules: "chinese".to_owned(),
+            initial_stones: Vec::new(),
             moves,
             max_visits: None,
             include_ownership: false,
@@ -290,7 +307,10 @@ fn is_zero_i32(v: &i32) -> bool {
 #[serde(rename_all = "camelCase")]
 struct WireQuery<'a> {
     id: String,
-    /// 本项目初始恒为空盘；字段保留以符合协议形态。
+    /// 预设摆子（`initialStones`，v1.18.2 实测：`[["B","Q16"],["W","D4"]]`
+    /// 形态的 GTP 坐标数组，见 [`AnalysisQuery::initial_stones`]）。空盘
+    /// 局省略字段（零开销），与摆子局区分——**绝不能**发空数组替代省略：
+    /// 「无该字段」是引擎接受的常规形态，字段语义本身没有空盘捷径。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     initial_stones: Vec<(String, String)>,
     moves: Vec<(&'a str, &'a str)>,
@@ -422,10 +442,22 @@ impl AnalysisQuery {
             .zip(&coord_strs)
             .map(|((stone, _), gtp)| (stone_tag(*stone), gtp.as_str()))
             .collect();
+        // 摆子同样先落 GTP 串（与 moves 同款借用拆分）。
+        let setup_strs: Vec<String> = self
+            .initial_stones
+            .iter()
+            .map(|(_, at)| at.to_gtp(self.board_size))
+            .collect();
+        let initial_stones: Vec<(String, String)> = self
+            .initial_stones
+            .iter()
+            .zip(&setup_strs)
+            .map(|((stone, _), gtp)| (stone_tag(*stone).to_owned(), gtp.clone()))
+            .collect();
         let (allow_moves, avoid_moves) = wire_move_rules(self.move_rules.as_ref());
         let wire = WireQuery {
             id: id.raw().to_string(),
-            initial_stones: Vec::new(),
+            initial_stones,
             moves,
             rules: &self.rules,
             komi: self.komi,
