@@ -110,6 +110,8 @@ pub struct StateSnapshot {
     /// 最近发出的 viewport 命令（读取即清空；与驱动「dump 后清」的旧
     /// 语义一致）。
     pub viewport_commands: Vec<String>,
+    /// 参照文件状态与当前局面命中情况（阶段 22；`None` = 未加载参照）。
+    pub reference: Option<ReferenceSnapshot>,
 }
 
 /// 局后统计的取证形态（dump 用；字段与 [`GameSummary`] 一一对应，
@@ -161,6 +163,54 @@ pub struct EngineReads {
     pub winrate: f64,
     /// 黑方目差（正 = 黑领先）。
     pub score_lead: f64,
+}
+
+/// 参照匹配结果的取证形态（阶段 22；headless dump 用）。
+/// 字段与侧栏「参照」卡片同一数据源（[`super::GuanqiApp::reference_view`]），
+/// 数字必然一致——「卡片显示什么」与「dump 取什么」对账的锚点。
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct ReferenceSnapshot {
+    /// 参照文件来源路径。
+    pub source: String,
+    /// 参照棋盘尺寸（路数）。
+    pub size: u8,
+    /// 索引条目数（不同局面键数）。
+    pub entries: usize,
+    /// 全树有着点的节点数。
+    pub nodes: usize,
+    /// 建索引用时（毫秒）。
+    pub index_ms: f64,
+    /// 载入警告（分支舍弃等）。
+    pub warnings: Vec<String>,
+    /// 当前局面命中详情；`None` = 未命中 / 尺寸不符 / 空盘。
+    pub hit: Option<RefHitSnapshot>,
+    /// 偏离提示（父局面命中、实战最后一手偏离）：`(实战手, 库中续法)`。
+    pub deviation: Option<(String, Vec<String>)>,
+    /// 尺寸不符标记（`true` = 参照与当前盘尺寸不同，无法匹配）。
+    pub size_mismatch: bool,
+}
+
+/// 命中详情的取证形态。
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct RefHitSnapshot {
+    /// 命中局面的库内手数。
+    pub move_no: usize,
+    /// 库内位置路径（各层分支下标，「0-2-1」形态）。
+    pub path: String,
+    /// 库内着法尾部展示串。
+    pub tail: String,
+    /// 库内注释。
+    pub comment: Option<String>,
+    /// 库内续法（展示串）。
+    pub continuations: Vec<String>,
+    /// 偏离提示（实战最后一手不在库内续法中）。
+    pub deviation: Option<String>,
+    /// 当前局面的着法尾部（实战口径；与库内 tail 并排核对用）。
+    pub live_tail: Vec<String>,
+    /// 命中条目的比较区域两角（GTP）。
+    pub region: String,
 }
 
 /// 思考过程记录的取证快照（阶段 21 #2；headless dump 用）。
@@ -234,6 +284,13 @@ impl GuanqiApp {
     pub fn inject_portal_event(&mut self, kind: PendingDialog, event: PortalEvent) {
         self.dialog = None;
         self.on_portal_event(kind, event);
+    }
+
+    /// 卸载参照（headless 工具的 `unref` 动作落点；与菜单「卸载参照」
+    /// 同一执行体）。
+    #[doc(hidden)]
+    pub fn unload_reference_pub(&mut self) {
+        self.unload_reference();
     }
 
     /// 退出收尾（headless 工具跑完脚本后调用）：与 eframe 运行时退出
@@ -423,6 +480,37 @@ impl GuanqiApp {
             .into_iter()
             .map(|c| format!("{c:?}"))
             .collect(),
+            reference: self.reference_view().map(|view| ReferenceSnapshot {
+                source: self
+                    .reference
+                    .as_ref()
+                    .map(|r| r.source().display().to_string())
+                    .unwrap_or_default(),
+                size: view.size,
+                entries: view.entries,
+                nodes: view.nodes,
+                index_ms: self
+                    .reference
+                    .as_ref()
+                    .map(|r| r.index_elapsed().as_secs_f64() * 1000.0)
+                    .unwrap_or(0.0),
+                warnings: view.warnings,
+                size_mismatch: self
+                    .reference
+                    .as_ref()
+                    .is_some_and(|r| r.size() != self.board.size()),
+                deviation: view.deviation,
+                hit: view.hit.map(|hit| RefHitSnapshot {
+                    move_no: hit.move_no,
+                    path: hit.path,
+                    tail: hit.tail,
+                    comment: hit.comment,
+                    continuations: hit.continuations,
+                    deviation: hit.deviation,
+                    live_tail: hit.live_tail,
+                    region: hit.region,
+                }),
+            }),
         }
     }
 }
@@ -480,6 +568,35 @@ impl StateSnapshot {
                 })).collect::<Vec<_>>(),
             })
         });
+        let reference = self.reference.as_ref().map(|r| {
+            // 同上：命中详情再拆一层，避免单次宏展开深度超限。
+            let hit = r.hit.as_ref().map(|h| {
+                serde_json::json!({
+                    "move_no": h.move_no,
+                    "path": h.path,
+                    "tail": h.tail,
+                    "comment": h.comment,
+                    "continuations": h.continuations,
+                    "deviation": h.deviation,
+                    "live_tail": h.live_tail,
+                    "region": h.region,
+                })
+            });
+            serde_json::json!({
+                "source": r.source,
+                "size": r.size,
+                "entries": r.entries,
+                "nodes": r.nodes,
+                "index_ms": r.index_ms,
+                "warnings": r.warnings,
+                "size_mismatch": r.size_mismatch,
+                "deviation": r.deviation.as_ref().map(|(played, book)| serde_json::json!({
+                    "played": played,
+                    "book": book,
+                })),
+                "hit": hit,
+            })
+        });
         serde_json::json!({
             "source": self.source,
             "size": self.size,
@@ -533,6 +650,7 @@ impl StateSnapshot {
             "komi": self.komi,
             "game_summary": game_summary,
             "viewport_commands": self.viewport_commands,
+            "reference": reference,
         })
         .to_string()
     }

@@ -45,6 +45,38 @@ pub(super) fn file_menu(&mut self, ui: &mut egui::Ui) {
             self.save_file_dialog();
             ui.close();
         }
+        // ---- 参照文件（阶段 22）：外部定式库 / 死活题谱的加载与卸载 ----
+        // 与「打开棋谱」正交：不替换当前对局 / 文档，无内容守卫；
+        // portal 不可用时同样置灰并说明原因。
+        let mut entry = ui.add_enabled(
+            disabled_reason.is_none(),
+            egui::Button::new("打开参照文件…"),
+        );
+        if let Some(reason) = disabled_reason.as_deref() {
+            entry = entry.on_disabled_hover_text(format!(
+                "{reason}（参照文件用于局面匹配提示，不影响当前棋谱）"
+            ));
+        }
+        if entry.clicked() {
+            self.open_reference_dialog();
+            ui.close();
+        }
+        let unload_disabled = if self.reference.is_none() {
+            Some("当前没有已加载的参照文件")
+        } else {
+            None
+        };
+        let mut entry = ui.add_enabled(
+            unload_disabled.is_none(),
+            egui::Button::new("卸载参照"),
+        );
+        if let Some(reason) = unload_disabled {
+            entry = entry.on_disabled_hover_text(reason);
+        }
+        if entry.clicked() {
+            self.unload_reference();
+            ui.close();
+        }
         // ---- 导出复盘报告（阶段 21 #6）：未载入棋谱置灰并说明原因 ----
         // 复盘报告的内容是「当前棋谱的局后统计 + 差异手棋盘图」，新对局
         // 的统计属于「本盘」（与局后统计写回 SGF 的边界一致），故以

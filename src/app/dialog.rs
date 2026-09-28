@@ -61,6 +61,31 @@ pub(super) fn open_file_dialog_now(&mut self) {
     }
 }
 
+/// 发起「打开参照文件…」对话框（菜单入口）。
+///
+/// 参照与当前对局正交：**不做**任何内容守卫（不碰未保存确认 / 副本
+/// 确认——加载参照不替换任何对局数据），只挡运行时态（portal 不可用 /
+/// 已有对话框在等待）。目录记忆复用「打开」槽位：参照文件（定式库 /
+/// 死活题谱）通常与棋谱放在一起。
+pub(super) fn open_reference_dialog(&mut self) {
+    if let Some(notice) = self.dialog_guard() {
+        self.notices.push(notice);
+        return;
+    }
+    match FileDialog::open_file(
+        "打开参照文件（SGF：定式库 / 死活题谱）",
+        self.engine_cfg.ui_prefs.last_open_dir.as_deref(),
+        Some(self.waker.clone()),
+    ) {
+        Ok(dialog) => {
+            self.dialog = Some((dialog, PendingDialog::OpenReference));
+        }
+        Err(err) => {
+            self.notices.push(LoadNotice::Failed(err.to_string()));
+        }
+    }
+}
+
 /// 确认「丢弃副本研究后载入」之后重新发起打开对话框。
 /// 研究成果已随确认清除（`drop_copy` 无副作用地放行了守卫）；
 /// 此时再查脏标记——脏则走「未保存」确认（同一入口第二次判定，
@@ -147,6 +172,18 @@ pub(super) fn on_portal_event(&mut self, kind: PendingDialog, event: PortalEvent
                 self.load_game(path);
             }
             PortalEvent::Cancelled => {} // 用户取消：静默，界面保持原状
+            PortalEvent::Failed(err) => {
+                self.notices.push(LoadNotice::Failed(err.to_string()));
+            }
+        },
+        // 参照文件：与「打开棋谱」同用 open 槽位记目录，但落点不同——
+        // 加载参照不替换棋盘。
+        PendingDialog::OpenReference => match event {
+            PortalEvent::Picked(path) => {
+                self.remember_dir(OpenSaveDir::Open, &path);
+                self.load_reference_file(path);
+            }
+            PortalEvent::Cancelled => {}
             PortalEvent::Failed(err) => {
                 self.notices.push(LoadNotice::Failed(err.to_string()));
             }

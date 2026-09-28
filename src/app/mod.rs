@@ -45,6 +45,7 @@ mod export;
 mod io;
 mod menu;
 mod play_flow;
+mod reference;
 mod snapshot;
 
 /// 弃着终局加深评估的目标 visits：手上终态低于此值时自动发起加深
@@ -120,6 +121,10 @@ pub struct GuanqiApp {
     dialog: Option<(FileDialog, PendingDialog)>,
     /// 已载入棋谱的元信息（`None` = 本次运行尚未打开过棋谱）。
     loaded: Option<GameMeta>,
+    /// 外部参照（定式库 / 死活题谱等参考 SGF；阶段 22）。与当前对局
+    /// 完全独立：加载 / 卸载它**绝不替换**棋盘与文档；同一时刻至多一份
+    /// （再加载即整体替换）。`None` = 未加载，侧栏只显示一行简短状态。
+    reference: Option<crate::refbook::Reference>,
     /// 事件型用户提示队列（载入 / 另存 / 快扫 / 规则解析 / 副本操作等
     /// 一次性反馈）：按时间排队、保留最近 [`analysis_panel::MAX_NOTICES`]
     /// 条，新消息不顶掉旧消息（此前单槽设计会让「另存成功」被后到的
@@ -205,6 +210,8 @@ pub struct GuanqiApp {
 pub enum PendingDialog {
     /// 等待用户选择要打开的棋谱。
     Open,
+    /// 等待用户选择参照文件（定式库 / 死活题谱等；阶段 22）。
+    OpenReference,
     /// 等待用户确认另存位置。
     Save,
     /// 等待用户确认复盘报告的导出位置（阶段 21 #6）。
@@ -426,6 +433,7 @@ impl GuanqiApp {
             portal_unavailable,
             dialog: None,
             loaded: None,
+            reference: None,
             notices: analysis_panel::NoticeFeed::new(),
             play: PlayState::review(),
             last_frame: None,
@@ -639,8 +647,7 @@ impl eframe::App for GuanqiApp {
             .and_then(|meta| meta.comment_at(&self.board));
         // 引擎无望提示文本（走子口径终态报告里引擎方胜率过低时给出，
         // 本帧检出后立即标记已提示，避免重复；确认按钮只清当前提示）。
-        let hopeless = play::should_show_hopeless(&self.play, self.analysis.snapshot.as_ref());
-        let hopeless_text = hopeless.then(|| {
+        let hopeless = play::should_show_hopeless(&self.play, self.analysis.snapshot.as_ref());        let hopeless_text = hopeless.then(|| {
             let engine = self.play.human.opposite();
             let wr = self
                 .analysis
@@ -661,6 +668,10 @@ impl eframe::App for GuanqiApp {
         let mut panel_action = analysis_panel::PanelAction::None;
         // 文档列表（侧栏「棋谱」区切换入口；空盘时为空列表）。
         let doc_entries = self.doc_entries();
+        // 参照卡片的展示数据（含当前局面命中查询）在闭包外派生：
+        // `reference_view` 需要 `&self`（棋盘 + 参照），而闭包里还要
+        // `&mut self.overlay` 等可变借用，先取值再进闭包化解借用冲突。
+        let reference_view = self.reference_view();
         egui::Panel::right("analysis_panel")
             .default_size(280.0)
             // 宽度硬限制：卡片化内容下某些子控件会逐帧把面板自然宽度
@@ -689,6 +700,7 @@ impl eframe::App for GuanqiApp {
                     hopeless_text.as_deref(),
                     &doc_entries,
                     self.thinking_open,
+                    reference_view.as_ref(),
                 );
             });
         match panel_action {

@@ -33,6 +33,8 @@
 //! keys <组合>               组合键，`+` 连接（Ctrl+O / Ctrl+Shift+S / Ctrl+Z）
 //! load <sgf>                从文件载入棋谱（等价 portal 对话框选中该文件）
 //! save <sgf>                另存到路径（同上）
+//! ref <sgf>                 加载参照文件（等价「打开参照文件…」选中该文件）
+//! unref                     卸载参照（等价菜单「卸载参照」）
 //! dump [标签]               打印结构化状态快照（单行 JSON）
 //! probe [文本过滤]          列出匹配文本的控件矩形与命中点（坐标标定用）
 //! viewport <宽> <高>        重设视口尺寸（默认 1180×860，points）
@@ -504,6 +506,16 @@ impl Driver {
                     .map_err(|e| format!("load 失败：{e}{}", label()))?,
                 "save" => self.inject_file_pick(guanqi::app::PendingDialog::Save, rest)
                     .map_err(|e| format!("save 失败：{e}{}", label()))?,
+                // 参照文件（阶段 22）：与 load 同款 portal 注入（OpenReference
+                // 用途），落点是「加载参照」——不替换当前棋盘。要求源文件存在。
+                "ref" => self
+                    .inject_file_pick(guanqi::app::PendingDialog::OpenReference, rest)
+                    .map_err(|e| format!("ref 失败：{e}{}", label()))?,
+                // 卸载参照：走菜单同款执行体（无参照时静默）。
+                "unref" => {
+                    self.app.unload_reference_pub();
+                    self.tick_default();
+                }
                 // 导出复盘报告（阶段 21 #6）：与菜单入口同一执行体
                 // （export_report_dialog 发起 → 注入 ExportReport picked）。
                 // 比菜单点击可靠：不依赖弹层坐标与时机。

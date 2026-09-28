@@ -180,6 +180,48 @@ pub struct DocEntry {
     pub active: bool,
 }
 
+/// 侧栏「参照」卡片的展示数据（App 从 [`crate::refbook::Reference`] 与
+/// 当前棋盘现场派生；UI 不直接持有参照内部结构，派生失败 = 卡片显示
+/// 「未命中」一行的简短状态）。
+pub struct ReferenceView {
+    /// 参照文件显示名。
+    pub name: String,
+    /// 参照棋盘尺寸（路数）。
+    pub size: u8,
+    /// 索引条目数（不同局面数）。
+    pub entries: usize,
+    /// 全树着法节点数。
+    pub nodes: usize,
+    /// 加载期警告（分支舍弃等），逐条展示。
+    pub warnings: Vec<String>,
+    /// 当前局面命中情况：`None` = 未命中（或尺寸不符 / 空盘）。
+    pub hit: Option<ReferenceHit>,
+    /// 偏离提示（当前局面不在库中、但父局面命中且实战最后一手偏离了
+    /// 库内续法）：`Some((实战手, 库中续法列表))`。
+    pub deviation: Option<(String, Vec<String>)>,
+}
+
+/// 「参照」卡片的命中详情。
+pub struct ReferenceHit {
+    /// 命中局面的库内手数。
+    pub move_no: usize,
+    /// 库内位置路径（各层分支下标串），如「0-2-1」；根 = 「根」。
+    pub path: String,
+    /// 着法尾部展示串（库内口径）。
+    pub tail: String,
+    /// 库内注释（无则 `None`）。
+    pub comment: Option<String>,
+    /// 库内续法列表（展示串）。
+    pub continuations: Vec<String>,
+    /// 偏离提示（当前局面命中、但实战最后一手不在库内续法中）。
+    pub deviation: Option<String>,
+    /// 当前局面的着法尾部（实战口径，「黑 D4」形态），供与库内 tail
+    /// 并排核对（headless 取证用；卡片暂不渲染，避免重复刷屏）。
+    pub live_tail: Vec<String>,
+    /// 命中条目的比较区域两角（GTP，取证用；卡片不渲染）。
+    pub region: String,
+}
+
 /// 状态文本与配色。流式分析时显示实时 visits 进度（随中间报告刷新），
 /// 比单纯「分析中…」更能反映引擎正在推进。
 fn status_label(analysis: &AnalysisState) -> (String, Color32) {
@@ -335,6 +377,7 @@ pub fn show(
     hopeless: Option<&str>,
     docs: &[DocEntry],
     thinking_open: bool,
+    reference: Option<&ReferenceView>,
 ) -> PanelAction {
     egui::ScrollArea::vertical()
         .show(ui, |ui| {
@@ -358,6 +401,7 @@ pub fn show(
                 hopeless,
                 docs,
                 thinking_open,
+                reference,
             )
         })
         .inner
@@ -389,6 +433,7 @@ fn panel_body(
     hopeless: Option<&str>,
     docs: &[DocEntry],
     thinking_open: bool,
+    reference: Option<&ReferenceView>,
 ) -> PanelAction {
     let mut action = PanelAction::None;
 
@@ -428,6 +473,10 @@ fn panel_body(
 
     // ---- 讲解（中文自动解说；终态数据驱动，流式期间只占位）----
     card_explain(ui, analysis, board);
+
+    // ---- 参照（阶段 22）：外部定式库 / 死活题谱的命中与偏离提示 ----
+    // 未加载参照时不占地方（一行简短状态），见 card_reference 文档。
+    card_reference(ui, reference);
 
     // ---- 限定选点信息（区域尺寸 / 排除清单内容；开关与清除在
     // 「分析 → 限定选点」菜单）----
@@ -882,6 +931,85 @@ fn card_explain(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(line.text).size(12.5).color(color));
             });
+        }
+    });
+}
+
+/// 「参照」卡片（阶段 22）：外部参照 SGF（定式库 / 死活题谱）的加载
+/// 状态与当前局面的命中情况。
+///
+/// 占位原则：**未加载参照时只有一行简短状态**（提示加载入口在「文件」
+/// 菜单），不渲染空卡片骨架；命中 / 未命中态各自给出最少必要信息。
+/// 加载 / 卸载在「文件」菜单（与其他文件动作同一排），本卡片纯展示，
+/// 无交互控件（「照库落子」「跳进参照树」等留后续批次）。
+fn card_reference(ui: &mut Ui, reference: Option<&ReferenceView>) {
+    let Some(reference) = reference else {
+        // 未加载：一行弱色状态，不占卡片。
+        ui.weak("未加载参照文件。可在「文件 → 打开参照文件…」加载定式库 / 死活题谱。");
+        return;
+    };
+    card(ui, |ui| {
+        theme::section_title(ui, "参照");
+        let file_label = ui.label(RichText::new(&reference.name).strong());
+        file_label.on_hover_text(format!(
+            "参照棋盘 {} 路；索引 {} 个局面 / 全树 {} 手",
+            reference.size, reference.entries, reference.nodes
+        ));
+        ui.weak(format!(
+            "{} 路 · 索引 {} 个局面 · 全树 {} 手",
+            reference.size, reference.entries, reference.nodes
+        ));
+        // 载入警告（分支舍弃等）：逐条列出（通常 0 条，整块省略）。
+        if !reference.warnings.is_empty() {
+            ui.colored_label(theme::colors::WARN, "载入时有分支无法重放：");
+            for warning in &reference.warnings {
+                ui.colored_label(theme::colors::WARN, format!("· {warning}"));
+            }
+        }
+        // 当前局面命中情况。
+        match &reference.hit {
+            None => {
+                // 偏离提示优先于「未命中」一行（刚走偏的场景用户最需要它）。
+                if let Some((played, book)) = &reference.deviation {
+                    ui.colored_label(
+                        theme::colors::WARN,
+                        format!("实战走 {played}，库中此局面走：{}。", book.join(" / ")),
+                    );
+                } else {
+                    ui.weak("当前局面未在参照中找到同形。");
+                }
+            }
+            Some(hit) => {
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(format!(
+                        "命中：第 {} 手（库内位置 {}）",
+                        hit.move_no, hit.path
+                    ))
+                    .color(theme::colors::OK)
+                    .strong(),
+                );
+                ui.label(RichText::new(hit.tail.as_str()).weak());
+                // 库内注释（参照节点上的 C）。
+                if let Some(comment) = &hit.comment {
+                    ui.add_space(2.0);
+                    ui.label(comment);
+                }
+                // 偏离提示优先于续法列表展示（用户此刻最需要它）。
+                if let Some(deviation) = &hit.deviation {
+                    ui.add_space(2.0);
+                    ui.colored_label(theme::colors::WARN, deviation);
+                }
+                // 续法列表（库中该局面的后续着法）。
+                if hit.continuations.is_empty() {
+                    ui.weak("库中该局面无续法（叶子节点）。");
+                } else {
+                    ui.weak("库中续法：");
+                    for cont in &hit.continuations {
+                        ui.label(RichText::new(format!("· {cont}")).monospace());
+                    }
+                }
+            }
         }
     });
 }
