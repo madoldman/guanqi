@@ -654,6 +654,47 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
                 "侧栏显示本次分析的稳定性读数与时间轴回放（首选翻转、何时稳定）",
             );
         });
+        // ---- 解题模式（阶段 22.2）：不剧透总闸 + 重试 / 看答案 ----
+        // 必须用户显式开启（死活题与让子局结构上无法区分，绝不自动识别）；
+        // 无参照时置灰并说明原因。开关不持久化（绑定「这一份参照题谱」
+        // 的使用场景，见 solving 模块文档）。
+        ui.menu_button("解题模式", |ui| {
+            let has_ref = self.reference.is_some();
+            let mut solving = self.solving_mode;
+            let entry = ui.add_enabled(has_ref, egui::Checkbox::new(&mut solving, "解题模式（不剧透）"));
+            if !has_ref {
+                entry.on_disabled_hover_text(
+                    "需先在「文件 → 打开参照文件…」加载题谱（参照文件），才能开启解题模式",
+                );
+            } else if entry.clicked() {
+                self.set_solving_mode(solving);
+                ui.close();
+            }
+            ui.separator();
+            // 重试本题：回题谱初始局面（含摆子）。解题模式未开时置灰。
+            let entry = ui.add_enabled(self.solving_mode, egui::Button::new("重试本题"));
+            if !self.solving_mode {
+                entry.on_disabled_hover_text("解题模式未开启（重试会把当前棋盘换回题谱初始局面）");
+            } else if entry.clicked() {
+                self.retry_problem();
+                ui.close();
+            }
+            // 看答案：显式动作；看了不自动退出解题模式（留痕标注）。
+            let answer_label = if self.answer_shown {
+                "显示参照续法（已看过）"
+            } else {
+                "显示参照续法（看答案）"
+            };
+            let entry = ui.add_enabled(self.solving_mode, egui::Button::new(answer_label));
+            if !self.solving_mode {
+                entry.on_disabled_hover_text("解题模式未开启");
+            } else if entry.clicked() {
+                self.show_answer();
+                ui.close();
+            }
+            ui.separator();
+            ui.weak("开启后隐藏候选 / 胜率 / 目差 / 讲解 / 失误 / 思考过程 / 曲线等分析呈现；落子后按题谱给出对照判定。");
+        });
     });
 }
 }

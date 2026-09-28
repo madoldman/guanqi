@@ -14,7 +14,15 @@ use crate::ui::analysis_panel::{self, LoadNotice};
 impl GuanqiApp {
     /// 派生侧栏「参照」卡片的展示数据（每帧一次；命中查询是 O(1)
     /// 哈希查表，偏离判定只在命中时多一次父局面重放，量级可忽略）。
+    ///
+    /// **解题模式下返回 `None`**（阶段 22.2）：命中详情里的续法 / 注释 /
+    /// 偏离提示正是答案（剧透内容），卡片整体不渲染（结构信息由「解题」
+    /// 卡片承担）；取证 dump（`state_snapshot`）取的是同一数据源，若
+    /// 解题模式仍派生续法文本，取证面会带出答案——数据与显示一起藏。
     pub(super) fn reference_view(&self) -> Option<analysis_panel::ReferenceView> {
+        if self.solving_mode {
+            return None;
+        }
         let reference = self.reference.as_ref()?;
         let mut deviation_top = None;
         let hit = match reference.lookup(&self.board) {

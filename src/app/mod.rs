@@ -47,6 +47,7 @@ mod menu;
 mod play_flow;
 mod reference;
 mod snapshot;
+mod solving;
 
 /// 弃着终局加深评估的目标 visits：手上终态低于此值时自动发起加深
 /// （800 ≈ 默认展示档 300 的 2.7 倍、40 visits 快扫的 20 倍，目差
@@ -125,6 +126,22 @@ pub struct GuanqiApp {
     /// 完全独立：加载 / 卸载它**绝不替换**棋盘与文档；同一时刻至多一份
     /// （再加载即整体替换）。`None` = 未加载，侧栏只显示一行简短状态。
     reference: Option<crate::refbook::Reference>,
+    /// 解题模式（阶段 22.2）：用户**显式**开启的「不剧透」总闸。
+    ///
+    /// 默认关、**不持久化**：解题模式绑定「这一份参照题谱」的使用场景，
+    /// 持久化会让用户在没开参照的日常使用里莫名缺全部分析呈现；且死活题
+    /// 与让子局结构上无法区分，绝不能自动开启（作者边界）。开启后所有
+    /// 会剧透的分析呈现（候选 / 胜率 / 目差 / 讲解 / 失误 / 局后统计 /
+    /// 思考过程 / 热度图 / 策略图 / 曲线 / 小棋盘 / 参照续法）按各自的
+    /// 显示判定短路；棋盘与走子交互完全不受影响（用户就是要自己下）。
+    solving_mode: bool,
+    /// 解题模式下「已查看答案」留痕（「显示参照续法」动作置位；重试本题
+    /// 与关闭解题模式清除）。看答案**不自动退出**解题模式——由用户决定；
+    /// 留痕让「本局已看过答案」在界面上可判读。
+    answer_shown: bool,
+    /// 解题模式最近一次落子判定的局面签名：同一局面只判定一次（落子 /
+    /// 导航 / 分支切换都改签名），防每帧重复提示刷屏。`None` = 尚未判定。
+    judged_sig: Option<Vec<MoveRecord>>,
     /// 事件型用户提示队列（载入 / 另存 / 快扫 / 规则解析 / 副本操作等
     /// 一次性反馈）：按时间排队、保留最近 [`analysis_panel::MAX_NOTICES`]
     /// 条，新消息不顶掉旧消息（此前单槽设计会让「另存成功」被后到的
@@ -191,13 +208,16 @@ pub struct GuanqiApp {
     /// `Close` 是否已经发出（避免每帧重复发同一条命令，见
     /// [`Self::handle_close_request`]）。
     close_sent: bool,
+    /// headless 取证：最近一帧棋盘视图的可用区域（`ui::show` 调用前
+    /// 由 `App::ui` 记录）。应用语义不读取；headless 工具据此把 GTP
+    /// 坐标换算成棋盘点击坐标（与 `board_view::Layout` 同口径）。
+    board_area: std::cell::RefCell<Option<egui::Rect>>,
     /// 最近发出的 viewport 命令（headless 工具 dump 用；应用路径上只追加，
     /// 由工具在 dump 后清空）。
     last_viewport_commands: std::cell::RefCell<Vec<egui::ViewportCommand>>,
     /// 偏好（界面开关 / 窗口几何）脏标记 + 防抖截止时刻：改动后停稳
     /// [`PREFS_SAVE_DEBOUNCE`] 才落盘，退出时无条件补写（子项 1/2 共用）。
-    prefs_dirty_since: Option<Instant>,
-    /// `egui::Context` 的留档克隆（复盘报告的棋盘图水印需要经
+    prefs_dirty_since: Option<Instant>,    /// `egui::Context` 的留档克隆（复盘报告的棋盘图水印需要经
     /// `ctx.fonts_mut` 光栅化中文字形；对话框结果在 `logic` 帧处理，
     /// 那里没有 `Ui`，故在构造期留一份。`Context` 是 `Arc` 克隆，廉价）。
     report_ctx: egui::Context,
@@ -434,6 +454,9 @@ impl GuanqiApp {
             dialog: None,
             loaded: None,
             reference: None,
+            solving_mode: false,
+            answer_shown: false,
+            judged_sig: None,
             notices: analysis_panel::NoticeFeed::new(),
             play: PlayState::review(),
             last_frame: None,
@@ -453,6 +476,7 @@ impl GuanqiApp {
             post_save: PostSaveAction::None,
             exit_requested: false,
             close_sent: false,
+            board_area: std::cell::RefCell::new(None),
             last_viewport_commands: std::cell::RefCell::new(Vec::new()),
             prefs_dirty_since: None,
             report_ctx: cc.egui_ctx.clone(),
@@ -671,7 +695,10 @@ impl eframe::App for GuanqiApp {
         // 参照卡片的展示数据（含当前局面命中查询）在闭包外派生：
         // `reference_view` 需要 `&self`（棋盘 + 参照），而闭包里还要
         // `&mut self.overlay` 等可变借用，先取值再进闭包化解借用冲突。
+        // 解题模式下 `reference_view` 的续法 / 偏离字段照常派生，但
+        // 侧栏卡片按 solving 标志隐藏（数据层不动，显示层短路）。
         let reference_view = self.reference_view();
+        let solving_view = self.solving_view();
         egui::Panel::right("analysis_panel")
             .default_size(280.0)
             // 宽度硬限制：卡片化内容下某些子控件会逐帧把面板自然宽度
@@ -701,6 +728,8 @@ impl eframe::App for GuanqiApp {
                     &doc_entries,
                     self.thinking_open,
                     reference_view.as_ref(),
+                    self.solving_mode,
+                    solving_view.as_ref(),
                 );
             });
         match panel_action {
@@ -753,6 +782,11 @@ impl eframe::App for GuanqiApp {
         // （防抖计时从「真正变化」起算，而不是每次重绘）。
         self.sync_prefs_and_track();
 
+        // 解题模式判定（阶段 22.2）：局面签名变化即按题谱对照判定一次
+        // （去重见 solving 模块文档）。放在偏好同步之后：判定提示走
+        // 消息区，下一帧渲染时即可见。
+        self.judge_if_needed();
+
         // 窗口几何记录（子项 2）：每帧从 ViewportInfo 读当前内容区矩形。
         // Wayland 下 egui-winit 会给出位置（估算）；拿不到（最小化 / 个别
         // WM）时保留几何尺寸、位置清空——下次启动交给 WM 摆放。几何变化
@@ -772,8 +806,9 @@ impl eframe::App for GuanqiApp {
         }
 
         // 胜率曲线底部面板（TASKS 4.3）：隐藏时不创建，零额外计算；
-        // 需在 CentralPanel 之前创建，中央区才会让出空间。
-        if self.curve_open {
+        // 需在 CentralPanel 之前创建，中央区才会让出空间。解题模式下
+        // 整面板不创建（胜率 / 目差曲线都是剧透）。
+        if self.curve_open && !self.solving_mode {
             egui::Panel::bottom("curve_panel")
                 .default_size(120.0)
                 .resizable(true)
@@ -785,8 +820,9 @@ impl eframe::App for GuanqiApp {
         // 小棋盘 PV 回放面板（第 6 项）：与曲线面板并列的底部面板。
         // 面板里只做预览式摆子（本地合成网格），绝不改棋谱树；数据源
         // 优先聚焦候选点、回落引擎首选，来源标注在面板标题行。
-        // 隐藏时不创建，不占主棋盘空间。
-        if self.overlay.show_mini_board {
+        // 隐藏时不创建，不占主棋盘空间。解题模式下不创建（PV 回放
+        // 会把引擎首选摆上盘面，正是剧透）。
+        if self.overlay.show_mini_board && !self.solving_mode {
             egui::Panel::bottom("mini_board_panel")
                 .default_size(mini_board::MINI_SIDE + 46.0)
                 .size_range(120.0..=460.0)
@@ -821,7 +857,8 @@ impl eframe::App for GuanqiApp {
                 });
         }
 
-        egui::CentralPanel::default().show(ui, |ui| {            // 顶部一行主操作按钮：主按钮（新对局）用琥珀填充强调，设置为普通按钮。
+        egui::CentralPanel::default().show(ui, |ui| {
+            // 顶部一行主操作按钮：主按钮（新对局）用琥珀填充强调，设置为普通按钮。
             // 不再在这里重复应用名——窗口标题栏已经有「观棋」。
             ui.horizontal(|ui| {
                 if !self.fonts_ok {
@@ -843,6 +880,10 @@ impl eframe::App for GuanqiApp {
                     }
                 });
             });
+            // headless 取证：记录棋盘视图收到的可用区域（按钮行之下、
+            // 状态行之上——与 board_view::Layout::fit 的输入同源，
+            // 工具据此做 GTP → 点击坐标换算）。应用语义不读取。
+            *self.board_area.borrow_mut() = Some(ui.available_rect_before_wrap());
             ui::show(
                 ui,
                 &mut self.board,
@@ -851,6 +892,7 @@ impl eframe::App for GuanqiApp {
                 &mut self.analysis,
                 &self.overlay,
                 self.manual_revealed,
+                self.solving_mode,
                 Some(&mut self.play),
             );
         });

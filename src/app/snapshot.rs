@@ -110,8 +110,68 @@ pub struct StateSnapshot {
     /// 最近发出的 viewport 命令（读取即清空；与驱动「dump 后清」的旧
     /// 语义一致）。
     pub viewport_commands: Vec<String>,
+    /// headless 取证：最近一次棋盘视图的可用区域（`App::ui` 每帧记录；
+    /// 应用语义不读取）。GTP → 点击坐标换算用。
+    pub board_area: std::cell::RefCell<Option<egui::Rect>>,
     /// 参照文件状态与当前局面命中情况（阶段 22；`None` = 未加载参照）。
     pub reference: Option<ReferenceSnapshot>,
+    /// 解题模式是否开启（阶段 22.2；不剧透总闸的原始状态）。
+    pub solving: bool,
+    /// 解题模式「已查看答案」留痕。
+    pub answer_shown: bool,
+    /// 最近一条「参照对照：」判定文本（解题模式落子判定的取证口径；
+    /// `None` = 本运行尚无判定）。
+    pub judge_notice: Option<String>,
+    /// 解题模式下各剧透显示层的实际渲染判定（全 false = 不剧透生效）。
+    /// 每项与真实绘制路径同一判定（与 App::ui / panel_body 的短路条件
+    /// 同源），对照取证用。
+    pub solving_hidden: SolvingHiddenDump,
+    /// 棋盘区域的屏幕矩形（points，left top right bottom）。headless
+    /// 工具把 GTP 坐标换算成点击坐标用（19 路网格等分、含边缘留白，
+    /// 与 `ui::board_view::Layout` 同一套几何口径的近似重建——留白比例
+    /// MARGIN_IN_SPACING = 1.2）。
+    pub board_rect: Option<[f32; 4]>,
+    /// 当前线最后一手（GTP，弃着为 "pass"；无着法为 `None`）。headless
+    /// 核实「点击实际落到哪一点」用。
+    pub last_move: Option<String>,
+}
+
+/// 解题模式「不剧透」各显示层的取证形态（阶段 22.2）。
+///
+/// 语义 = **该显示层此刻是否实际渲染**（true = 可见）：解题模式开启时
+/// 全部应为 false；关闭时恢复各自开关的真实值。逐项对应任务书清单：
+/// 候选圆圈 / 热度图 / 策略图 / 失误标注（棋盘叠加层）、候选列表 /
+/// 胜率目差 / 讲解 / 思考过程 / 失误卡 / 局后统计（侧栏卡片）、
+/// 曲线 / 目差线 / 小棋盘（底部面板）、参照续法（参照卡片）。
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct SolvingHiddenDump {
+    /// 棋盘候选点圆圈层。
+    pub board_candidates: bool,
+    /// 棋盘局势热度图（含候选点领地）。
+    pub board_heat: bool,
+    /// 棋盘策略热度图。
+    pub board_policy: bool,
+    /// 棋盘失误标注。
+    pub board_mistakes: bool,
+    /// 侧栏候选点卡片。
+    pub panel_candidates: bool,
+    /// 侧栏胜率 / 目差卡片。
+    pub panel_winrate: bool,
+    /// 侧栏讲解卡片。
+    pub panel_explain: bool,
+    /// 侧栏思考过程卡片。
+    pub panel_thinking: bool,
+    /// 侧栏失误卡片。
+    pub panel_mistakes: bool,
+    /// 侧栏局后统计卡片。
+    pub panel_summary: bool,
+    /// 胜率曲线面板（含目差折线）。
+    pub curve_panel: bool,
+    /// 小棋盘 PV 回放面板。
+    pub mini_board_panel: bool,
+    /// 参照卡片的续法 / 偏离详情（true = 详情可见）。
+    pub reference_details: bool,
 }
 
 /// 局后统计的取证形态（dump 用；字段与 [`GameSummary`] 一一对应，
@@ -480,6 +540,7 @@ impl GuanqiApp {
             .into_iter()
             .map(|c| format!("{c:?}"))
             .collect(),
+            board_area: std::cell::RefCell::new(None),
             reference: self.reference_view().map(|view| ReferenceSnapshot {
                 source: self
                     .reference
@@ -511,6 +572,56 @@ impl GuanqiApp {
                     region: hit.region,
                 }),
             }),
+            solving: self.solving_mode,
+            answer_shown: self.answer_shown,
+            judge_notice: self.last_judge_notice(),
+            board_rect: self.board_area.borrow().as_ref().map(|r| {
+                [r.left(), r.top(), r.right(), r.bottom()]
+            }),
+            last_move: self.board.records().last().map(|record| {
+                match record.action {
+                    crate::board::Action::Place(at) => {
+                        format!("{}{}", record.player.name(), at.to_gtp(self.board.size()))
+                    }
+                    crate::board::Action::Pass => {
+                        format!("{}pass", record.player.name())
+                    }
+                }
+            }),
+            solving_hidden: {
+                // 各显示层的实际渲染判定：与绘制路径同一条件（App::ui 的
+                // 面板创建条件 / panel_body 的卡片短路 / board_view 的
+                // 叠加层短路），取证值即真实可见性，无第二套口径。
+                let candidates_visible =
+                    self.analysis.candidates_visible(self.manual_revealed);
+                let solving = self.solving_mode;
+                let snapshot_exists = self.analysis.snapshot.is_some();
+                SolvingHiddenDump {
+                    board_candidates: self.overlay.show_candidates
+                        && candidates_visible
+                        && !solving
+                        && snapshot_exists,
+                    board_heat: self.overlay.show_heat && !solving && snapshot_exists,
+                    board_policy: self.overlay.show_policy && !solving && snapshot_exists,
+                    board_mistakes: self.overlay.show_mistakes && !solving,
+                    panel_candidates: !solving,
+                    panel_winrate: !solving,
+                    panel_explain: !solving,
+                    panel_thinking: self.thinking_open && !solving,
+                    panel_mistakes: !solving,
+                    panel_summary: !solving,
+                    curve_panel: self.curve_open && !solving,
+                    mini_board_panel: self.overlay.show_mini_board && !solving,
+                    // 「参照卡片的续法/偏离详情」在解题模式打开时**数据层
+                    // 也隐藏**（reference_view 返回 None）：续法文本若仍
+                    // 派生进结构体，取证 dump 会带出答案——取证面与显示
+                    // 面必须一致，故这里以 reference_view 的实际产出为准。
+                    reference_details: !solving
+                        && self.reference_view().is_some_and(|v| {
+                            v.hit.is_some() || v.deviation.is_some()
+                        }),
+                }
+            },
         }
     }
 }
@@ -597,6 +708,21 @@ impl StateSnapshot {
                 "hit": hit,
             })
         });
+        let solving_hidden = serde_json::json!({
+            "board_candidates": self.solving_hidden.board_candidates,
+            "board_heat": self.solving_hidden.board_heat,
+            "board_policy": self.solving_hidden.board_policy,
+            "board_mistakes": self.solving_hidden.board_mistakes,
+            "panel_candidates": self.solving_hidden.panel_candidates,
+            "panel_winrate": self.solving_hidden.panel_winrate,
+            "panel_explain": self.solving_hidden.panel_explain,
+            "panel_thinking": self.solving_hidden.panel_thinking,
+            "panel_mistakes": self.solving_hidden.panel_mistakes,
+            "panel_summary": self.solving_hidden.panel_summary,
+            "curve_panel": self.solving_hidden.curve_panel,
+            "mini_board_panel": self.solving_hidden.mini_board_panel,
+            "reference_details": self.solving_hidden.reference_details,
+        });
         serde_json::json!({
             "source": self.source,
             "size": self.size,
@@ -651,6 +777,12 @@ impl StateSnapshot {
             "game_summary": game_summary,
             "viewport_commands": self.viewport_commands,
             "reference": reference,
+            "solving": self.solving,
+            "answer_shown": self.answer_shown,
+            "judge_notice": self.judge_notice,
+            "board_rect": self.board_rect,
+            "last_move": self.last_move,
+            "solving_hidden": solving_hidden,
         })
         .to_string()
     }

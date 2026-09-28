@@ -516,6 +516,65 @@ impl Driver {
                     self.app.unload_reference_pub();
                     self.tick_default();
                 }
+                // 解题模式（阶段 22.2）：solve on|off = 开关（菜单同一
+                // 执行体）；solve retry = 重试本题（恢复题谱初始含摆子）；
+                // solve answer = 看答案（显示参照续法并留痕）。
+                "solve" => match rest {
+                    "on" => {
+                        self.app.set_solving_mode_pub(true);
+                        self.tick_default();
+                    }
+                    "off" => {
+                        self.app.set_solving_mode_pub(false);
+                        self.tick_default();
+                    }
+                    "retry" => {
+                        self.app.retry_problem_pub();
+                        self.tick_default();
+                    }
+                    "answer" => {
+                        self.app.show_answer_pub();
+                        self.tick_default();
+                    }
+                    other => {
+                        return Err(format!(
+                            "solve 参数非法：{other}（on / off / retry / answer）{}",
+                            label()
+                        ));
+                    }
+                },
+                // 按 GTP 坐标点击棋盘交叉点（阶段 22.2 验证用）：从最近
+                // 一帧 dump 的棋盘区域矩形 + board_view::Layout 的几何
+                // 口径（等分网格、边缘留白 = 1.2 × 间距）反算屏幕点。
+                // 比硬编码像素坐标可移植（视口 / 面板宽度变化不失效）。
+                "click_gtp" => {
+                    let rect = self
+                        .app
+                        .board_area_probe()
+                        .ok_or_else(|| format!("棋盘区域未知（先跑一帧）{}", label()))?;
+                    let n = f32::from(self.app.state_snapshot().size as u8);
+                    // Layout::fit 口径：side = min(w, h)（board_area 已扣除
+                    // 按钮行；状态行占 rect 底部 STATUS_HEIGHT=42），
+                    // spacing = side / (n - 1 + 2×1.2)，margin = spacing × 1.2，
+                    // 棋盘在「扣除状态行后的可用区」内居中。
+                    let w = rect.width();
+                    let h = rect.height() - 42.0; // 底部状态行（STATUS_HEIGHT）
+                    let side = w.min(h);
+                    let spacing = side / (n - 1.0 + 2.4);
+                    let margin = spacing * 1.2;
+                    let board_left = rect.left() + (w - side) / 2.0 + margin;
+                    let board_top = rect.top() + (h - side) / 2.0 + margin;
+                    let gtp = unquote(rest);
+                    let size = guanqi::board::Size::new(n as u8)
+                        .map_err(|_| format!("尺寸非法 {n}{}", label()))?;
+                    let at = guanqi::board::Coord::from_gtp(size, &gtp)
+                        .map_err(|e| format!("GTP 坐标非法 {gtp}：{e}{}", label()))?;
+                    // 内部 y 自上向下，行号自下向上，point() 直接用内部坐标。
+                    let x = board_left + f32::from(at.x()) * spacing;
+                    let y = board_top + f32::from(at.y()) * spacing;
+                    println!("[click_gtp] {gtp} → ({x:.0},{y:.0})");
+                    self.click(x, y, egui::PointerButton::Primary);
+                }
                 // 导出复盘报告（阶段 21 #6）：与菜单入口同一执行体
                 // （export_report_dialog 发起 → 注入 ExportReport picked）。
                 // 比菜单点击可靠：不依赖弹层坐标与时机。

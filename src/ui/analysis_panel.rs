@@ -222,6 +222,48 @@ pub struct ReferenceHit {
     pub region: String,
 }
 
+/// 侧栏「解题」卡片的展示数据（阶段 22.2；App 从解题模式状态与参照
+/// 现场派生，`None` = 未开解题模式，卡片不渲染）。
+pub struct SolvingView {
+    /// 题谱文件显示名。
+    pub name: String,
+    /// 题谱棋盘尺寸（路数）。
+    pub size: u8,
+    /// 题谱索引局面数（结构信息；解题模式下可留，不剧透）。
+    /// **0 = 索引为空**（题谱缺 `PL` / 行棋方不符致重放全被舍弃等），
+    /// 此时判定无从谈起，卡片显示可读提示而非「没命中」。
+    pub entries: usize,
+    /// 当前局面的题谱命中（题面注释等）；`None` = 当前局面不在题谱中。
+    pub hit: Option<SolvingHit>,
+    /// 「看答案」后的答案内容（`None` = 尚未看答案）。
+    pub answer: Option<SolvingAnswer>,
+    /// 「已查看答案」留痕（看答案动作置位、重试 / 关闭解题模式清除）。
+    pub answer_shown: bool,
+    /// 题谱载入警告（分支舍弃等；索引为空时的原因线索，逐条展示）。
+    pub warnings: Vec<String>,
+}
+
+/// 解题卡片里的当前局面题谱命中（题面展示）。
+pub struct SolvingHit {
+    /// 命中局面的题谱手数。
+    pub move_no: usize,
+    /// 题面（参照节点注释，如「黑先活」）。
+    pub comment: Option<String>,
+    /// 该局面的题谱续法（**不展示**——这就是答案；字段留存供类型
+    /// 完整，卡片在未看答案时不渲染它）。
+    pub continuations: Vec<String>,
+}
+
+/// 「看答案」后的答案内容。
+pub struct SolvingAnswer {
+    /// 答案局面的题谱手数（0 = 当前局面不在题谱中）。
+    pub move_no: usize,
+    /// 题谱续法列表（展示串；空 = 题谱此处无后续）。
+    pub continuations: Vec<String>,
+    /// 题谱注释（可能含答案解说）。
+    pub comment: Option<String>,
+}
+
 /// 状态文本与配色。流式分析时显示实时 visits 进度（随中间报告刷新），
 /// 比单纯「分析中…」更能反映引擎正在推进。
 fn status_label(analysis: &AnalysisState) -> (String, Color32) {
@@ -355,6 +397,9 @@ pub(crate) fn pv_visits_text(
 /// 开关与终局动作在「对局」菜单）。
 /// `hopeless` 为引擎无望提示文本（`Some` = 展示提示；判认输在菜单）。
 /// `docs` 为文档列表（原谱 + 各研究副本，活动项高亮；空盘时为空）。
+/// `thinking_open` 为思考过程卡片开关；`reference` 为参照卡片数据；
+/// `solving` 为解题模式总闸（true = 全部剧透类卡片与内容短路，见
+/// `panel_body` 内各判定点）；`solving_view` 为解题卡片数据。
 /// 注释可能很长，整体包一层垂直滚动，避免侧栏内容被裁剪。
 #[allow(clippy::too_many_arguments)]
 pub fn show(
@@ -378,6 +423,8 @@ pub fn show(
     docs: &[DocEntry],
     thinking_open: bool,
     reference: Option<&ReferenceView>,
+    solving: bool,
+    solving_view: Option<&SolvingView>,
 ) -> PanelAction {
     egui::ScrollArea::vertical()
         .show(ui, |ui| {
@@ -402,6 +449,8 @@ pub fn show(
                 docs,
                 thinking_open,
                 reference,
+                solving,
+                solving_view,
             )
         })
         .inner
@@ -412,6 +461,11 @@ pub fn show(
 /// 卡片序即阅读序：先「发生了什么」（消息），再「现在进行到哪」
 /// （对局状态 / 快扫进度），然后是分析数据（引擎 / 棋谱 / 胜率 /
 /// 讲解 / 候选 / 失误 / 局后统计）。
+///
+/// 解题模式（`solving`）：所有会剧透的分析呈现在此处按卡片为单位
+/// 短路——胜率 / 目差、讲解、候选点、思考过程、失误、局后统计、
+/// 限定选点提示不渲染；参照卡片的续法 / 偏离由 `card_reference` 内部
+/// 处理（结构信息保留）。解题卡片在消息之后、参照卡片之前渲染。
 #[allow(clippy::too_many_arguments)]
 fn panel_body(
     ui: &mut Ui,
@@ -434,6 +488,8 @@ fn panel_body(
     docs: &[DocEntry],
     thinking_open: bool,
     reference: Option<&ReferenceView>,
+    solving: bool,
+    solving_view: Option<&SolvingView>,
 ) -> PanelAction {
     let mut action = PanelAction::None;
 
@@ -452,6 +508,12 @@ fn panel_body(
         &mut action,
     );
 
+    // ---- 解题模式（阶段 22.2）：题面 / 判定留痕 / 看答案。位置在
+    // 消息之后：解题场景里它是第二关注点（判定提示在消息卡里滚动）。
+    if let Some(view) = solving_view {
+        card_solving(ui, view);
+    }
+
     // ---- 对局状态（纯展示：你执X / 时钟 / 终局原因 / 无望提示文本；
     // 开关与终局动作在「对局」菜单）----
     card_play_status(ui, analysis, board, game, play, hopeless);
@@ -468,35 +530,41 @@ fn panel_body(
         card_game(ui, game, comment, docs, &mut action);
     }
 
-    // ---- 胜率 / 目差 ----
-    card_winrate(ui, analysis);
+    // ---- 以下分析数据卡片：解题模式下全部短路（不剧透总闸，见模块
+    // 文档的覆盖清单）。引用 `solving` 消灭「参数未使用」的歧义。----
+    if !solving {
+        // ---- 胜率 / 目差 ----
+        card_winrate(ui, analysis);
 
-    // ---- 讲解（中文自动解说；终态数据驱动，流式期间只占位）----
-    card_explain(ui, analysis, board);
+        // ---- 讲解（中文自动解说；终态数据驱动，流式期间只占位）----
+        card_explain(ui, analysis, board);
+    }
 
     // ---- 参照（阶段 22）：外部定式库 / 死活题谱的命中与偏离提示 ----
     // 未加载参照时不占地方（一行简短状态），见 card_reference 文档。
-    card_reference(ui, reference);
+    card_reference(ui, reference, solving);
 
-    // ---- 限定选点信息（区域尺寸 / 排除清单内容；开关与清除在
-    // 「分析 → 限定选点」菜单）----
-    card_limits_info(ui, analysis, board);
+    if !solving {
+        // ---- 限定选点信息（区域尺寸 / 排除清单内容；开关与清除在
+        // 「分析 → 限定选点」菜单）----
+        card_limits_info(ui, analysis, board);
 
-    // ---- 候选点（点击定位 / 排除 / 沿主变前进——展示固有交互）----
-    card_candidates(ui, analysis, overlay, manual_revealed, &mut action);
+        // ---- 候选点（点击定位 / 排除 / 沿主变前进——展示固有交互）----
+        card_candidates(ui, analysis, overlay, manual_revealed, &mut action);
 
-    // ---- 引擎思考过程（阶段 21 #2：稳定性读数 + 时间轴回放；
-    // `thinking_open` 为「分析 → 面板」里的开关，与曲线 / 棋谱树同款）----
-    if thinking_open {
-        card_thinking(ui, analysis, manual_revealed);
+        // ---- 引擎思考过程（阶段 21 #2：稳定性读数 + 时间轴回放；
+        // `thinking_open` 为「分析 → 面板」里的开关，与曲线 / 棋谱树同款）----
+        if thinking_open {
+            card_thinking(ui, analysis, manual_revealed);
+        }
+
+        // ---- 失误统计（TASKS 4.4）----
+        card_mistakes(ui, analysis, board);
+
+        // ---- 局后统计（吻合度 + 最差 N 手，与失误卡片信息互补不重复：
+        // 失误卡片 = 目差损失分级计数；本卡片 = visits 口径吻合度 + 排行跳转）----
+        card_summary(ui, analysis, board, &mut action);
     }
-
-    // ---- 失误统计（TASKS 4.4）----
-    card_mistakes(ui, analysis, board);
-
-    // ---- 局后统计（吻合度 + 最差 N 手，与失误卡片信息互补不重复：
-    // 失误卡片 = 目差损失分级计数；本卡片 = visits 口径吻合度 + 排行跳转）----
-    card_summary(ui, analysis, board, &mut action);
 
     action
 }
@@ -942,7 +1010,11 @@ fn card_explain(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
 /// 菜单），不渲染空卡片骨架；命中 / 未命中态各自给出最少必要信息。
 /// 加载 / 卸载在「文件」菜单（与其他文件动作同一排），本卡片纯展示，
 /// 无交互控件（「照库落子」「跳进参照树」等留后续批次）。
-fn card_reference(ui: &mut Ui, reference: Option<&ReferenceView>) {
+///
+/// 解题模式（`solving`，阶段 22.2）：只保留结构信息（文件名 / 规模 /
+/// 警告），**续法与偏离提示隐藏**——那正是答案所在；命中 / 未命中 /
+/// 题面 / 判定的展示由「解题」卡片承担，避免同一信息两处泄露。
+fn card_reference(ui: &mut Ui, reference: Option<&ReferenceView>, solving: bool) {
     let Some(reference) = reference else {
         // 未加载：一行弱色状态，不占卡片。
         ui.weak("未加载参照文件。可在「文件 → 打开参照文件…」加载定式库 / 死活题谱。");
@@ -965,6 +1037,21 @@ fn card_reference(ui: &mut Ui, reference: Option<&ReferenceView>) {
             for warning in &reference.warnings {
                 ui.colored_label(theme::colors::WARN, format!("· {warning}"));
             }
+        }
+        // 索引为空（重放全被舍弃 / 谱结构异常）：命中判定不可能有结果，
+        // 如实给出排查线索，不给「没命中」的误导。
+        if reference.entries == 0 {
+            ui.colored_label(
+                theme::colors::WARN,
+                "题谱索引为空：没有可匹配的局面。请检查题谱的 PL（首着方）、\
+                 摆子与各行棋方是否一致。",
+            );
+            return;
+        }
+        // 解题模式：续法 / 偏离 / 注释都是剧透内容，到结构信息为止。
+        if solving {
+            ui.weak("解题模式：命中详情已隐藏（判定见「解题」卡片）。");
+            return;
         }
         // 当前局面命中情况。
         match &reference.hit {
@@ -1011,6 +1098,78 @@ fn card_reference(ui: &mut Ui, reference: Option<&ReferenceView>) {
                 }
             }
         }
+    });
+}
+
+/// 「解题」卡片（阶段 22.2）：解题模式的常驻信息（题面 / 留痕 / 答案）。
+///
+/// 只在解题模式开启时渲染（`App::solving_view` 返回 `None` 即整卡缺席）。
+/// 展示口径：
+/// - 题面 = 当前局面在题谱中的注释（如「黑先活」），未命中局面时给出
+///   「当前局面不在题谱中」的一行说明；
+/// - 「已查看答案」留痕：用户显式看过答案后本局一直标注（重试 / 关闭
+///   解题模式才清除），让「这局还作不作数」可判读；
+/// - 答案 = 题谱续法与注释，**只在看答案之后**渲染。
+fn card_solving(ui: &mut Ui, view: &SolvingView) {
+    card(ui, |ui| {
+        theme::section_title(ui, "解题模式");
+        ui.weak(format!(
+            "题谱：{}（{} 路，{} 个局面）",
+            view.name, view.size, view.entries
+        ));
+        // 索引为空：判定无从谈起（任何局面都查不到），给出排查线索而非
+        // 让用户只看到「没命中」。常见原因 = 缺 `PL` / 行棋方不符 / 摆子
+        // 非法致整树重放被舍弃——载入警告逐条列出即原因本身。
+        if view.entries == 0 {
+            ui.colored_label(
+                theme::colors::WARN,
+                "题谱索引为空：没有可匹配的局面（判定不可用）。\
+                 请检查题谱的 PL（首着方）、摆子与各行棋方是否一致。",
+            );
+            for warning in &view.warnings {
+                ui.colored_label(theme::colors::WARN, format!("· {warning}"));
+            }
+            return;
+        }
+        if view.answer_shown {
+            ui.colored_label(theme::colors::WARN, "已查看答案（本局留痕）");
+        }
+        if let Some(answer) = &view.answer {
+            ui.add_space(2.0);
+            ui.label(RichText::new("题谱续法（答案）：").strong());
+            if answer.continuations.is_empty() {
+                ui.weak("题谱此处无后续。");
+            } else {
+                for cont in &answer.continuations {
+                    ui.label(RichText::new(format!("· {cont}")).monospace());
+                }
+            }
+            if let Some(comment) = &answer.comment {
+                ui.add_space(2.0);
+                ui.label(comment);
+            }
+            if answer.move_no == 0 {
+                ui.weak("（当前局面不在题谱中。）");
+            }
+        } else {
+            // 未看答案：只给题面（参照节点注释），不给续法。
+            match &view.hit {
+                Some(hit) => {
+                    if let Some(comment) = &hit.comment {
+                        ui.add_space(2.0);
+                        ui.label(RichText::new(comment).strong());
+                    } else {
+                        ui.weak("题谱此处无题面注释。");
+                    }
+                }
+                None => {
+                    ui.add_space(2.0);
+                    ui.weak("当前局面不在题谱中。");
+                }
+            }
+        }
+        ui.add_space(2.0);
+        ui.weak("判定与操作在「分析 → 解题模式」菜单。");
     });
 }
 
@@ -1140,6 +1299,7 @@ fn card_winrate(ui: &mut Ui, analysis: &AnalysisState) {
 /// 整张卡片属**候选类**内容（第 5 项门控）：延迟 / 手动模式下未到时机
 /// 时整体不渲染（含「排除 / 前进」按钮——按钮以候选行为载体，候选都
 /// 藏了按钮自然也不该在）。胜率 / 目差卡片与曲线不受门控。
+/// 解题模式下整卡不渲染（不剧透总闸，见 `panel_body`）。
 fn card_candidates(
     ui: &mut Ui,
     analysis: &AnalysisState,

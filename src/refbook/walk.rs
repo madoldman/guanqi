@@ -79,6 +79,8 @@ impl Rect {
 
 /// 展开后的统一节点树：`children` = 链延续 + 各分支首节点（见模块文档）。
 /// 借用 SGF 树的节点，生命周期随加载函数；深搜结束即释放，只留索引条目。
+/// `Clone` 供根条目入索引时复制分支壳层（纯指针拷贝，见 `build` 注释）。
+#[derive(Clone)]
 struct RNode<'a> {
     node: &'a Node,
     children: Vec<RNode<'a>>,
@@ -101,7 +103,12 @@ fn expand(tree: &GameTree) -> Vec<RNode<'_>> {
     current
 }
 
-/// 建索引：重放整棵树并为每个有着点的节点算键入表。
+/// 建索引：重放整棵树并为每个有着点的节点算键入表；**根局面在盘面非空
+/// （有摆子/预置子）时同样入索引**——死活题 / 定式谱的第一手之前的父
+/// 局面正是根局面，它缺席会让「第一手走偏」的偏离判定（父局面命中 +
+/// 最后一手不在续法中）无从成立，退化为「不在题谱中」的误导提示。空盘
+/// 根（无摆子）没有索引价值：任何实战局面的父局面链都不会经过它，且
+/// 「无子的父局面」没有可比较的局部簇，跳过。
 /// 返回（索引表，警告，着法节点总数）。每节点一次键计算，整体 O(节点数)。
 pub(super) fn build(
     tree: &GameTree,
@@ -110,13 +117,37 @@ pub(super) fn build(
     let mut grid: Vec<Option<Stone>> = vec![None; size.point_count()];
     let mut warnings = Vec::new();
     let mut move_nodes = 0usize;
+    let mut root_node: Option<&Node> = None;
     if let Some(root) = tree.root() {
         apply_root_setup(root, size, &mut grid, &mut warnings);
+        root_node = Some(root);
     }
     let to_play = root_to_play(tree);
     let mut index = HashMap::new();
     let mut path: Vec<usize> = Vec::new();
+    // 根局面（0 手）：有摆子才入索引。条目的「续法」= 首着手法（root
+    // 的链延续 + 各分支首节点，统一树展开后即 `top` 各首手），
+    // 注释 = 根注释（题面常写在这里，UI 的题面展示依赖它）。
+    // 构造根 RNode 时克隆 `top`（仅分支壳层的浅拷贝量级：每项是一个
+    // 借用 SGF 节点的结构体，克隆 = 指针拷贝 × 分支数，可忽略）。
     let top = expand(tree);
+    if grid.iter().any(|stone| stone.is_some())
+        && let Some(root) = root_node
+    {
+        index_entry(
+            &RNode {
+                node: root,
+                children: top.clone(),
+            },
+            size,
+            &grid,
+            to_play,
+            &[],
+            &path,
+            0,
+            &mut index,
+        );
+    }
     walk(
         &top,
         size,

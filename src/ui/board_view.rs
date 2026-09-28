@@ -66,6 +66,9 @@ const BRANCH_HEIGHT: f32 = 42.0;
 /// （App 持有，局面变化时由 App 复位）。
 /// `play` 为人机对弈状态（`None` = 尚未初始化，按纯复盘处理）；
 /// 对弈模式开启时 Ctrl+Z 悔棋回到「轮到人类」的状态（见 [`undo_to_human`]）。
+/// `solving` 为解题模式总闸（阶段 22.2）：候选点圆圈 / 热度图 / 策略图 /
+/// 失误标注 / 定位高亮（幽灵子）全部短路——它们都直接或间接展示引擎
+/// 的选点 / 评估结论，正是剧透；棋盘本体与走子交互不受影响。
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut Ui,
@@ -75,6 +78,7 @@ pub fn show(
     analysis: &mut AnalysisState,
     overlay: &Overlay,
     manual_revealed: bool,
+    solving: bool,
     mut play: Option<&mut PlayState>,
 ) {
     handle_keyboard(ui, board, notice, branch_notice, play.as_deref());
@@ -123,7 +127,9 @@ pub fn show(
         // 「候选点领地」开关开启时热度图可切换到聚焦候选点的「走后」
         // 领地（无聚焦回落当前局面）；实际用哪路数据由 draw_heat 内的
         // heat_source 判定，返回来源供状态栏 / 图例标注。
+        // 解题模式：领地 / 热度图整层短路（局面评估即剧透）。
         if overlay.show_heat
+            && !solving
             && let Some(snapshot) = snapshot
         {
             // 聚焦候选点的「走后领地」属候选类内容，随门控隐藏；
@@ -135,7 +141,9 @@ pub fn show(
         }
         // 策略热度图同样压在棋子之下（棋子之上于热度图，同开时策略层
         // 的小圆片叠在 ownership 大方块上，两种数据都可见）。
+        // 解题模式：策略先验直接指出引擎直觉选点，短路。
         if overlay.show_policy
+            && !solving
             && let Some(snapshot) = snapshot
         {
             overlay::draw_policy(&painter, &layout, board, snapshot);
@@ -143,17 +151,21 @@ pub fn show(
         draw_stones(&painter, &layout, board);
         draw_last_move_mark(&painter, &layout, board);
         // 失误标注画在棋子之上：小色点不遮棋子辨识。
-        if overlay.show_mistakes {
+        // 解题模式：失误 = 引擎对该手的亏损结论，短路。
+        if overlay.show_mistakes && !solving {
             overlay::draw_mistakes(&painter, &layout, board, analysis);
         }
-        // 候选点与定位高亮画在棋子之上（随候选类门控）。
+        // 候选点与定位高亮画在棋子之上（随候选类门控；解题模式整体短路
+        // ——候选点圆圈是引擎首选的直观剧透，定位高亮的幽灵子 = 主变）。
         if overlay.show_candidates
             && candidates_visible
+            && !solving
             && let Some(snapshot) = snapshot
         {
             overlay::draw_candidates(&painter, &layout, snapshot);
         }
         if candidates_visible
+            && !solving
             && let Some(focus) = &overlay.focus
         {
             overlay::draw_focus(&painter, &layout, board, focus);
