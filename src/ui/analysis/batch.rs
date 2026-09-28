@@ -693,8 +693,16 @@ impl AnalysisState {
                 .unwrap_or(&[]);
             let sig = position_sig(&path[..report.turn_number.min(path.len())]);
             // 候选表随 root 同一次写入（口径一致，见 record_history 文档）。
-            let (moves, total) = Self::candidates_from(&report.move_infos);
-            self.record_history(report.turn_number, root, sig, &moves, total, None);
+            let (moves, total, best) = Self::candidates_from(&report.move_infos);
+            self.record_history(
+                report.turn_number,
+                root,
+                sig,
+                &moves,
+                total,
+                best,
+                None,
+            );
             if job.active.as_ref().is_some_and(|chunk| chunk.deep) {
                 job.deep_done += 1;
             } else {

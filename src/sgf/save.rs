@@ -27,6 +27,7 @@
 //! - `AP`（创建该文件的程序）**只用原值**：原谱写了就照写（作者是原程序），
 //!   没有才署本程序的名——恒写自己的名字等于认领别人做的谱。
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use super::GameMeta;
@@ -77,7 +78,15 @@ impl std::error::Error for SaveError {
 /// `stats_block` 为「局后统计」根注释块（含首尾界标
 /// 的整段文本，`ui::analysis::stats_block_text` 产出）；`Some` 时按
 /// [`merge_delimited_block`] 的幂等语义合入根注释（不覆盖用户原有内容）。
-pub fn board_to_sgf(board: &Board, meta: Option<&GameMeta>, stats_block: Option<&str>) -> String {
+/// `move_notes` 为逐手注释块表（键 = 走子后局面签名，文本含首尾界标，
+/// `AnalysisState::move_annotations` 产出）：命中的节点按同一幂等语义
+/// 合入该节点的 `C[]`；`None` / 未命中的节点不写任何东西。
+pub fn board_to_sgf(
+    board: &Board,
+    meta: Option<&GameMeta>,
+    stats_block: Option<&str>,
+    move_notes: Option<&HashMap<u64, String>>,
+) -> String {
     let info = meta.map(|m| &m.info);
     let mut tree = GameTree::default();
     let mut root = build_root(board, info);
@@ -105,19 +114,20 @@ pub fn board_to_sgf(board: &Board, meta: Option<&GameMeta>, stats_block: Option<
         }
     }
     tree.nodes.push(root);
-    extend_tree(board, 0, SIG_INIT, meta, &mut tree);
+    extend_tree(board, 0, SIG_INIT, meta, move_notes, &mut tree);
     tree.write()
 }
 /// 序列化并写入文件（UTF-8 无 BOM；文本由 [`GameTree::write`] 生成）。
 /// 落盘为原子写（见 [`write_atomically`]），失败时已有文件不受影响。
-/// `stats_block` 语义见 [`board_to_sgf`]。
+/// `stats_block` / `move_notes` 语义见 [`board_to_sgf`]。
 pub fn save_to_file(
     path: &Path,
     board: &Board,
     meta: Option<&GameMeta>,
     stats_block: Option<&str>,
+    move_notes: Option<&HashMap<u64, String>>,
 ) -> Result<(), SaveError> {
-    let text = board_to_sgf(board, meta, stats_block);
+    let text = board_to_sgf(board, meta, stats_block, move_notes);
     write_atomically(path, &text)
 }
 
@@ -215,6 +225,7 @@ fn extend_tree(
     start: usize,
     incoming_sig: u64,
     meta: Option<&GameMeta>,
+    move_notes: Option<&HashMap<u64, String>>,
     tree: &mut GameTree,
 ) {
     let (mut node_id, mut sig) = (start, incoming_sig);
@@ -224,12 +235,12 @@ fn extend_tree(
         if node_id != 0 {
             let record = node.record().expect("非根节点必有着法记录");
             sig_with_record(&mut sig, record);
-            tree.nodes.push(record_node(record, sig, meta));
+            tree.nodes.push(record_node(record, sig, meta, move_notes));
         }
         if node.children().len() > 1 {            let children = node.children().to_vec();
             for &branch in &children {
                 let mut child_tree = GameTree::default();
-                extend_tree(board, branch, sig, meta, &mut child_tree);
+                extend_tree(board, branch, sig, meta, move_notes, &mut child_tree);
                 tree.children.push(child_tree);
             }
             return;
@@ -250,7 +261,16 @@ fn extend_tree(
 /// 程序已专门写的属性（`B`/`W`/`C` 等）在保全时已排除（见
 /// `load::is_owned_by_save`），追加的不会与上面两个属性重复；
 /// 用户本轮新增的注释/着法不影响：写回以局面签名为键，新局面无保全。
-fn record_node(record: &MoveRecord, sig: u64, meta: Option<&GameMeta>) -> SgfNode {
+///
+/// 逐手注释块（`move_notes` 按局面签名命中时）合入同一 `C[]`：用户
+/// 注释先写、块后合（[`merge_delimited_block`] 把块追加在用户文字之后，
+/// 重复另存按界标替换、用户文字不动）。
+fn record_node(
+    record: &MoveRecord,
+    sig: u64,
+    meta: Option<&GameMeta>,
+    move_notes: Option<&HashMap<u64, String>>,
+) -> SgfNode {
     let mut node = SgfNode::default();
     let ident = match record.player {
         Stone::Black => "B",
@@ -267,12 +287,42 @@ fn record_node(record: &MoveRecord, sig: u64, meta: Option<&GameMeta>) -> SgfNod
     {
         node.props.push(prop("C", text));
     }
+    if let Some(block) = move_notes.and_then(|notes| notes.get(&sig)) {
+        merge_delimited_block(&mut node, block_begin(block), block_end(block), block);
+    }
     if let Some(meta) = meta {
         for extra in meta.extras_by_sig(sig) {
             node.props.push(extra.clone());
         }
     }
     node
+}
+
+/// 块文本的起始界标（首个 `【` 起到首个 `】` 止）。逐手注释块的手数
+/// 编在界标里（`【观棋 N】`），界标因此随文本自带——通用合并函数
+/// （[`merge_delimited_block`]）无需感知手数语义。
+fn block_begin(block: &str) -> &str {
+    let start = block.find('【').unwrap_or(0);
+    let end = block[start..].find('】').map_or(block.len(), |off| start + off + '】'.len_utf8());
+    &block[start..end]
+}
+
+/// 块文本的结束界标（**最后一个** `【…】` 段；逐手块恒为
+/// `【/观棋 N】`）。找不到时退回起始界标——半截块按「替换到末尾」
+/// 的幂等语义自愈（见 [`merge_delimited_block`]），不会留孤儿开头。
+fn block_end(block: &str) -> &str {
+    let start = block
+        .rfind('【')
+        .map(|start| {
+            let end = block[start..].find('】').map_or(block.len(), |off| start + off + '】'.len_utf8());
+            &block[start..end]
+        })
+        .unwrap_or("");
+    if start.is_empty() {
+        block_begin(block)
+    } else {
+        start
+    }
 }
 
 /// 由棋盘预设局面与对局信息构造根节点属性。

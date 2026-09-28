@@ -1,14 +1,22 @@
 //! 历史缓冲与统计派生：逐手胜率历史（局面签名键控）、失误汇总与
 //! 局后统计（吻合度 / 最差 N 手），以及终态报告向历史的转存。
 
+use std::collections::HashMap;
+
 use crate::board::{Action, Board, Coord, Stone};
 use crate::engine::{MoveInfo, RootInfo};
 
 use super::types::{
-    loss_from_points, hash_record, CandidateSnap, GameSummary, HistoryPoint, LossSummary,
-    Severity, WorstMove, DEEP_VISITS_THRESHOLD, HISTORY_CAP, MATCH_MIN_MOVES, WORST_LIMIT,
+    loss_from_points, hash_record, move_block_text, CandidateSnap, GameSummary, HistoryPoint,
+    LossSummary, Severity, WorstMove, DEEP_VISITS_THRESHOLD, HISTORY_CAP, MATCH_MIN_MOVES,
+    WORST_LIMIT,
 };
 use super::AnalysisState;
+
+/// 一次终态报告的候选表提取结果（[`AnalysisState::candidates_from`]
+/// 的返回）：候选 (落点, visits) 列表、总 visits（吻合度分母）、首选
+/// 候选（落点 + 黑方视角胜率；弃着首选 = `None`）。
+pub(super) type CandidateExtract = (Vec<(Coord, u64)>, u64, Option<(Coord, f64)>);
 
 impl AnalysisState {
     /// 当前线（根到当前节点沿选中子分支）的逐手历史数据：下标 = 手数
@@ -204,6 +212,7 @@ impl AnalysisState {
         sig: u64,
         moves: &[(Coord, u64)],
         total_visits: u64,
+        best: Option<(Coord, f64)>,
         game_rules: Option<&str>,
     ) {
         let _ = game_rules;
@@ -234,6 +243,7 @@ impl AnalysisState {
                 CandidateSnap {
                     moves: moves.to_vec(),
                     total_visits,
+                    best,
                 },
             );
         }
@@ -241,13 +251,75 @@ impl AnalysisState {
 
     /// 由一份终态报告提取候选表快照所需的 (落点, visits) 列表与总 visits。
     /// 弃着（`mv == None`）不进表：它不占棋盘交叉点，永远不可能是
-    /// 「实际落子」的匹配对象。
-    pub(super) fn candidates_from(infos: &[MoveInfo]) -> (Vec<(Coord, u64)>, u64) {
+    /// 「实际落子」的匹配对象。同时提取**首选**候选（`moves.sort_by_key`
+    /// 尚未进行时报告按引擎 order 序到达；这里独立取 order 最小者，
+    /// 不依赖调用方的排序时机）——落点与胜率，弃着首选记 `None`。
+    pub(super) fn candidates_from(infos: &[MoveInfo]) -> CandidateExtract {
         let moves: Vec<(Coord, u64)> = infos
             .iter()
             .filter_map(|info| info.mv.map(|at| (at, info.visits)))
             .collect();
         let total = moves.iter().map(|(_, v)| *v).sum();
-        (moves, total)
+        let best = infos
+            .iter()
+            .min_by_key(|info| info.order)
+            .and_then(|info| info.mv.map(|at| (at, info.winrate)));
+        (moves, total, best)
+    }
+
+    /// 逐手注释成文（「另存」时写回 SGF 用）：把当前线各手可算的损失
+    /// 整理成「局面签名 → 注释块文本」表。键与载入端
+    /// `GameMeta::comment_by_sig`、保存端滚动签名是同一套哈希——按
+    /// **局面**而非手数挂接，树形谱里不同分支的同一手数不会互相顶替。
+    ///
+    /// 键语义：签名 = **走子后**局面（注释挂产生该局面的节点，与载入
+    /// 端同键）；循环里先滚入该手再成文，`sig_before` 变量到使用点时
+    /// 已是走子后签名（走子前签名只活在循环步内，用于查候选表）。
+    ///
+    /// 收录口径：
+    /// - 只收 [`loss_from_points`] 能算出损失的手（两端历史点缺失 =
+    ///   未知 = 不写，绝不写 0 或臆造）；
+    /// - `all_hands == false`（默认）时再按 [`Severity::is_marked`]
+    ///   过滤，只注疑问手及以上；`true` 时全部已分析手都注。
+    /// - 一手也收不进（没分析过 / 数据两端不齐）返回**空表**——上层
+    ///   对空表不写任何逐手注释，与「关闭开关」同效。
+    ///
+    /// 纯读函数（`&self`），另存路径随时可调；文本含界标（见
+    /// [`move_block_text`]），重复另存的幂等合并由保存端负责。
+    pub fn move_annotations(&self, board: &Board, all_hands: bool) -> HashMap<u64, String> {
+        let size = board.size();
+        let records = board.line_records();
+        let points = self.line_points(board);
+        let mut notes: HashMap<u64, String> = HashMap::new();
+        // 滚动签名与 line_points 同款：进入第 i 轮时 sig_before = 走子前
+        // 局面（候选表键），hash_record 一步后 = 走子后局面（注释键）。
+        let mut sig = 0xcbf2_9ce4_8422_2325;
+        for (i, record) in records.iter().enumerate() {
+            let sig_before = sig;
+            hash_record(&mut sig, record);
+            let turn = i + 1;
+            let (Some(before), Some(after)) = (points[i], points[i + 1]) else {
+                continue; // 两端不齐：损失未知，不注（不臆造）
+            };
+            let Some(loss) = loss_from_points(turn, record.player, before, after) else {
+                continue;
+            };
+            if !all_hands && !loss.severity.is_marked() {
+                continue; // 默认档位：好棋 / 尚可不注
+            }
+            // 实战点（弃着如实写「弃着」）与引擎首选（走子前局面的
+            // 首选候选；表缺失 / 首选为弃着 / 表为空都省略整段）。
+            let actual = match record.action {
+                Action::Place(at) => at.to_gtp(size),
+                Action::Pass => "弃着".to_owned(),
+            };
+            let best = self
+                .candidates
+                .get(&sig_before)
+                .and_then(|snap| snap.best)
+                .map(|(at, winrate)| format!("{}（{:.1}%）", at.to_gtp(size), winrate * 100.0));
+            notes.insert(sig, move_block_text(&loss, Some(&actual), best.as_deref()));
+        }
+        notes
     }
 }

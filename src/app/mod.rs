@@ -101,6 +101,9 @@ pub struct GuanqiApp {
     /// 整谱快扫设置对话框是否打开（菜单「分析 → 整谱快扫…」的入口，
     /// 从侧栏卡片搬家而来：设置与预估同屏，看完预估再决定发起）。
     batch_scan_open: bool,
+    /// 另存时是否写逐手注释块（「分析」菜单开关，随 ui_prefs 持久化；
+    /// 默认开）。只影响「另存为」的写回内容，不改任何分析数据流。
+    annotate_moves: bool,
     /// 首次读取配置的提示（文件损坏回退等），直到用户保存过新配置。
     startup_notice: Option<String>,
     /// 最近一次难度/设置保存失败的用户提示（成功时不显示）。
@@ -405,6 +408,7 @@ impl GuanqiApp {
             settings,
             settings_open: false,
             batch_scan_open: false,
+            annotate_moves: prefs.annotate_moves,
             startup_notice,
             persist_notice: None,
             waker,
@@ -556,6 +560,7 @@ impl GuanqiApp {
             batch_deepen: self.analysis.batch_config().deepen_enabled,
             batch_deepen_top: self.analysis.batch_config().deepen_top,
             batch_deepen_visits: self.analysis.batch_config().deepen_visits,
+            annotate_moves: self.annotate_moves,
             // 窗口几何 / 文件目录记忆在各自路径上单独写入，这里原样保留。
             window_geometry: self.engine_cfg.ui_prefs.window_geometry.take(),
             last_open_dir: self.engine_cfg.ui_prefs.last_open_dir.take(),

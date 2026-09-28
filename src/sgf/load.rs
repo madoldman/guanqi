@@ -422,10 +422,13 @@ fn play_node(board: &mut Board, node: &Node) -> Result<bool, String> {
     }
 }
 
-/// 局面签名：对根到当前节点的着法序列（行棋方 + 着点 / 弃着）做
-/// FNV-1a。与 `ui::analysis` 的同名函数同构但更简（不含提子——同一
-/// 着法序列必然同一盘面，提子是派生结果）；两处语义独立，改动需同步。
-/// 仅作注释索引键，不要求抗碰撞。
+/// 局面签名：对根到当前节点的着法记录（行棋方 + 着点 / 弃着 + 提子）
+/// 做 FNV-1a。与 `ui::analysis::hash_record` **逐字节一致**：同一着法
+/// 前缀两侧必算出同一键——这是「逐手分析数据按局面签名入库」与「注释 /
+/// 保全属性按签名挂接」能共用一张键表的前提。提子计入哈希：打劫转换
+/// 会产生「着法序列不同、盘面相同」之外的另一类情形——坐标序列看似
+/// 可比对而提子集不同的中间态，混键会让注释挂错局面。仅作索引键，
+/// 不要求抗碰撞。
 ///
 /// 保存端（`save.rs`）逐节点增量混入各手还原同一签名，哈希实现经
 /// [`sig_with_record`] 共享，两侧按键必然一致。
@@ -441,7 +444,8 @@ fn position_sig(records: &[crate::board::MoveRecord]) -> u64 {
 pub(super) const SIG_INIT: u64 = 0xcbf2_9ce4_8422_2325;
 
 /// 把一手棋混入局面签名（[`position_sig`] 的增量步；保存端共用，
-/// 保证两处对同一着法序列算出同一签名）。
+/// 保证两处对同一着法序列算出同一签名）。字节序与 `ui::analysis::hash_record`
+/// 完全相同（player、action、提子数、提子坐标），两处改动需同步。
 pub(super) fn sig_with_record(sig: &mut u64, record: &crate::board::MoveRecord) {
     fn byte(h: &mut u64, b: u8) {
         *h ^= u64::from(b);
@@ -455,5 +459,12 @@ pub(super) fn sig_with_record(sig: &mut u64, record: &crate::board::MoveRecord) 
             byte(sig, c.y());
         }
         Action::Pass => byte(sig, 0),
+    }
+    let n = record.captured.len();
+    byte(sig, n as u8);
+    byte(sig, (n >> 8) as u8);
+    for c in &record.captured {
+        byte(sig, c.x());
+        byte(sig, c.y());
     }
 }

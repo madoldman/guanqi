@@ -151,11 +151,21 @@ pub(super) fn save_game(&mut self, path: PathBuf) {
     } else {
         None
     };
+    // 逐手注释成文（开关开 + 已载入棋谱时）：疑问手及以上的手按局面
+    // 签名合成注释块表交给保存管线。空表 = 没有任何可注的手（没分析
+    // 过 / 数据不齐），交给保存端等同 `None`，不写任何东西。
+    let move_notes = if self.loaded.is_some() && self.annotate_moves {
+        let notes = self.analysis.move_annotations(&self.board, false);
+        (!notes.is_empty()).then_some(notes)
+    } else {
+        None
+    };
     match save_to_file(
         &path,
         &self.board,
         self.loaded.as_ref(),
         stats_block.as_deref(),
+        move_notes.as_ref(),
     ) {
         Ok(()) => {
             let size = self.board.size();

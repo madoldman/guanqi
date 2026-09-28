@@ -64,10 +64,11 @@ use query::{Inflight, Stage, TerminalEval};
 use limits::LimitsEpoch;
 
 pub use types::{
-    loss_from_points, result_block_text, stats_block_text, terminal_result_string, CandidateSnap,
-    EngineStatus, GameSummary, HistoryPoint, LossSummary, MoveLoss, Severity, Snapshot,
-    WorstMove, DEEP_VISITS_THRESHOLD, MATCH_MIN_MOVES, STATS_BLOCK_BEGIN, STATS_BLOCK_END,
-    RESULT_BLOCK_BEGIN, RESULT_BLOCK_END, WORST_LIMIT,
+    loss_from_points, move_block_text, result_block_text, stats_block_text, terminal_result_string,
+    CandidateSnap, EngineStatus, GameSummary, HistoryPoint, LossSummary, MoveLoss, Severity,
+    Snapshot, WorstMove, DEEP_VISITS_THRESHOLD, MATCH_MIN_MOVES, MOVE_BLOCK_END_MARK,
+    MOVE_BLOCK_MARK, STATS_BLOCK_BEGIN, STATS_BLOCK_END, RESULT_BLOCK_BEGIN, RESULT_BLOCK_END,
+    WORST_LIMIT,
 };
 pub(crate) use types::SEVERITY_GOOD_MAX;
 pub(crate) use display::display_values;

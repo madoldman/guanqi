@@ -368,7 +368,7 @@ impl AnalysisState {
         let mut moves = report.move_infos;
         // 候选表快照在 moves 被 move 进快照前提取（终态才用得到，
         // 但提前提取成本可忽略：表长 ≤ 候选数）。
-        let (candidates, candidates_total) = Self::candidates_from(&moves);
+        let (candidates, candidates_total, candidates_best) = Self::candidates_from(&moves);
         moves.sort_by_key(|info| info.order);
         let root = report.root_info;
         let snapshot = Snapshot {
@@ -401,7 +401,15 @@ impl AnalysisState {
             let sig = position_sig(board.records());
             // 候选表随 root 同一次写入（口径一致，见 record_history 文档）；
             // moves 已按 order 排序，快照顺序即引擎序。
-            self.record_history(turn, root, sig, &candidates, candidates_total, game_rules);
+            self.record_history(
+                turn,
+                root,
+                sig,
+                &candidates,
+                candidates_total,
+                candidates_best,
+                game_rules,
+            );
             // 终局评估回填：任务在、局面匹配、visits 不低于已记录值才
             // 覆盖（与 history 同一覆盖规则；评估任务是纯读方，不改
             // 展示 / 走子口径的任何状态）。

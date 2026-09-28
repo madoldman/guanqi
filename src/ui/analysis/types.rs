@@ -69,6 +69,11 @@ pub struct CandidateSnap {
     pub moves: Vec<(Coord, u64)>,
     /// 候选表 visits 总和（吻合度分母，LizzieYzy `percentsMatch` 口径）。
     pub total_visits: u64,
+    /// 该报告的**首选**（`order` 最小）候选：落点与黑方视角胜率。逐手
+    /// 注释「引擎首选 D4（52.1%）」的数据源；候选为空或首选是弃着时为
+    /// `None`。不参与吻合度计算——只是同一次报告顺手留下的展示字段，
+    /// 与表本体同进退（同一覆盖判定写入）。
+    pub best: Option<(Coord, f64)>,
 }
 
 /// LizzieYzy 吻合度的样本门槛（已分析手数，黑白各自独立计数）：
@@ -369,6 +374,48 @@ pub const STATS_BLOCK_END: &str = "【/观棋统计】";
 pub const RESULT_BLOCK_BEGIN: &str = "【观棋终局】";
 /// 根注释「终局估计」块的结束界标（见 [`RESULT_BLOCK_BEGIN`]）。
 pub const RESULT_BLOCK_END: &str = "【/观棋终局】";
+
+// ---- 逐手注释成文写回 SGF（阶段 21）----
+
+/// 逐手注释块的起始界标前缀：实际界标 = `【观棋 N】`（N = 手数）。
+/// 每手独立界标而非共用一个：块挂在**各自的节点**上，界标即「这是观棋
+/// 为第 N 手写的块」的自证，重复另存按界标定位替换（幂等）；共用的
+/// 「【观棋逐手】…【/观棋逐手】」包络只在一个节点内有意义，跨节点
+/// 只会制造无意义的嵌套。风格与 [`STATS_BLOCK_BEGIN`] 一致。
+pub const MOVE_BLOCK_MARK: &str = "【观棋 ";
+/// 逐手注释块的结束界标前缀：实际界标 = `【/观棋 N】`。
+pub const MOVE_BLOCK_END_MARK: &str = "【/观棋 ";
+
+/// 一手棋的逐手注释块正文（含首尾界标，整段合入该手节点的 `C[]`）。
+///
+/// 成文口径（与侧栏「讲解」同一措辞风格，字段缺失就省略、绝不写
+/// 「未知 / N/A」占位）：
+/// - 手数、行棋方、目差损失、分级：[`MoveLoss`] 必有（损失算不出就
+///   不会有本块——上游只对能算损失的手调本函数）；
+/// - 实战点 / 引擎首选：调用方格式化好的成品串（`None` = 省略该段）。
+///   坐标需要尺寸换算 GTP，格式化持盘的职责归调用方，本函数不持棋盘。
+pub fn move_block_text(loss: &MoveLoss, actual: Option<&str>, best: Option<&str>) -> String {
+    let begin = format!("{MOVE_BLOCK_MARK}{}】", loss.turn);
+    let end = format!("{MOVE_BLOCK_END_MARK}{}】", loss.turn);
+    let mut text = format!(
+        "{begin}{} {} 手损失 {:.1} 目（{}）",
+        loss.player.name(),
+        loss.turn,
+        loss.score_loss,
+        loss.severity.name(),
+    );
+    if let Some(at) = actual {
+        text.push_str("；实战 ");
+        text.push_str(at);
+    }
+    if let Some(best) = best {
+        text.push_str("，引擎首选 ");
+        text.push_str(best);
+    }
+    text.push('。');
+    text.push_str(&end);
+    text
+}
 
 /// 由最深终局评估构造「终局判定」块正文（含首尾界标）。弃着终局的
 /// `RE` 与本块**同源**（同一份最深终态 scoreLead）：`score_lead` 为

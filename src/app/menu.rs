@@ -299,6 +299,21 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
             self.analysis.cancel_batch();
             ui.close();
         }
+        // ---- 另存写回：逐手注释开关（随 ui_prefs 持久化）----
+        // 归「分析」菜单而非另存对话框：portal 另存对话框是系统原生
+        // 窗口塞不进自绘控件，且注释是分析产物的写出口径，与分析设置
+        // 同类。只影响下一次「另存为」，不改任何分析数据流。
+        if ui
+            .checkbox(&mut self.annotate_moves, "另存带逐手注释")
+            .on_hover_text(
+                "另存时把已分析出手（默认疑问手及以上；数据不足的手不注）\
+                 的损失写成「【观棋 N】」注释块，合进各手节点的注释里——\
+                 重复另存只更新块内容，原有注释文字不动。",
+            )
+            .changed()
+        {
+            self.mark_prefs_dirty();
+        }
         ui.separator();
         // ---- 限定选点：区域开关 / 清除区域 / 清除排除列表 ----
         // 「清除排除列表」在原侧栏卡片里有独立按钮，搬家后必须仍

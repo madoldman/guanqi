@@ -95,6 +95,11 @@ pub struct UiPrefs {
     pub batch_deepen_top: usize,
     /// 加深每手 visits。
     pub batch_deepen_visits: u32,
+    /// ---- 另存写回 ----
+    /// 另存时把逐手损失注释（疑问手及以上；数据缺失的手不注）写进
+    /// 各手节点的 `C[]`（【观棋 N】界标块，幂等）。默认开——产物本身
+    /// 就是复盘笔记；关闭时另存与旧版完全一致（不写逐手块）。
+    pub annotate_moves: bool,
     /// ---- 窗口几何 ----
     /// 上次退出的窗口尺寸与位置（`None` = 从未记录，用程序默认）。
     pub window_geometry: Option<WindowGeometry>,
@@ -129,6 +134,7 @@ impl Default for UiPrefs {
             batch_deepen: true,
             batch_deepen_top: 10,
             batch_deepen_visits: 300,
+            annotate_moves: true,
             window_geometry: None,
             last_open_dir: None,
             last_save_dir: None,
