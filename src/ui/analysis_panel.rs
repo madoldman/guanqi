@@ -103,6 +103,10 @@ pub enum PanelAction {
     /// 点了参照卡片的「查看库中树…」：开关只读浏览窗口（阶段 23.2）。
     /// 纯显示开关，不携带数据（树数据由 App 每帧从参照派生）。
     ToggleRefTree,
+    /// 点了「参照打分」卡片的「导出 AI 标注版…」（阶段 23.3）：App 发起
+    /// 保存对话框（默认名 `<参照名>-AI标注.sgf`），选中后把打分结果合入
+    /// 参照树**副本**另存为新 SGF。不携带数据：结果表与参照树由 App 持有。
+    ExportAiSgf,
 }
 
 /// 「打开棋谱」流程的用户可见提示（App 写入，随侧栏提示行显示）。
@@ -580,7 +584,7 @@ fn panel_body(
     // 挂在参照卡片之下（同一主题域）。无论是否已加载参照都调用：
     // 「换参照即清空」后结果为空，区块只显示一行说明而非整卡消失——
     // 「这个功能存在、结果在此」比「卡片忽有忽无」更可发现。
-    card_ref_scan(ui, analysis, reference.is_some(), solving);
+    card_ref_scan(ui, analysis, reference.is_some(), solving, &mut action);
 
     if !solving {
         // ---- 限定选点信息（区域尺寸 / 排除清单内容；开关与清除在
@@ -1228,7 +1232,7 @@ fn continuation_row(
 /// - 文案自证：**这是 AI 对库的评估，不是库本身的对错**（「已淘汰」=
 ///   引擎评估显著劣于引擎首选，不是「这手棋人类不能下」）。
 /// - 结果只在本会话内保存，换参照即清空（AnalysisState 生命周期）。
-fn card_ref_scan(ui: &mut Ui, analysis: &AnalysisState, has_ref: bool, solving: bool) {
+fn card_ref_scan(ui: &mut Ui, analysis: &AnalysisState, has_ref: bool, solving: bool, action: &mut PanelAction) {
     // 进行中：进度 + 提示（不依赖 has_ref——取消动作在菜单 / 对话框）。
     if let Some((done, total, elapsed)) = analysis.ref_scan_progress() {
         card(ui, |ui| {
@@ -1257,6 +1261,9 @@ fn card_ref_scan(ui: &mut Ui, analysis: &AnalysisState, has_ref: bool, solving: 
         }
         return;
     };
+    // 导出入口（阶段 23.3）：**有打分结果时才可用**。无结果的分支已在
+    // 上面 return（说明行自带「请先完成打分」的原因），这里只处理可用态
+    // ——把入口放进卡片，与打分结果同屏（导出的正是眼前这份结果）。
     card(ui, |ui| {
         theme::section_title(ui, "参照打分");
         ui.weak("AI 对库的评估，不是库本身的对错（结果随换参照清空）。");
@@ -1278,6 +1285,7 @@ fn card_ref_scan(ui: &mut Ui, analysis: &AnalysisState, has_ref: bool, solving: 
                 theme::colors::OK,
                 "扫描完成：库中没有续法被 AI 判为显著劣于引擎首选。",
             );
+            export_ai_row(ui, results.len(), action);
             return;
         }
         ui.add_space(2.0);
@@ -1290,6 +1298,23 @@ fn card_ref_scan(ui: &mut Ui, analysis: &AnalysisState, has_ref: bool, solving: 
         for score in ranked.iter().take(REFSCAN_TOP) {
             ref_scan_row(ui, score);
         }
+        ui.add_space(2.0);
+        export_ai_row(ui, results.len(), action);
+    });
+}
+
+/// 「导出 AI 标注版…」按钮行（阶段 23.3）：把打分结果写进参照树副本
+/// 另存为新的 SGF（给别的软件看）。只在此卡片渲染（有打分结果才有
+/// 卡片），无结果态卡片本身不存在——「请先完成打分」的说明由无结果
+/// 分支的状态行承担，按钮永不出现在无结果屏上（置灰空按钮没有信息量）。
+fn export_ai_row(ui: &mut Ui, scored: usize, action: &mut PanelAction) {
+    ui.horizontal(|ui| {
+        if ui.button("导出 AI 标注版…").clicked() {
+            *action = PanelAction::ExportAiSgf;
+        }
+        ui.weak(format!(
+            "另存为新 SGF（已标 {scored} 个局面），参照原文件不会被修改。"
+        ));
     });
 }
 

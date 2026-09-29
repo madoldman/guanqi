@@ -45,6 +45,7 @@ mod export;
 mod io;
 mod menu;
 mod play_flow;
+mod ref_export;
 mod reference;
 mod snapshot;
 mod solving;
@@ -242,6 +243,8 @@ pub enum PendingDialog {
     Save,
     /// 等待用户确认复盘报告的导出位置（阶段 21 #6）。
     ExportReport,
+    /// 等待用户确认「AI 标注版库」的另存位置（阶段 23.3）。
+    ExportAiSgf,
 }
 
 /// 目录记忆的槽位（打开 / 另存各记各的，见 `remember_dir`）。
@@ -805,6 +808,10 @@ impl eframe::App for GuanqiApp {
             analysis_panel::PanelAction::ToggleRefTree => {
                 self.ref_tree_ui.open = !self.ref_tree_ui.open;
             }
+            // 「导出 AI 标注版…」（阶段 23.3）：发起保存对话框；选中
+            // 路径后的合并与写盘在 on_portal_event 的 ExportAiSgf 分支。
+            // 结果表为空时按钮不会渲染（卡片本身缺席），此处不再守卫。
+            analysis_panel::PanelAction::ExportAiSgf => self.export_ai_dialog(),
             analysis_panel::PanelAction::None => {}
         }
 

@@ -35,6 +35,8 @@
 //! save <sgf>                另存到路径（同上）
 //! ref <sgf>                 加载参照文件（等价「打开参照文件…」选中该文件）
 //! unref                     卸载参照（等价菜单「卸载参照」）
+//! export_ai <sgf>           导出 AI 标注版库（需先 ref + refscan 有结果；
+//!                           等价侧栏「导出 AI 标注版…」按钮选中另存路径）
 //! dump [标签]               打印结构化状态快照（单行 JSON）
 //! probe [文本过滤]          列出匹配文本的控件矩形与命中点（坐标标定用）
 //! viewport <宽> <高>        重设视口尺寸（默认 1180×860，points）
@@ -643,6 +645,16 @@ impl Driver {
                     self.tick_default();
                     self.inject_file_pick(guanqi::app::PendingDialog::ExportReport, rest)
                         .map_err(|e| format!("export 失败：{e}{}", label()))?;
+                }
+                // 导出「AI 标注版库」（阶段 23.3）：与 export 同构——
+                // export_ai_dialog_pub 发起 → 注入 ExportAiSgf picked。
+                // 要求已 ref 且 refscan 已有结果（无结果时 App 侧守卫给
+                // 提示；picked 后的合并与写盘走与真实用户相同的路径）。
+                "export_ai" => {
+                    self.app.export_ai_dialog_pub();
+                    self.tick_default();
+                    self.inject_file_pick(guanqi::app::PendingDialog::ExportAiSgf, rest)
+                        .map_err(|e| format!("export_ai 失败：{e}{}", label()))?;
                 }
                 "dump" => {
                     let snap = self.app.state_snapshot();

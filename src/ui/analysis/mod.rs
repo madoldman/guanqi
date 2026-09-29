@@ -58,6 +58,7 @@ mod display;
 mod history;
 mod limits;
 mod query;
+pub mod ref_export;
 mod refscan;
 mod thinking;
 mod types;

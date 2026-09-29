@@ -201,6 +201,20 @@ pub(super) fn on_portal_event(&mut self, kind: PendingDialog, event: PortalEvent
                 self.notices.push(LoadNotice::Failed(err.to_string()));
             }
         },
+        // 「AI 标注版库」另存（阶段 23.3）：与导出报告同构（picked 后
+        // 现场取数与写盘，文件 I/O 都是本地 KB 量级，不值得一线程）。
+        PendingDialog::ExportAiSgf => match event {
+            PortalEvent::Picked(path) => {
+                // 另存位置记进「另存目录」槽位（导出的 SGF 通常与参照、
+                // 棋谱放在一起；与另存为同一槽位）。
+                self.remember_dir(OpenSaveDir::Save, &path);
+                self.export_ai_annotated(path);
+            }
+            PortalEvent::Cancelled => {}
+            PortalEvent::Failed(err) => {
+                self.notices.push(LoadNotice::Failed(err.to_string()));
+            }
+        },
         PendingDialog::Save => match event {
             PortalEvent::Picked(path) => {
                 self.remember_dir(OpenSaveDir::Save, &path);

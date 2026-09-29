@@ -144,11 +144,15 @@ impl RefContinuationScore {
         }
     }
 
-    /// 差距展示串（未列出无差距可写）。
+    /// 差距展示串（未列出无差距可写）。负零归一为 0.0——`gap` 恰为
+    /// `-0.0` 时 `{:+.1}` 会输出 `-0.0`，与文案前缀「−」叠成双负号。
     pub fn gap_text(&self) -> String {
         self.gap.map_or_else(
             || "—".to_owned(),
-            |gap| format!("−{gap:.1} 目"),
+            |gap| {
+                let gap = if gap == 0.0 { 0.0 } else { gap };
+                format!("−{gap:.1} 目")
+            },
         )
     }
 }
