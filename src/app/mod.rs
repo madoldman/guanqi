@@ -785,6 +785,15 @@ impl eframe::App for GuanqiApp {
             analysis_panel::PanelAction::GotoTurn(turn) => {
                 self.board.go_to(turn);
             }
+            // 照库落子（侧栏参照卡片的续法点击）：与手点**完全等价**的
+            // 真实走子——走同一条 play_with_feedback（Board::play，计入
+            // 棋谱树、可 Ctrl+Z 悔棋、局面变化由既有 sync 触发分析重发），
+            // 不是跳进参照树、不是预览摆子。UI 侧已把回看中 / 行棋方
+            // 不符 / 弃着的入口置灰，这里复核末端与行棋方（防御双保险：
+            // 派生与点击之间隔了渲染帧，局面可能刚好变化）。
+            analysis_panel::PanelAction::PlaceFromBook { player, at } => {
+                self.play_from_book(player, at);
+            }
             analysis_panel::PanelAction::None => {}
         }
 

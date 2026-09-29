@@ -636,10 +636,13 @@ impl AnalysisState {
         }
         let elapsed = job.started.elapsed();
         self.ref_scan_results.extend(job.results.drain());
+        // 档位同完成口径：取发起时锁定的 `job.visits`（不读当前偏好）。
         self.ref_scan_notice = Some(format!(
-            "参照库打分已取消：完成 {}/{} 节点，用时 {}（已收结果保留）。",
+            "参照库打分已取消：完成 {}/{} 节点（{} visits/局面，用时 {}，\
+             已收结果保留）。",
             job.done,
             job.plan.positions,
+            job.visits,
             format_ref_duration(elapsed),
         ));
     }
@@ -749,6 +752,9 @@ impl AnalysisState {
         }
         let total = job.plan.positions;
         let elapsed = job.started.elapsed();
+        // 档位取**发起时锁定的** `job.visits`（不读当前偏好）：扫描中途
+        // 改档位不影响本次报告——报告描述的是「那次扫描」的口径。
+        let visits = job.visits;
         let outdated = job
             .results
             .values()
@@ -756,14 +762,15 @@ impl AnalysisState {
             .count();
         self.ref_scan_notice = Some(if complete {
             format!(
-                "参照库打分完成：{total} 节点，其中 {outdated} 个节点的库中续法\
-                 被 AI 判劣（详见侧栏参照卡片）。用时 {}。",
+                "参照库打分完成：{total} 节点（{visits} visits/局面，共 {}），\
+                 其中 {outdated} 个节点的库中续法被 AI 判劣（详见侧栏参照卡片）。",
                 format_ref_duration(elapsed)
             )
         } else {
             format!(
-                "参照库打分已结束：完成 {done}/{total} 节点（部分块超时被跳过），\
-                 其中 {outdated} 个节点的库中续法被 AI 判劣。用时 {}。",
+                "参照库打分已结束：完成 {done}/{total} 节点（{visits} visits/局面，\
+                 部分块超时被跳过，共 {}），其中 {outdated} 个节点的库中续法\
+                 被 AI 判劣。",
                 format_ref_duration(elapsed),
                 done = job.done,
             )

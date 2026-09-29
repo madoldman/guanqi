@@ -799,22 +799,25 @@ impl Driver {
         }
     }
 
-    /// 组合键（按住修饰键 → 点按主键 → 释放修饰键）。
+    /// 组合键（按下修饰键 → 点按主键 → 释放修饰键）。
+    ///
+    /// 修饰键必须以 [`egui::Event::ModifiersChanged`] 注入：`ui.input`
+    /// 的 `i.modifiers` 读的是**全局修饰键状态**（只由该事件更新），
+    /// `Event::Key` 自带的 modifiers 字段不进这个状态——只发 Key 事件
+    /// 时 `i.modifiers.ctrl` 恒 false，Ctrl+Z 这类组合键永远判定失败。
     fn press_keys(&mut self, mods: &[egui::Modifiers], key: egui::Key) {
         let modifiers = mods
             .iter()
             .copied()
             .fold(egui::Modifiers::default(), |m, f| m | f);
+        // 按下修饰键（更新全局状态）。
         self.tick_with(|input| {
-            for m in mods {
-                input.events.push(egui::Event::Key {
-                    physical_key: None,
-                    key: egui::Key::A,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: *m,
-                });
-            }
+            input
+                .events
+                .push(egui::Event::ModifiersChanged(modifiers));
+        });
+        // 点按主键（两帧：按下 / 抬起，与单击同节奏）。
+        self.tick_with(|input| {
             input.events.push(egui::Event::Key {
                 physical_key: None,
                 key,
@@ -822,6 +825,8 @@ impl Driver {
                 repeat: false,
                 modifiers,
             });
+        });
+        self.tick_with(|input| {
             input.events.push(egui::Event::Key {
                 physical_key: None,
                 key,
@@ -829,15 +834,12 @@ impl Driver {
                 repeat: false,
                 modifiers,
             });
-            for _ in mods {
-                input.events.push(egui::Event::Key {
-                    physical_key: None,
-                    key: egui::Key::A,
-                    pressed: false,
-                    repeat: false,
-                    modifiers: egui::Modifiers::default(),
-                });
-            }
+        });
+        // 释放修饰键（全局状态复位）。
+        self.tick_with(|input| {
+            input
+                .events
+                .push(egui::Event::ModifiersChanged(egui::Modifiers::default()));
         });
     }
 

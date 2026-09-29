@@ -25,6 +25,18 @@ impl GuanqiApp {
         }
         let reference = self.reference.as_ref()?;
         let mut deviation_top = None;
+        // 照库落子的守卫与结构化续法（与命中详情同一数据源，每帧现场
+        // 派生）：
+        // - 末端守卫：续法只描述「当前这个库中局面」的后续，只在游标
+        //   处于活子位置（cursor == line_len，与手点在活子上续棋同口径）
+        //   时可落；回看中点续法会落到旧局面上建变着分支，不是用户要的
+        //   「照着库走」，入口置灰并说明。
+        // - 行棋方：局面键含行棋方字节 ⇒ 能命中的局面 to_play 必与库内
+        //   节点一致，库内续法（children 首手）行棋方也恒等于 to_play，
+        //   正常数据不会不符；这里仍把实况带给 UI 做防御性对照（注释
+        //   节点链里的着法不查行棋方，构造谱可造出不一致）。
+        let place_blocked = (self.board.cursor() != self.board.line_len())
+            .then(|| "当前在回看历史（非棋谱末端）。".to_owned());
         let hit = match reference.lookup(&self.board) {
             crate::refbook::LookupOutcome::Hit { entry, tail, deviation } => {
                 Some(analysis_panel::ReferenceHit {
@@ -41,6 +53,18 @@ impl GuanqiApp {
                         .continuations
                         .iter()
                         .map(crate::refbook::Continuation::text)
+                        .collect(),
+                    // 结构化落子信息：把 GTP 串按棋盘尺寸换回 Coord（弃着
+                    // 或串非法 = None，UI 置灰）。解析口径只在派生侧一处。
+                    playable: entry
+                        .continuations
+                        .iter()
+                        .map(|cont| {
+                            cont.at
+                                .as_deref()
+                                .and_then(|at| crate::board::Coord::from_gtp(self.board.size(), at).ok())
+                                .map(|at| (cont.player, at))
+                        })
                         .collect(),
                     deviation,
                     live_tail: tail
@@ -60,6 +84,8 @@ impl GuanqiApp {
                                 .unwrap_or_default(),
                         )
                     },
+                    to_play: Some(self.board.to_play()),
+                    place_blocked,
                 })
             }
             crate::refbook::LookupOutcome::Deviation(deviation) => {
@@ -142,5 +168,44 @@ impl GuanqiApp {
     /// 当前参照的只读访问（侧栏卡片与 headless 快照共用）。
     pub fn current_reference(&self) -> Option<&Reference> {
         self.reference.as_ref()
+    }
+
+    /// 照库落子（侧栏「参照」卡片续法点击的执行体）：在当前棋盘**真实
+    /// 落该子**，走手点同一条 `play_with_feedback`（[`Board::play`]：
+    /// 计入棋谱、可 Ctrl+Z 悔棋、局面变化触发既有分析重发）——参照只
+    /// 给指路，落子是对局 / 复盘动作，不走「跳进参照树 / 伪造局面」的
+    /// 旁路。
+    ///
+    /// 守卫（与卡片入口置灰同口径，此处复核防派生与点击之间的局面漂移）：
+    /// - **只允许末端**：`cursor == line_len`（回看中点续法会落到旧局面
+    ///   上建变着分支，不是「照着库走」）；被拒给原因。
+    /// - **行棋方相符**：续法 `player` ≠ 当前 `to_play()` 即拒（说明该
+    ///   续法是为哪一方写的）。
+    ///   落子非法（已被占用 / 劫争等）由 `play_with_feedback` 写入非法
+    ///   提示，与手点同一条错误路径。
+    pub(super) fn play_from_book(&mut self, player: crate::board::Stone, at: crate::board::Coord) {
+        if self.board.cursor() != self.board.line_len() {
+            self.notices.push(LoadNotice::Warn(
+                "照库落子被拒：当前在回看历史（非棋谱末端），只在末端可照库落子。".to_owned(),
+            ));
+            return;
+        }
+        if self.board.to_play() != player {
+            self.notices.push(LoadNotice::Warn(format!(
+                "照库落子被拒：该续法是给{}方走的，当前轮到{}方。",
+                player.name(),
+                self.board.to_play().name(),
+            )));
+            return;
+        }
+        // 走子口径与手点等价：同一函数给出成功反馈（清提示 / 读秒 /
+        // 变着提示）与失败原因（侧栏「非法落子：…」）。
+        crate::ui::board_view::play_with_feedback(
+            &mut self.board,
+            &mut self.notice,
+            &mut self.branch_notice,
+            at,
+            Some(&mut self.play),
+        );
     }
 }

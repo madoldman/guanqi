@@ -90,6 +90,16 @@ pub enum PanelAction {
     /// 点了「局后统计」排行榜某行：跳转到该手（App 调
     /// [`crate::board::Board::go_to`]，曲线 / 棋盘定位随局面联动）。
     GotoTurn(usize),
+    /// 点了参照卡片的某条库内续法：在当前棋盘**真实落该子**（走
+    /// [`crate::board::Board::play`]，与手点完全等价——计入棋谱、可
+    /// 悔棋、触发分析重发；不是跳进参照树、不是预览）。App 侧复核
+    /// 末端 / 行棋方守卫（UI 侧已禁用非法入口，此处兜底双保险）。
+    PlaceFromBook {
+        /// 行棋方（该续法为哪一方而写；与当前 `to_play()` 不符即拒）。
+        player: Stone,
+        /// 落点（续法 `at` 已在派生侧换回棋盘坐标）。
+        at: Coord,
+    },
 }
 
 /// 「打开棋谱」流程的用户可见提示（App 写入，随侧栏提示行显示）。
@@ -214,6 +224,11 @@ pub struct ReferenceHit {
     pub comment: Option<String>,
     /// 库内续法列表（展示串）。
     pub continuations: Vec<String>,
+    /// 库内续法的**结构化落子信息**（与 `continuations` 逐条对齐）：
+    /// `Some((行棋方, 着点))` = 可照库落子；`None` = 弃着续法或坐标
+    /// 解析失败（不可落子）。展示串保留给显示，本字段保留给动作——
+    /// UI 不解析「白 D14」这类文本（解析口径放派生侧单点保证）。
+    pub playable: Vec<Option<(Stone, Coord)>>,
     /// 偏离提示（当前局面命中、但实战最后一手不在库内续法中）。
     pub deviation: Option<String>,
     /// 当前局面的着法尾部（实战口径，「黑 D4」形态），供与库内 tail
@@ -221,6 +236,15 @@ pub struct ReferenceHit {
     pub live_tail: Vec<String>,
     /// 命中条目的比较区域两角（GTP，取证用；卡片不渲染）。
     pub region: String,
+    /// 当前行棋方（`Some` = 派生时实况；行棋方守卫的对照值）。
+    pub to_play: Option<Stone>,
+    /// 末端 / 行棋方守卫的禁用原因（`None` = 照库落子入口放行）。
+    ///
+    /// 续法落子**只允许末端**（`cursor == line_len`，与手点在活子上
+    /// 续棋同口径；回看中落子会建变着分支，而参照续法是对「当前这个
+    /// 库中局面」的建议，回看点的不是它）：非末端时这里给原因，续法
+    /// 行整体置灰。App 派生（每帧随局面联动），UI 只读。
+    pub place_blocked: Option<String>,
 }
 
 /// 侧栏「解题」卡片的展示数据（阶段 22.2；App 从解题模式状态与参照
@@ -543,7 +567,7 @@ fn panel_body(
 
     // ---- 参照（阶段 22）：外部定式库 / 死活题谱的命中与偏离提示 ----
     // 未加载参照时不占地方（一行简短状态），见 card_reference 文档。
-    card_reference(ui, reference, solving);
+    card_reference(ui, reference, solving, &mut action);
 
     // ---- 参照打分区块（阶段 22.3）：进度 / 已淘汰分支 Top N / 明细 ----
     // 挂在参照卡片之下（同一主题域）。无论是否已加载参照都调用：
@@ -1021,7 +1045,12 @@ fn card_explain(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
 /// 解题模式（`solving`，阶段 22.2）：只保留结构信息（文件名 / 规模 /
 /// 警告），**续法与偏离提示隐藏**——那正是答案所在；命中 / 未命中 /
 /// 题面 / 判定的展示由「解题」卡片承担，避免同一信息两处泄露。
-fn card_reference(ui: &mut Ui, reference: Option<&ReferenceView>, solving: bool) {
+fn card_reference(
+    ui: &mut Ui,
+    reference: Option<&ReferenceView>,
+    solving: bool,
+    action: &mut PanelAction,
+) {
     let Some(reference) = reference else {
         // 未加载：一行弱色状态，不占卡片。
         ui.weak("未加载参照文件。可在「文件 → 打开参照文件…」加载定式库 / 死活题谱。");
@@ -1094,18 +1123,74 @@ fn card_reference(ui: &mut Ui, reference: Option<&ReferenceView>, solving: bool)
                     ui.add_space(2.0);
                     ui.colored_label(theme::colors::WARN, deviation);
                 }
-                // 续法列表（库中该局面的后续着法）。
+                // 续法列表（库中该局面的后续着法）。非弃着续法可点击
+                // **照库落子**（走手点同一条 `Board::play` 路径，见
+                // `PanelAction::PlaceFromBook`）；弃着 / 守卫不通过时
+                // 置灰并给悬停原因（静默无效的按钮比没有更糟）。
                 if hit.continuations.is_empty() {
                     ui.weak("库中该局面无续法（叶子节点）。");
                 } else {
-                    ui.weak("库中续法：");
-                    for cont in &hit.continuations {
-                        ui.label(RichText::new(format!("· {cont}")).monospace());
+                    ui.weak("库中续法（点击落子）：");
+                    for (i, cont) in hit.continuations.iter().enumerate() {
+                        continuation_row(ui, i, hit, cont, action);
                     }
                 }
             }
         }
     });
+}
+
+/// 参照卡片的一行库内续法：普通按钮承载展示串（「· 白 D14」），可落子
+/// 的续法点击后派发 [`PanelAction::PlaceFromBook`]（App 走手点同一条
+/// 落子路径）；弃着续法 / 末端守卫不通过 / 行棋方不符时禁用并给悬停
+/// 原因。禁用判定全部在**派生侧 + 本行现场**给出，不派发动作让 App
+/// 再拦一遍——按钮置灰是第一道门，用户看得见原因才不算「点了没反应」。
+fn continuation_row(
+    ui: &mut Ui,
+    index: usize,
+    hit: &ReferenceHit,
+    text: &str,
+    action: &mut PanelAction,
+) {
+    // 结构化落子信息：None = 弃着续法（或坐标解析失败），不可落子。
+    let playable = hit.playable.get(index).copied().flatten();
+    // 行棋方守卫：续法为哪一方而写 ≠ 当前行棋方即不可落（防御性判定，
+    // 正常库内数据两者恒一致，口径见派生侧注释）。
+    let player_mismatch = playable
+        .as_ref()
+        .is_some_and(|(player, _)| hit.to_play != Some(*player));
+    let label = format!("· {text}");
+    let button = egui::Button::new(RichText::new(&label).monospace());
+    // 三个禁用 / 放行分支各自产出 Response（悬停或禁用原因），末尾统一
+    // 判 clicked 派发——借用与分支都拉平，避免嵌套 match 里挂文本。
+    let response = match (playable, player_mismatch, hit.place_blocked.as_deref()) {
+        // 可落子且无守卫拦截：悬停说明动作语义。
+        (Some(_), false, None) => ui.add_enabled(true, button).on_hover_text(format!(
+            "照库落子：在当前棋盘落下 {text}（与手点落子完全等价，可 Ctrl+Z 悔棋）"
+        )),
+        // 可落子但处于回看中（末端守卫拦截）：置灰 + 原因。
+        (Some(_), false, Some(reason)) => ui.add_enabled(false, button)
+            .on_disabled_hover_text(format!(
+                "{reason} 照库落子只在棋谱末端可用（回看中落子会创建变着分支）。"
+            )),
+        // 行棋方不符：置灰 + 说明该续法为哪一方而写。
+        (Some((player, _)), true, _) => ui.add_enabled(false, button)
+            .on_disabled_hover_text(format!(
+                "该续法是给{}方走的，当前轮到{}方，不能照库落子。",
+                player.name(),
+                hit.to_play.map_or("—", |s| s.name()),
+            )),
+        // 弃着续法（或坐标解析失败）：置灰 + 指向既有弃着入口。
+        (None, _, _) => ui.add_enabled(false, button).on_disabled_hover_text(
+            "弃着续法不支持照库落子（落弃着请用「对局 → 弃着」）。",
+        ),
+    };
+    // 只有放行分支的按钮可能 clicked（禁用按钮不产生点击事件）。
+    if response.clicked()
+        && let Some((player, at)) = hit.playable.get(index).copied().flatten()
+    {
+        *action = PanelAction::PlaceFromBook { player, at };
+    }
 }
 
 /// 「参照打分」区块（阶段 22.3）：AI 对参照库的批量评估结果。

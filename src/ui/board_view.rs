@@ -411,6 +411,23 @@ fn handle_click(
 ) {
     let Some(pos) = pos else { return };
     let Some(at) = layout.hit_test(pos) else { return };
+    play_with_feedback(board, notice, branch_notice, at, play);
+}
+
+/// 落子 + 统一反馈（手点与侧栏「照库落子」共用的走子口径）。
+///
+/// 走 [`Board::play`]（计入棋谱树、可悔棋、触发既有分析重发）；成功时
+/// 清非法提示、对弈模式下重置人类方读秒并按需提示「已创建变着分支」，
+/// 非法时把原因写入 `notice`（侧栏消息卡展示）。侧栏入口与手点必须
+/// 走同一个函数：反馈、读秒、变着判定三处口径任何一处漂移都会让
+/// 「照库落子」变成第二种走子语义。
+pub fn play_with_feedback(
+    board: &mut Board,
+    notice: &mut Option<IllegalReason>,
+    branch_notice: &mut Option<String>,
+    at: Coord,
+    play: Option<&mut PlayState>,
+) {
     let children_before = board.child_count();
     let moves_before = board.move_count();
     let mover = board.to_play();
