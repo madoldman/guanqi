@@ -64,6 +64,39 @@ pub const REFSCAN_VISITS: u32 = 40;
 /// 「定式覆盖」的折中。
 pub const REFSCAN_MAX_MOVE_NO: usize = 30;
 
+/// 参照打分的发起配置：扫描范围（库内手数上限）+ 每局面思考量。
+///
+/// 快扫 [`super::batch::BatchConfig`] 的小型对应物。引入结构而非两个
+/// 散参的理由：预估（[`AnalysisState::ref_scan_estimate`]）与发起
+/// （[`AnalysisState::start_ref_scan`]）的签名都同时需要「范围 +
+/// visits」，散参既让两处调用点持续膨胀，也拦不住「预估按 A 档算、
+/// 发起按 B 档跑」的错配——配置单一来源后对话框改动即时写回（快扫
+/// 同款模式），预估与发起读的必然是同一份。默认值 = 阶段 22.3 的既有
+/// 行为（30 手 / 40 visits）：未动过档位的用户结果与升级前完全一致。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RefScanConfig {
+    /// 扫描范围上限（库内手数）：默认 [`REFSCAN_MAX_MOVE_NO`]。
+    pub max_move_no: usize,
+    /// 每局面思考量（visits）：默认 [`REFSCAN_VISITS`]。
+    ///
+    /// 档位的意义与代价（界面文案同口径，必须如实）：visits 越高引擎
+    /// 候选表（`moveInfos`）越长，库中续法拿不到访问量就是「引擎未列
+    /// 出」（不可判定、不臆造数值）——档位提高后可判定样本变多、「已
+    /// 淘汰」检出更充分，**但判定口径（阈值 / 行棋方换算）不变，不代
+    /// 表判定更「正确」，只是样本更充分**；耗时按倍数线性增长（预估
+    /// 与本值同源外推）。
+    pub visits: u32,
+}
+
+impl Default for RefScanConfig {
+    fn default() -> Self {
+        Self {
+            max_move_no: REFSCAN_MAX_MOVE_NO,
+            visits: REFSCAN_VISITS,
+        }
+    }
+}
+
 /// 「已淘汰」的目差阈值（目，行棋方视角）：库中续法与引擎首选的目差
 /// 差达到此值即判「已被 AI 淘汰」。
 ///
@@ -516,15 +549,30 @@ pub fn ref_scan_plan_digest_of(
 impl AnalysisState {
     // ---- 参照打分：发起 / 预估 / 进度 / 取消 / 提示 ----
 
+    /// 当前参照打分配置（范围 + 思考量档位；对话框每帧读取）。
+    pub fn ref_scan_config(&self) -> RefScanConfig {
+        self.ref_scan_config
+    }
+
+    /// 写回参照打分配置（对话框改动即时生效；预估与发起共用同一份，
+    /// 快扫 `set_batch_config` 同款模式）。
+    pub fn set_ref_scan_config(&mut self, config: RefScanConfig) {
+        self.ref_scan_config = config;
+    }
+
     /// 构造参照打分预估（发起前确认框展示）：`(节点数, 预估秒数)`。
     ///
     /// 耗时口径与快扫一致：单线程 40 visits ≈ 0.94s/节点的实测外推
-    /// （[`BATCH_SECS_PER_HAND_AT_40`] 同源），多线程实际更快——预估
-    /// 偏高是有意的。
-    pub fn ref_scan_estimate(tree: &GameTree, size: Size, max_move_no: usize) -> (usize, f64) {
-        let plan = build_ref_scan_plan(tree, size, max_move_no);
+    /// （[`BATCH_SECS_PER_HAND_AT_40`] 同源），按所选 visits 线性放大，
+    /// 多线程实际更快——预估偏高是有意的。
+    pub fn ref_scan_estimate(
+        tree: &GameTree,
+        size: Size,
+        config: RefScanConfig,
+    ) -> (usize, f64) {
+        let plan = build_ref_scan_plan(tree, size, config.max_move_no);
         let secs = plan.positions as f64 * BATCH_SECS_PER_HAND_AT_40
-            * f64::from(REFSCAN_VISITS)
+            * f64::from(config.visits.max(1))
             / 40.0;
         (plan.positions, secs)
     }
@@ -538,7 +586,7 @@ impl AnalysisState {
         size: Size,
         komi: f64,
         game_rules: Option<&str>,
-        max_move_no: usize,
+        config: RefScanConfig,
     ) -> Result<(), String> {
         if self.ref_scan.is_some() {
             return Err("参照库打分已在进行中。".to_owned());
@@ -553,7 +601,7 @@ impl AnalysisState {
         if !matches!(self.engine, EngineStatus::Ready) {
             return Err("引擎未就绪，无法开始参照库打分。".to_owned());
         }
-        let plan = build_ref_scan_plan(tree, size, max_move_no);
+        let plan = build_ref_scan_plan(tree, size, config.max_move_no);
         if plan.positions == 0 {
             return Err("参照库里没有可打分的节点：范围内没有「有库中续法」的局面。\
                         可尝试放宽手数范围。"
@@ -567,7 +615,7 @@ impl AnalysisState {
             results: HashMap::new(),
             done: 0,
             started: Instant::now(),
-            visits: REFSCAN_VISITS,
+            visits: config.visits.max(1),
             komi,
             rules: self.effective_rules(game_rules),
             view: self.want_view,

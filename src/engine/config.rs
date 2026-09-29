@@ -97,6 +97,11 @@ pub struct UiPrefs {
     pub batch_deepen_top: usize,
     /// 加深每手 visits。
     pub batch_deepen_visits: u32,
+    /// 参照库打分每局面 visits（思考量档位，默认 40）。旧配置缺此键时
+    /// 回退默认档（struct 级 `#[serde(default)]`），升级前的扫描口径
+    /// 不变。手数范围不持久化——那是「这一次扫描」的参数，与快扫
+    /// 「记住用户改过的档位」的定位不同。
+    pub refscan_visits: u32,
     /// ---- 另存写回 ----
     /// 另存时把逐手损失注释（疑问手及以上；数据缺失的手不注）写进
     /// 各手节点的 `C[]`（【观棋 N】界标块，幂等）。默认开——产物本身
@@ -140,6 +145,7 @@ impl Default for UiPrefs {
             batch_deepen: true,
             batch_deepen_top: 10,
             batch_deepen_visits: 300,
+            refscan_visits: 40,
             annotate_moves: true,
             window_geometry: None,
             last_open_dir: None,
@@ -767,6 +773,11 @@ fn config_from_value(value: &serde_json::Value, notices: &mut Vec<String>) -> En
                     ));
                     prefs.batch_side = "all".to_owned();
                 }
+                // 数值型偏好统一做下限兜底（手改 0 / 负数会破坏查询语义）。
+                prefs.batch_visits = prefs.batch_visits.max(1);
+                prefs.batch_deepen_top = prefs.batch_deepen_top.max(1);
+                prefs.batch_deepen_visits = prefs.batch_deepen_visits.max(1);
+                prefs.refscan_visits = prefs.refscan_visits.max(1);
                 prefs
             }
             Err(_) => {

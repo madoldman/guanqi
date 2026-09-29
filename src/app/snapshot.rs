@@ -289,6 +289,11 @@ pub struct RefScanSnapshot {
     pub results: Vec<RefNodeScoreDump>,
     /// 会被判淘汰的节点数（与 results 同源，报告核对用）。
     pub outdated_nodes: usize,
+    /// 当前配置的每局面思考量（档位取证：`refscan config` / 对话框
+    /// 选档后 dump 比对，重启后应保持）。
+    pub config_visits: u32,
+    /// 当前配置的范围上限（库内手数）。
+    pub config_max_move_no: usize,
 }
 
 /// 一个被扫节点的评分取证形态。
@@ -406,11 +411,14 @@ impl GuanqiApp {
     }
 
     /// 发起参照库打分（headless 工具的 `refscan on` 落点；与对话框
-    /// 「开始打分」同一执行体，规则 / 贴目口径一致）。
+    /// 「开始打分」同一执行体，规则 / 贴目口径一致）。`visits` 为
+    /// `Some` 时先写进配置再发起（等价用户在对话框选档），`None` 用
+    /// 当前配置（默认 40 档，与升级前行为一致）。
     #[doc(hidden)]
     pub fn start_ref_scan_pub(
         &mut self,
         max_move_no: usize,
+        visits: Option<u32>,
     ) -> Result<(), String> {
         let Some(reference) = self.reference.as_ref() else {
             return Err("未加载参照文件".to_owned());
@@ -421,14 +429,28 @@ impl GuanqiApp {
             .loaded
             .as_ref()
             .and_then(|meta| meta.info.rules.as_deref());
+        let mut config = self.analysis.ref_scan_config();
+        config.max_move_no = max_move_no;
+        if let Some(visits) = visits {
+            config.visits = visits;
+        }
         self.analysis
-            .start_ref_scan(tree, size, self.komi, game_rules, max_move_no)
+            .start_ref_scan(tree, size, self.komi, game_rules, config)
     }
 
     /// 取消参照库打分（headless 工具的 `refscan off` 落点）。
     #[doc(hidden)]
     pub fn cancel_ref_scan_pub(&mut self) {
         self.analysis.cancel_ref_scan();
+    }
+
+    /// 设置参照打分的思考量档位（headless 工具的 `refscan config`
+    /// 落点；只改配置不发起，等价用户在对话框选档——含随偏好落盘）。
+    #[doc(hidden)]
+    pub fn set_ref_scan_visits_pub(&mut self, visits: u32) {
+        let mut config = self.analysis.ref_scan_config();
+        config.visits = visits;
+        self.analysis.set_ref_scan_config(config);
     }
 
     /// 离线构造扫描计划并打印摘要（headless 工具的 `refscan plan` 落点；
@@ -668,11 +690,21 @@ impl GuanqiApp {
             judge_notice: self.last_judge_notice(),
             ref_scan: {
                 // 打分取证：进度 / 计划摘要 / 结果明细三段。results 排序
-                // 稳定（按手数）便于 diff；空结果且无任务 = None。
+                // 稳定（按手数）便于 diff；空闲且无结果时只回配置两字段
+                // （档位 / 范围取证不依赖扫描发生——持久化验证要在未发起
+                // 时就能 dump 出当前档位）。
                 let results = self.analysis.ref_scan_results();
                 let progress = self.analysis.ref_scan_progress();
+                let config = self.analysis.ref_scan_config();
                 if results.is_none() && progress.is_none() {
-                    None
+                    Some(RefScanSnapshot {
+                        progress: None,
+                        plan: None,
+                        outdated_nodes: 0,
+                        results: Vec::new(),
+                        config_visits: config.visits,
+                        config_max_move_no: config.max_move_no,
+                    })
                 } else {
                     let mut nodes: Vec<RefNodeScoreDump> = results
                         .map(|m| m.values())
@@ -707,6 +739,8 @@ impl GuanqiApp {
                             .filter(|n| n.continuations.iter().any(|c| c.outdated))
                             .count(),
                         results: nodes,
+                        config_visits: config.visits,
+                        config_max_move_no: config.max_move_no,
                     })
                 }
             },
@@ -890,6 +924,8 @@ impl StateSnapshot {
                 })),
                 "plan": plan,
                 "outdated_nodes": rs.outdated_nodes,
+                "config_visits": rs.config_visits,
+                "config_max_move_no": rs.config_max_move_no,
                 "results": results,
             })
         });

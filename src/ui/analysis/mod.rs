@@ -67,7 +67,7 @@ use limits::LimitsEpoch;
 use thinking::ThinkingLog;
 
 pub use refscan::{
-    ref_scan_plan_digest_of, RefContinuationScore, RefNodeScore, RefScanResults,
+    ref_scan_plan_digest_of, RefContinuationScore, RefNodeScore, RefScanConfig, RefScanResults,
     REFSCAN_MAX_MOVE_NO, REFSCAN_OUTDATED_SCORE, REFSCAN_OUTDATED_WINRATE, REFSCAN_VISITS,
 };
 
@@ -192,6 +192,11 @@ pub struct AnalysisState {
     /// [`Self::ref_scan_results`]。调度模式（组间串行、切块、心跳、
     /// terminate）复用快扫，见 `refscan` 模块文档。
     ref_scan: Option<refscan::RefScanJob>,
+    /// 参照打分的发起配置（范围 + 思考量档位）。对话框每帧经
+    /// [`Self::ref_scan_config`] 读 / [`Self::set_ref_scan_config`] 写，
+    /// 预估与发起共用同一份（快扫 `batch_config` 同款单一来源）。
+    /// 发起时整份定格进任务，进行中改配置不影响在飞扫描。
+    ref_scan_config: refscan::RefScanConfig,
     /// 参照库打分的已完成结果（按树内路径键）。**本会话内保存、换参照
     /// 即清空**（`detach_ref_scan`），不做持久化。
     ref_scan_results: refscan::RefScanResults,
@@ -285,6 +290,7 @@ impl AnalysisState {
             batch_config: BatchConfig::default(),
             batch_notice: None,
             ref_scan: None,
+            ref_scan_config: refscan::RefScanConfig::default(),
             ref_scan_results: HashMap::new(),
             ref_scan_notice: None,
             gating: CandidateGating::Immediate,

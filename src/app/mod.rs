@@ -108,12 +108,8 @@ pub struct GuanqiApp {
     /// 从侧栏卡片搬家而来：设置与预估同屏，看完预估再决定发起）。
     batch_scan_open: bool,
     /// 参照库打分对话框是否打开（菜单「分析 → 参照库打分…」的入口，
-    /// 阶段 22.3：范围确认 + 预估同屏；无参照时菜单入口已置灰）。
+    /// 阶段 22.3：范围 / 档位确认 + 预估同屏；无参照时菜单入口已置灰）。
     ref_scan_open: bool,
-    /// 参照库打分的手数范围上限（对话框可编辑；默认
-    /// [`crate::ui::analysis::REFSCAN_MAX_MOVE_NO`]，不持久化——范围是
-    /// 「这一次扫描」的参数，与快扫配置的持久化定位不同）。
-    ref_scan_max: usize,
     /// 另存时是否写逐手注释块（「分析」菜单开关，随 ui_prefs 持久化；
     /// 默认开）。只影响「另存为」的写回内容，不改任何分析数据流。
     annotate_moves: bool,
@@ -415,6 +411,12 @@ impl GuanqiApp {
             ..crate::ui::analysis::BatchConfig::default()
         };
         analysis.set_batch_config(batch_config);
+        // 参照打分档位（visits）随偏好恢复；手数范围用默认值（不持久化，
+        // 与快扫「记住用户改过的档位」的定位差异见 UiPrefs 字段文档）。
+        analysis.set_ref_scan_config(crate::ui::analysis::RefScanConfig {
+            visits: prefs.refscan_visits.max(1),
+            ..crate::ui::analysis::RefScanConfig::default()
+        });
         if let Some(gating) = prefs.gating() {
             analysis.set_gating(gating);
         }
@@ -454,7 +456,6 @@ impl GuanqiApp {
             settings_open: false,
             batch_scan_open: false,
             ref_scan_open: false,
-            ref_scan_max: crate::ui::analysis::REFSCAN_MAX_MOVE_NO,
             annotate_moves: prefs.annotate_moves,
             startup_notice,
             persist_notice: None,
@@ -614,6 +615,7 @@ impl GuanqiApp {
             batch_deepen: self.analysis.batch_config().deepen_enabled,
             batch_deepen_top: self.analysis.batch_config().deepen_top,
             batch_deepen_visits: self.analysis.batch_config().deepen_visits,
+            refscan_visits: self.analysis.ref_scan_config().visits,
             annotate_moves: self.annotate_moves,
             // 窗口几何 / 文件目录记忆在各自路径上单独写入，这里原样保留。
             window_geometry: self.engine_cfg.ui_prefs.window_geometry.take(),
@@ -998,7 +1000,9 @@ impl eframe::App for GuanqiApp {
         }
 
         // 参照库打分对话框（「分析 → 参照库打分…」入口，阶段 22.3）：
-        // 范围确认 + 预估同屏；发起与取消走 AnalysisState 的独立批处理。
+        // 范围 / 档位确认 + 预估同屏；发起与取消走 AnalysisState 的独立
+        // 批处理。配置单一来源在 `analysis.ref_scan_config()`：对话框每帧
+        // 读、改动即时写回（快扫同款模式），预估与发起读的必然是同一份。
         if self.ref_scan_open {
             let ctx = ui.ctx().clone();
             let game_rules =
@@ -1011,7 +1015,6 @@ impl eframe::App for GuanqiApp {
                     &mut self.ref_scan_open,
                     &mut self.analysis,
                     reference,
-                    &mut self.ref_scan_max,
                     self.komi,
                     game_rules,
                 );
@@ -1022,7 +1025,7 @@ impl eframe::App for GuanqiApp {
                             reference.size(),
                             self.komi,
                             game_rules,
-                            self.ref_scan_max,
+                            self.analysis.ref_scan_config(),
                         ) {
                             self.notices.push(analysis_panel::LoadNotice::Warn(reason));
                         }

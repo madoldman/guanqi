@@ -517,17 +517,24 @@ impl Driver {
                     self.tick_default();
                 }
                 // 参照库打分（阶段 22.3）：
-                //   refscan on [max]  发起打分（可选手数范围上限，默认 30）
+                //   refscan on [max] [visits]  发起打分（可选范围上限，默认 30；
+                //                     可选每局面 visits，缺省用当前配置 = 40）
                 //   refscan off       取消打分
                 //   refscan plan [max]  离线打印扫描计划（链数/每链 turns/节点数/摆子数）
+                //   refscan config [visits]  只改档位不发起（持久化验证用）
                 "refscan" => {
                     let (sub, arg) = rest.split_once(' ').unwrap_or((rest, ""));
                     match sub {
                         "on" => {
-                            let max = arg.trim().parse::<usize>().unwrap_or(
-                                guanqi::ui::analysis::REFSCAN_MAX_MOVE_NO,
-                            );
-                            let started = self.app.start_ref_scan_pub(max);
+                            let mut parts = arg.split_whitespace();
+                            let max = parts
+                                .next()
+                                .and_then(|v| v.parse::<usize>().ok())
+                                .unwrap_or(guanqi::ui::analysis::REFSCAN_MAX_MOVE_NO);
+                            let visits =
+                                parts.next().and_then(|v| v.parse::<u32>().ok());
+                            let started =
+                                self.app.start_ref_scan_pub(max, visits);
                             self.tick_default();
                             if let Err(reason) = started {
                                 println!("[refscan] 发起失败：{reason}");
@@ -551,9 +558,19 @@ impl Driver {
                             }
                             self.tick_default();
                         }
+                        // 只改档位不发起：写进配置，随退出偏好落盘（验证
+                        // 「档位被记住」用；发起路径请用 `on [max] [visits]`）。
+                        "config" => {
+                            let visits = arg.trim().parse::<u32>().map_err(|_| {
+                                format!("refscan config 需要 visits 数值{}", label())
+                            })?;
+                            self.app.set_ref_scan_visits_pub(visits);
+                            self.tick_default();
+                            println!("[refscan-config] 档位已设为 {visits}");
+                        }
                         other => {
                             return Err(format!(
-                                "refscan 参数非法：{other}（on / off / plan）{}",
+                                "refscan 参数非法：{other}（on / off / plan / config）{}",
                                 label()
                             ));
                         }
