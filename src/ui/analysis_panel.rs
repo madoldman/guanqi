@@ -100,6 +100,9 @@ pub enum PanelAction {
         /// 落点（续法 `at` 已在派生侧换回棋盘坐标）。
         at: Coord,
     },
+    /// 点了参照卡片的「查看库中树…」：开关只读浏览窗口（阶段 23.2）。
+    /// 纯显示开关，不携带数据（树数据由 App 每帧从参照派生）。
+    ToggleRefTree,
 }
 
 /// 「打开棋谱」流程的用户可见提示（App 写入，随侧栏提示行显示）。
@@ -450,6 +453,8 @@ pub fn show(
     reference: Option<&ReferenceView>,
     solving: bool,
     solving_view: Option<&SolvingView>,
+    // 「库中树」浏览窗口开关（按钮文本态 / 解题模式短路用）。
+    ref_tree_open: bool,
 ) -> PanelAction {
     egui::ScrollArea::vertical()
         .show(ui, |ui| {
@@ -476,6 +481,7 @@ pub fn show(
                 reference,
                 solving,
                 solving_view,
+                ref_tree_open,
             )
         })
         .inner
@@ -515,6 +521,7 @@ fn panel_body(
     reference: Option<&ReferenceView>,
     solving: bool,
     solving_view: Option<&SolvingView>,
+    ref_tree_open: bool,
 ) -> PanelAction {
     let mut action = PanelAction::None;
 
@@ -567,7 +574,7 @@ fn panel_body(
 
     // ---- 参照（阶段 22）：外部定式库 / 死活题谱的命中与偏离提示 ----
     // 未加载参照时不占地方（一行简短状态），见 card_reference 文档。
-    card_reference(ui, reference, solving, &mut action);
+    card_reference(ui, reference, solving, ref_tree_open, &mut action);
 
     // ---- 参照打分区块（阶段 22.3）：进度 / 已淘汰分支 Top N / 明细 ----
     // 挂在参照卡片之下（同一主题域）。无论是否已加载参照都调用：
@@ -1049,6 +1056,7 @@ fn card_reference(
     ui: &mut Ui,
     reference: Option<&ReferenceView>,
     solving: bool,
+    ref_tree_open: bool,
     action: &mut PanelAction,
 ) {
     let Some(reference) = reference else {
@@ -1084,10 +1092,27 @@ fn card_reference(
             );
             return;
         }
-        // 解题模式：续法 / 偏离 / 注释都是剧透内容，到结构信息为止。
+        // 解题模式：续法 / 偏离 / 注释都是剧透内容，到结构信息为止
+        // （库中树窗口同样含注释 / 续法 = 剧透，入口一并短路）。
         if solving {
             ui.weak("解题模式：命中详情已隐藏（判定见「解题」卡片）。");
             return;
+        }
+        // 「查看库中树…」入口（阶段 23.2）：打开只读浏览窗口。已加载
+        // 参照即可用（未命中局面也能从库根浏览库结构）；窗口开着时
+        // 按钮文本带「关闭」提示（同一开关）。
+        let tree_btn = if ref_tree_open {
+            egui::Button::new("关闭库中树")
+        } else {
+            egui::Button::new("查看库中树…")
+        };
+        if ui
+            .add(tree_btn)
+            .on_hover_text("在独立窗口浏览参照库的树结构：当前局面的祖先路径、\
+                            各分支的后续与库内注释（只读，不影响棋盘）")
+            .clicked()
+        {
+            *action = PanelAction::ToggleRefTree;
         }
         // 当前局面命中情况。
         match &reference.hit {

@@ -115,6 +115,9 @@ pub struct StateSnapshot {
     pub board_area: std::cell::RefCell<Option<egui::Rect>>,
     /// 参照文件状态与当前局面命中情况（阶段 22；`None` = 未加载参照）。
     pub reference: Option<ReferenceSnapshot>,
+    /// 参照树浏览（阶段 23.2）：「库中树」窗口打开时的视图内容取证。
+    /// 窗口关闭 / 解题模式 / 无参照时为 `None`（与真实渲染判定一致）。
+    pub ref_tree_view: Option<RefTreeViewDump>,
     /// 参照库打分状态（阶段 22.3；`None` = 本会话无结果且无在飞任务）。
     pub ref_scan: Option<RefScanSnapshot>,
     /// 解题模式是否开启（阶段 22.2；不剧透总闸的原始状态）。
@@ -273,6 +276,52 @@ pub struct RefHitSnapshot {
     pub live_tail: Vec<String>,
     /// 命中条目的比较区域两角（GTP）。
     pub region: String,
+}
+
+/// 参照树浏览的取证形态（阶段 23.2；headless dump 用）。
+///
+/// 行列表 = 视图实际渲染的先序行（与绘制侧同一派生函数产出），每行带
+/// 路径 / 文本 / 注释长度 / 命中标记 / 默认展开标记 / 截断标记 ——
+/// 「祖先路径正确、续法数量正确、注释取自对应节点、命中标记随局面
+/// 移动」的验证全部以此为准。
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct RefTreeViewDump {
+    /// 锚点说明行（「库内位置 0-2」/「从库根浏览」）。
+    pub anchor_text: String,
+    /// 命中节点路径（无命中为 `None`）。
+    pub hit_path: Option<String>,
+    /// 未命中态的原因说明（窗口顶部展示的同一文本）。
+    pub no_hit_reason: Option<String>,
+    /// 先序行列表。
+    pub rows: Vec<RefTreeRowDump>,
+    /// 视图内展开集合的**真实状态**（用户点击后的显式展开路径，排除
+    /// 派生默认值）——展开 / 收起交互生效的直接取证。
+    pub expanded_paths: Vec<String>,
+    /// 是否截断。
+    pub truncated: bool,
+}
+
+/// 一行的取证形态。
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct RefTreeRowDump {
+    /// 统一树路径（「0-2-1」形态；库根 = "根"）。
+    pub path: String,
+    /// 缩进层级。
+    pub depth: usize,
+    /// 行文本（「黑 D4」/「库根」）。
+    pub label: String,
+    /// 注释全文（取证注释内容对账；`None` = 无注释）。
+    pub comment: Option<String>,
+    /// 是否有后继着法。
+    pub has_children: bool,
+    /// 是否当前命中节点。
+    pub is_hit: bool,
+    /// 派生侧默认展开标记。
+    pub expanded: bool,
+    /// 是否截断。
+    pub truncated: bool,
 }
 
 /// 参照库打分的取证形态（阶段 22.3；headless dump 用）。
@@ -654,6 +703,48 @@ impl GuanqiApp {
             .map(|c| format!("{c:?}"))
             .collect(),
             board_area: std::cell::RefCell::new(None),
+            ref_tree_view: {
+                // 与渲染判定一致：窗口开 + 非解题 + 有参照。解题模式下
+                // 视图内容含注释 / 续法 = 剧透面，取证同样不带出（渲染
+                // 侧强制收起窗口，dump 返回 None）。
+                if self.ref_tree_ui.open && !self.solving_mode {
+                    self.ref_tree_view().map(|(view, reason)| RefTreeViewDump {
+                        anchor_text: view.anchor_text,
+                        hit_path: view.hit_path.as_ref().map(|p| {
+                            crate::ui::ref_tree::path_text(p)
+                        }),
+                        no_hit_reason: reason,
+                        expanded_paths: {
+                            let mut paths = self
+                                .ref_tree_ui
+                                .expanded_paths()
+                                .unwrap_or_default()
+                                .iter()
+                                .map(|p| crate::ui::ref_tree::path_text(p))
+                                .collect::<Vec<_>>();
+                            paths.sort();
+                            paths
+                        },
+                        rows: view
+                            .rows
+                            .iter()
+                            .map(|row| RefTreeRowDump {
+                                path: crate::ui::ref_tree::path_text(&row.path),
+                                depth: row.depth,
+                                label: row.label.clone(),
+                                comment: row.comment.clone(),
+                                has_children: row.has_children,
+                                is_hit: row.is_hit,
+                                expanded: row.expanded,
+                                truncated: row.truncated,
+                            })
+                            .collect(),
+                        truncated: view.truncated,
+                    })
+                } else {
+                    None
+                }
+            },
             reference: self.reference_view().map(|view| ReferenceSnapshot {
                 source: self
                     .reference
@@ -877,6 +968,25 @@ impl StateSnapshot {
                 "hit": hit,
             })
         });
+        let ref_tree_view = self.ref_tree_view.as_ref().map(|tv| {
+            let rows = tv.rows.iter().map(|row| {
+                serde_json::json!({
+                    "path": row.path, "depth": row.depth,
+                    "label": row.label, "comment": row.comment,
+                    "has_children": row.has_children, "is_hit": row.is_hit,
+                    "expanded": row.expanded, "truncated": row.truncated,
+                })
+            }).collect::<Vec<_>>();
+            serde_json::json!({
+                "anchor_text": tv.anchor_text,
+                "hit_path": tv.hit_path,
+                "no_hit_reason": tv.no_hit_reason,
+                "expanded_paths": tv.expanded_paths,
+                "row_count": tv.rows.len(),
+                "truncated": tv.truncated,
+                "rows": rows,
+            })
+        });
         let solving_hidden = serde_json::json!({
             "board_candidates": self.solving_hidden.board_candidates,
             "board_heat": self.solving_hidden.board_heat,
@@ -983,6 +1093,7 @@ impl StateSnapshot {
             "game_summary": game_summary,
             "viewport_commands": self.viewport_commands,
             "reference": reference,
+            "ref_tree_view": ref_tree_view,
             "ref_scan": ref_scan,
             "solving": self.solving,
             "answer_shown": self.answer_shown,

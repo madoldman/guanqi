@@ -33,7 +33,7 @@ use crate::ui;
 use crate::ui::{
     analysis::{AnalysisState, EngineStatus, Waker},
     analysis_panel::self,
-    batch_scan, curve, mini_board, new_game, overlay, settings, tree,
+    batch_scan, curve, mini_board, new_game, overlay, ref_tree, settings, tree,
 };
 
 // ---- 按职责拆出的子模块（菜单 / 对话框 / 读写 / 对弈 / 文档 / 快照）----
@@ -93,6 +93,9 @@ pub struct GuanqiApp {
     thinking_open: bool,
     /// 棋谱树控件跨帧状态（布局缓存与自动滚动记忆）。
     tree_ui: tree::TreeUi,
+    /// 参照树浏览（阶段 23.2）：「库中树」只读窗口开关与视图内展开
+    /// 集合。与对局树控件状态完全独立（两棵树、两种交互语义）。
+    ref_tree_ui: ref_tree::RefTreeUi,
     /// 小棋盘 PV 回放状态机（第 6 项；开关在叠加层卡片，默认关）。
     mini_board: mini_board::MiniBoard,
     /// 棋盘替换代数：整体替换棋盘（载谱 / 新对局）时递增，混入树布局
@@ -449,6 +452,7 @@ impl GuanqiApp {
             tree_open: prefs.tree_open,
             thinking_open: prefs.thinking_open,
             tree_ui: tree::TreeUi::default(),
+            ref_tree_ui: ref_tree::RefTreeUi::default(),
             mini_board: mini_board::MiniBoard::default(),
             tree_epoch: 0,
             engine_cfg,
@@ -741,6 +745,7 @@ impl eframe::App for GuanqiApp {
                     reference_view.as_ref(),
                     self.solving_mode,
                     solving_view.as_ref(),
+                    self.ref_tree_ui.open,
                 );
             });
         match panel_action {
@@ -793,6 +798,12 @@ impl eframe::App for GuanqiApp {
             // 派生与点击之间隔了渲染帧，局面可能刚好变化）。
             analysis_panel::PanelAction::PlaceFromBook { player, at } => {
                 self.play_from_book(player, at);
+            }
+            // 「查看库中树…」开关（阶段 23.2）：只翻窗口开关，树数据
+            // 每帧从参照派生。卸载参照时窗口在 ui 层被强制关闭（无数据
+            // 可看），此处不做额外守卫。
+            analysis_panel::PanelAction::ToggleRefTree => {
+                self.ref_tree_ui.open = !self.ref_tree_ui.open;
             }
             analysis_panel::PanelAction::None => {}
         }
@@ -857,6 +868,31 @@ impl eframe::App for GuanqiApp {
                         &self.overlay,
                     );
                 });
+        }
+
+        // 参照树浏览窗口（阶段 23.2）：只读查看库结构。数据每帧从
+        // 参照派生（窗口打开时才有展开量）；解题模式下强制收起（注释
+        // / 续法即答案，防剧透口径与参照卡片一致）；无参照时同样不画
+        // （无内容可看）。锚点由命中情况现场决定（命中 → 命中节点；
+        // 未命中 / 偏离 → 库根）。
+        if self.ref_tree_ui.open {
+            if self.solving_mode {
+                self.ref_tree_ui.open = false;
+            } else if let Some((view, reason)) = self.ref_tree_view() {
+                if let Some(reference) = self.reference.as_ref() {
+                    let ctx = ui.ctx().clone();
+                    ref_tree::show_window(
+                        &ctx,
+                        &mut self.ref_tree_ui,
+                        &view,
+                        reference.tree(),
+                        reference.size(),
+                        reason.as_deref(),
+                    );
+                }
+            } else {
+                self.ref_tree_ui.open = false;
+            }
         }
 
         // 棋谱树底部面板：整棵对局树可视化 + 点击跳转（见 ui::tree 模块

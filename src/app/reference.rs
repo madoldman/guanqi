@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use super::GuanqiApp;
 use crate::refbook::{Reference, load_reference};
 use crate::ui::analysis_panel::{self, LoadNotice};
+use crate::ui::ref_tree;
 
 impl GuanqiApp {
     /// 派生侧栏「参照」卡片的展示数据（每帧一次；命中查询是 O(1)
@@ -168,6 +169,45 @@ impl GuanqiApp {
     /// 当前参照的只读访问（侧栏卡片与 headless 快照共用）。
     pub fn current_reference(&self) -> Option<&Reference> {
         self.reference.as_ref()
+    }
+
+    /// 派生「库中树」浏览视图（阶段 23.2）：窗口渲染与 headless dump
+    /// 共用同一数据源（渲染什么、取证什么，两面对账天然一致）。
+    ///
+    /// 返回 `None` = 窗口不该有内容（无参照；解题模式由调用方先行短路）。
+    /// 锚点：命中 → 命中节点（祖先链 + 后继）；未命中 / 偏离 → 库根
+    /// （浏览库结构也是本功能的合法用途），并给出窗口顶部的原因说明。
+    pub(super) fn ref_tree_view(
+        &self,
+    ) -> Option<(ref_tree::RefTreeView, Option<String>)> {
+        let reference = self.reference.as_ref()?;
+        let hit_path = self
+            .reference_view()
+            .and_then(|view| view.hit)
+            .map(|hit| {
+                hit.path
+                    .split('-')
+                    .filter_map(|part| part.parse::<usize>().ok())
+                    .collect::<Vec<_>>()
+            });
+        let (anchor, reason) = match hit_path {
+            Some(path) => (ref_tree::RefTreeAnchor::Hit(path), None),
+            None => (
+                ref_tree::RefTreeAnchor::Root,
+                Some(
+                    "当前局面未在库中命中（或已偏离）——从库根浏览；\
+                     走回库内分支后视图会跳到命中位置。"
+                        .to_owned(),
+                ),
+            ),
+        };
+        let view = ref_tree::derive_view(
+            reference.tree(),
+            reference.size(),
+            &anchor,
+            reference.tree().root().and_then(|root| root.comment()),
+        );
+        Some((view, reason))
     }
 
     /// 照库落子（侧栏「参照」卡片续法点击的执行体）：在当前棋盘**真实

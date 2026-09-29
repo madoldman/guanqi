@@ -11,6 +11,7 @@ pub mod mini_board;
 pub mod new_game;
 pub mod overlay;
 pub mod ref_scan;
+pub mod ref_tree;
 pub mod report;
 pub mod report_image;
 pub mod settings;
