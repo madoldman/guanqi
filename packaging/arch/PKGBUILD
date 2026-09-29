@@ -19,6 +19,9 @@
 #      源码有改动时递增 pkgrel（同一上游版本的新构建，便于区分已装版本）。
 #   5) makepkg -f 构建（保留构建目录里的 src/target 可增量编译），
 #      然后 sudo pacman -U guanqi-<pkgver>-<pkgrel>-x86_64.pkg.tar.zst 安装。
+#      ⚠️ 上游**模块形态变化**（单文件 → 目录模块，如 app.rs → app/mod.rs）时，
+#      tar 覆盖解包不删旧文件，残留旧单文件与新目录同名校验冲突（E0761）⇒
+#      需先删除构建目录里的 src/guanqi-0.1.0 解包残留再重跑（target 缓存可保留）。
 #      装完可用 `pacman -Q guanqi` 核对版本、`grep -a 整谱快扫 /usr/bin/guanqi`
 #      之类的字符串抽查确认新功能确实进了包。
 #
@@ -28,7 +31,7 @@
 
 pkgname=guanqi
 pkgver=0.1.0
-pkgrel=3
+pkgrel=4
 pkgdesc='观棋 —— KataGo 围棋 AI 引擎图形前端'
 arch=('x86_64')
 license=('MIT')
@@ -67,8 +70,8 @@ source=(
   "guanqi-$pkgver.tar.gz"
   'vendor.tar.gz'
 )
-sha256sums=('611fce335f893be1790ecc3593c6efa582e66194d5a73d3df7dbb9c2d02585c3'
-            '33413593322733e89d55bac806574b9862d80c16cc97fc23b18c5f0a4a774114')
+sha256sums=('c28ab4491fc805c4722d8b36cd19a9c1e04a8bdfc900f79f4d483e478d65714f'
+            '7c0cd3be22d7193da3397c7d761635d7dbbca0a24df8767700d25a0626798e5e')
 
 prepare() {
   cd "guanqi-$pkgver"
