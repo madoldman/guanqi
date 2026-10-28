@@ -126,6 +126,12 @@ impl AnalysisState {
         self.want_view
     }
 
+    /// 取走分析偏置（激进度 PDA）口径变化的提示（「历史数据已清空」；
+    /// App 转入消息区）。机制与 [`Self::take_rules_notice`] 同款。
+    pub fn take_bias_notice(&mut self) -> Option<String> {
+        self.bias_notice.take()
+    }
+
     /// 设置目数视角（App 随设置面板 / 侧栏切换写入）。变化即作废快照，
     /// `sync` 比对 `want/sent` 后重发查询；历史数据不清空——存储恒黑
     /// 视角（SIDETOMOVE 报文在引擎桥接层已归一化），同一份数据两种
@@ -508,6 +514,20 @@ impl AnalysisState {
         // 规则先在取句柄之前解析（借用分离）：`effective_rules` 只读
         // `want_rules`，与引擎句柄的可变借用互斥。
         let rules = self.effective_rules(game_rules);
+        // 分析偏置（PDA）的数据口径判定：PDA 直接扭曲胜率 / 目差（实测
+        // ±2 → 目差 ±8–10 目），不同 PDA 的历史点不可混在一条曲线上——
+        // 与规则口径（`data_rules`）同一纪律。首次产生口径（程序刚启动 /
+        // 载谱后首查）不算「切换」。WRN 不参与（评估漂移在噪声内）。
+        if self.data_bias != Some(cfg.playout_doubling_advantage) {
+            if self.data_bias.is_some() {
+                self.history.clear();
+                self.candidates.clear();
+                self.snapshot = None;
+                self.bias_notice =
+                    Some("分析偏置（激进度）已变化，历史数据已清空。".to_owned());
+            }
+            self.data_bias = Some(cfg.playout_doubling_advantage);
+        }
         // 生效规则相对**数据口径**变化 ⇒ 旧历史（曲线 / 候选表）是别的
         // 规则算的，必须清空并提示。比对放这里（查询组装点）而非设置
         // 写入点：设置变化不必然改变生效规则（自动跟随下换谱同理）。
@@ -600,6 +620,10 @@ impl AnalysisState {
         if stage == Stage::Play {
             query.max_time = max_time;
         }
+        // 分析偏置（激进度 / 分析广度）：恒随查询显式发送（0 = 引擎默认），
+        // 值来自设置（cfg），变化由 sync 的 sent_bias 比对触发重发。
+        query.playout_doubling_advantage = cfg.playout_doubling_advantage;
+        query.wide_root_noise = cfg.wide_root_noise;
         let query_rules_after = query.rules.clone();
         let id = handle.analyze(query);
         self.analyzed_sig = Some(board.records().to_vec());
@@ -607,6 +631,7 @@ impl AnalysisState {
         self.sent_policy = self.want_policy;
         self.sent_moves_ownership = self.want_moves_ownership;
         self.sent_pv_visits = self.want_pv_visits;
+        self.sent_bias = Some((cfg.playout_doubling_advantage, cfg.wide_root_noise));
         // 规则 / 视角 / 贴目随查询定格：want/sent 比对的基准（规则变化在下次
         // sync 比对中触发重发；视角与贴目同理）。
         self.sent_rules = Some(query_rules_after);

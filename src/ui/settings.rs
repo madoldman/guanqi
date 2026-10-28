@@ -34,6 +34,10 @@ pub struct SettingsUi {
         search_threads: u32,
         /// 规则草稿：`None` = 自动（跟随棋谱）；`Some(规则)` = 显式指定。
         rules: Option<crate::engine::Rules>,
+        /// 激进度偏置（查询级 overrideSettings，0 = 引擎默认）。
+        playout_doubling_advantage: f64,
+        /// 分析广度（查询级 overrideSettings，0 = 引擎默认）。
+        wide_root_noise: f64,
     }
 
 impl SettingsUi {
@@ -46,6 +50,8 @@ impl SettingsUi {
                 visits: cfg.visits,
                 search_threads: cfg.search_threads,
                 rules: cfg.rules.as_deref().and_then(crate::engine::Rules::from_wire),
+                playout_doubling_advantage: cfg.playout_doubling_advantage,
+                wide_root_noise: cfg.wide_root_noise,
             },
             weights: Vec::new(),
             message: None,
@@ -71,6 +77,10 @@ impl SettingsUi {
             play_difficulty: base.play_difficulty,
             // 规则存规范名（下拉只产规范名，防自由文本进 settings.json）。
             rules: self.draft.rules.map(|r| r.wire().to_owned()),
+            // 分析偏置随草稿持久化；查询级字段，保存后 sync 比对自动重发
+            // （PDA 变化会清空历史，无需重启引擎进程）。
+            playout_doubling_advantage: self.draft.playout_doubling_advantage.clamp(-3.0, 3.0),
+            wide_root_noise: self.draft.wide_root_noise.clamp(0.0, 3.0),
             // 时限制式与「新对局规则」不在本窗口编辑（新对局窗口改），
             // 原值保留。
             time_system: base.time_system,
@@ -214,6 +224,45 @@ fn body(ui: &mut Ui, state: &mut SettingsUi, cfg: &mut EngineConfig, action: &mu
                      同一局面差可达约 1 目）。「自动」按载入棋谱的 RU[] 属性\
                      宽容映射；谱上未写则按中国规则。",
                 );
+            ui.end_row();
+
+            // 激进度偏置（PDA）：查询级 overrideSettings，恒随查询显式发送。
+            // ⚠️ 非 0 扭曲评估（探针实测 ±2 → 同局面目差 ±8–10 目）——
+            // 这是搜索偏置不是「换视角」，复盘求准确数字时必须保持 0。
+            ui.label("激进度");
+            ui.vertical(|ui| {
+                ui.add_sized(
+                    [96.0, 0.0],
+                    egui::DragValue::new(&mut state.draft.playout_doubling_advantage)
+                        .speed(0.1)
+                        .range(-3.0..=3.0),
+                )
+                .on_hover_text(
+                    "playoutDoublingAdvantage：正值使引擎偏实地 / 激进，负值偏厚势 / 缓慢。\
+                     ⚠️ 非 0 会直接扭曲胜率与目差（实测 +2 → 目差 +9.7），仅用于\
+                     对弈风格与研究向实验；改动会清空逐手历史并重查，无需重启引擎。",
+                );
+                ui.weak("0 = 关闭；非 0 会扭曲评估（研究用）");
+            });
+            ui.end_row();
+
+            // 分析广度（WRN）：非 0 时候选分布变宽而评估几乎不变（实测
+            // 2.0 → 首选占比 0.68→0.14、目差漂移在噪声内）。
+            ui.label("分析广度");
+            ui.vertical(|ui| {
+                ui.add_sized(
+                    [96.0, 0.0],
+                    egui::DragValue::new(&mut state.draft.wide_root_noise)
+                        .speed(0.1)
+                        .range(0.0..=3.0),
+                )
+                .on_hover_text(
+                    "wideRootNoise：加大根节点噪声，让搜索探索更多候选点。\
+                     实测 2.0 时首选 visits 占比从 68% 降到 14%，胜率 / 目差几乎不变。\
+                     改动后自动重查，无需重启引擎。",
+                );
+                ui.weak("0 = 默认；调大可看更多候选（评估不变）");
+            });
             ui.end_row();
         });
 

@@ -227,6 +227,19 @@ pub struct AnalysisState {
     want_view: DisplayView,
     /// 上次发起查询时请求的视角。
     sent_view: DisplayView,
+    /// 上次发起查询时发送的分析偏置（激进度 PDA, 分析广度 WRN）。
+    /// 两者都是查询级 overrideSettings 字段，变化即重发（局面未变也发）；
+    /// 其中 **PDA 变化还清空逐手历史**（见 `data_bias`）。
+    sent_bias: Option<(f64, f64)>,
+    /// 逐手历史与候选表当前数据的 **PDA 口径**（`None` = 无数据）。
+    /// PDA 直接扭曲胜率 / 目差评估（实测 ±2 → 目差 ±8–10 目），不同
+    /// PDA 下的历史点混在一条曲线上是错的——与规则口径（`data_rules`）
+    /// 同一纪律：request 时刻比对，实际变化才清历史并提示。WRN 不进
+    /// 本口径：实测评估漂移在搜索噪声内，历史数据可跨 WRN 值共用。
+    data_bias: Option<f64>,
+    /// PDA 口径变化刚清空历史时的用户提示（App 经
+    /// [`Self::take_bias_notice`] 取走转消息区）。
+    bias_notice: Option<String>,
     /// 最近一次规则解析的「未识别规则串」提示（消息区显示，由 App
     /// 取走转用户可见消息；每帧同步一次，规则未变时保持 `None`）。
     /// 读取方（`take_rules_notice`）走 Cell 之外的直接访问；写入方
@@ -301,6 +314,9 @@ impl AnalysisState {
             data_rules: None,
             want_view: DisplayView::Black,
             sent_view: DisplayView::Black,
+            sent_bias: None,
+            data_bias: None,
+            bias_notice: None,
             rules_notice: None,
             rules_notice_slot: std::cell::Cell::new(None),
             terminal_eval: None,
@@ -465,6 +481,11 @@ impl AnalysisState {
         // 大小写归一与关键词匹配）。
         let resolved_rules = self.effective_rules(game_rules);
         let rules_changed = self.sent_rules.as_deref() != Some(resolved_rules.as_str());
+        // 分析偏置（PDA / WRN）：查询级 overrideSettings 字段，cfg 值变化
+        // 即重发（局面未变也发）。PDA 变化的历史清空在 request 内按数据
+        // 口径判定（`data_bias`），这里只负责触发重发。
+        let bias_changed =
+            self.sent_bias != Some((cfg.playout_doubling_advantage, cfg.wide_root_noise));
         if Some(sig) != self.analyzed_sig.as_deref()
             || limits_changed
             || policy_changed
@@ -473,6 +494,7 @@ impl AnalysisState {
             || view_changed
             || rules_changed
             || komi_changed
+            || bias_changed
         {
             self.snapshot = None;
             self.transient_error = None;

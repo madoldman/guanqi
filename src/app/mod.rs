@@ -117,6 +117,11 @@ pub struct GuanqiApp {
     /// 另存时是否写逐手注释块（「分析」菜单开关，随 ui_prefs 持久化；
     /// 默认开）。只影响「另存为」的写回内容，不改任何分析数据流。
     annotate_moves: bool,
+    /// 对弈即时反馈已提示到的手数（KaTrain「即时反馈」的移植）：人类
+    /// 落子后损失可算时在消息卡提示一次，本字段去重。悔棋 / 回看使游标
+    /// 低于它时自动回落（重走同一手会重新提示，反馈按当前着点重算），
+    /// 新对局 / 载谱后游标归零自然失效，无需专门清理。
+    play_feedback_shown: usize,
     /// 首次读取配置的提示（文件损坏回退等），直到用户保存过新配置。
     startup_notice: Option<String>,
     /// 最近一次难度/设置保存失败的用户提示（成功时不显示）。
@@ -448,6 +453,7 @@ impl GuanqiApp {
             show_pv_visits: prefs.show_pv_visits,
                 show_mistakes: prefs.show_mistakes,
                 show_score_lead: prefs.show_score_lead,
+                show_mistake_bars: prefs.show_mistake_bars,
                 show_mini_board: prefs.show_mini_board,
                 focus: None,
             },
@@ -464,6 +470,7 @@ impl GuanqiApp {
             batch_scan_open: false,
             ref_scan_open: false,
             annotate_moves: prefs.annotate_moves,
+            play_feedback_shown: 0,
             startup_notice,
             persist_notice: None,
             waker,
@@ -595,6 +602,7 @@ impl GuanqiApp {
             show_pv_visits: overlay.show_pv_visits,
             show_mistakes: overlay.show_mistakes,
             show_score_lead: overlay.show_score_lead,
+            show_mistake_bars: overlay.show_mistake_bars,
             show_mini_board: overlay.show_mini_board,
             curve_open: self.curve_open,
             tree_open: self.tree_open,
@@ -851,7 +859,13 @@ impl eframe::App for GuanqiApp {
                 .default_size(120.0)
                 .resizable(true)
                 .show(ui, |ui| {
-                    curve::show(ui, &self.analysis, &self.board, self.overlay.show_score_lead);
+                    curve::show(
+                        ui,
+                        &self.analysis,
+                        &self.board,
+                        self.overlay.show_score_lead,
+                        self.overlay.show_mistake_bars,
+                    );
                 });
         }
 
@@ -1330,6 +1344,83 @@ impl eframe::App for GuanqiApp {
         // 规则解析提示（未识别的 RU 串已按默认规则分析）落位到消息区。
         if let Some(text) = self.analysis.take_rules_notice() {
             self.notices.push(analysis_panel::LoadNotice::Warn(text));
+        }
+        // 分析偏置（激进度）口径变化提示（历史已清空）落位到消息区。
+        if let Some(text) = self.analysis.take_bias_notice() {
+            self.notices.push(analysis_panel::LoadNotice::Warn(text));
+        }
+
+        // ---- 对弈即时反馈（KaTrain instant feedback 的移植）：人类落子
+        // 且该手损失可算（走子前后两个历史点都齐）时，在消息卡提示一次
+        // 该手的损失与分级。检查对象 = 人类的**最后一手**：既看末端
+        // （刚落、引擎还没应手）也看倒数第二（引擎已秒应手——游标前进
+        // 不吞掉反馈窗口）；数据未齐不标记，之后每帧重试直到落库（走子
+        // 前局面的分析在人类思考期间基本已完成，极端快节奏手可能永远
+        // 缺走子前点——如实不提示，绝不臆造）。每帧检查幂等（提示过即
+        // 记录手数）；悔棋 / 回看使游标回落时重置，重走重新提示。
+        {
+            let cursor = self.board.cursor();
+            if self.play_feedback_shown > cursor {
+                self.play_feedback_shown = cursor;
+            }
+            // 人类的最后一手：末端是人类的手 → cursor；末端是引擎应手
+            // → cursor−1（如存在）。回看 / 复盘浏览（cursor 不在末端）
+            // 不触发——反馈是「你刚走完」的即时反馈，不是历史标注。
+            let at_end = cursor == self.board.line_len();
+            let human_last = if at_end
+                && cursor > 0
+                && self
+                    .board
+                    .record_at(cursor - 1)
+                    .is_some_and(|r| r.player == self.play.human)
+            {
+                Some(cursor)
+            } else if at_end
+                && cursor > 1
+                && self
+                    .board
+                    .record_at(cursor - 2)
+                    .is_some_and(|r| r.player == self.play.human)
+            {
+                Some(cursor - 1)
+            } else {
+                None
+            };
+            if self.play.mode
+                && !self.play.finished(&self.board)
+                && let Some(turn) = human_last
+                && self.play_feedback_shown < turn
+                && let Some((loss, best)) = self.analysis.move_feedback(&self.board, turn)
+            {
+                self.play_feedback_shown = turn;
+                let size = self.board.size();
+                let at = match self.board.record_at(turn - 1).map(|r| r.action) {
+                    Some(crate::board::Action::Place(c)) => c.to_gtp(size),
+                    _ => "弃着".to_owned(),
+                };
+                let best_text = best
+                    .map(|(c, wr)| format!("，引擎首选 {}（{:.1}%）", c.to_gtp(size), wr * 100.0))
+                    .unwrap_or_default();
+                let text = format!(
+                    "第 {} 手 {}：损 {:.1} 目（{}）{best_text}",
+                    loss.turn,
+                    at,
+                    loss.score_loss,
+                    loss.severity.name(),
+                );
+                let notice = match loss.severity {
+                    crate::ui::analysis::Severity::Good
+                    | crate::ui::analysis::Severity::Fine => {
+                        analysis_panel::LoadNotice::Ok(text)
+                    }
+                    crate::ui::analysis::Severity::Questionable
+                    | crate::ui::analysis::Severity::Mistake => {
+                        analysis_panel::LoadNotice::Warn(text)
+                    }
+                    crate::ui::analysis::Severity::Blunder => analysis_panel::LoadNotice::Failed(text),
+                };
+                self.notices.push(notice);
+            }
         }
         // 局面变化会先作废快照（见 AnalysisState::sync），借此时机清除定位高亮。
         if self.analysis.snapshot.is_none() {

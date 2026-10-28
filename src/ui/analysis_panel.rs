@@ -808,6 +808,24 @@ fn card_engine(
         info_line(ui, "规则", &rules_line).on_hover_text(
             "引擎按哪套规则计算胜率与目差（数子 / 数目口径不同，同一局面差             可达约 1 目）。显式指定时按设置；「自动」按棋谱 RU[] 宽容映射，             谱上未写按中国。",
         );
+        // 分析偏置（激进度 / 广度）：默认 0 不占位；非 0 时必须显式可见
+        // ——此刻的胜率 / 目差 / 候选分布是被偏置扭曲过的口径（PDA 实测
+        // ±2 → 目差 ±8–10 目），不标注就会被当成正常分析误读。
+        if cfg.playout_doubling_advantage != 0.0 || cfg.wide_root_noise != 0.0 {
+            let pda = cfg.playout_doubling_advantage;
+            let wrn = cfg.wide_root_noise;
+            let mut parts: Vec<String> = Vec::new();
+            if pda != 0.0 {
+                parts.push(format!("激进度 {pda:+.1}（评估被扭曲）"));
+            }
+            if wrn != 0.0 {
+                parts.push(format!("广度 {wrn:.1}"));
+            }
+            info_line(ui, "偏置", &parts.join(" · ")).on_hover_text(
+                "设置里开启了非 0 的分析偏置：激进度（PDA）会直接扭曲胜率与\
+                 目差数字，广度（WRN）让候选分布变宽。求准确分析请把它们调回 0。",
+            );
+        }
         if let Some(snapshot) = &analysis.snapshot {
             info_line(
                 ui,

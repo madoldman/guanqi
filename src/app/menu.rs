@@ -601,6 +601,10 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
                 );
             ui.checkbox(&mut overlay.show_mistakes, "失误标注");
             ui.checkbox(&mut overlay.show_score_lead, "曲线叠加目差线");
+            ui.checkbox(&mut overlay.show_mistake_bars, "曲线失误柱状条").on_hover_text(
+                "曲线底部按手画柱：高度 = 目差损失（≥8 目全高），颜色 = 严重程度\n\
+                 （黄疑问手 / 橙失误 / 红恶手，与棋盘标注同一套）。悬停曲线看精确数值。",
+            );
             ui.checkbox(&mut overlay.show_mini_board, "小棋盘变化图");
             // opt-in 各项的翻转回传（与侧栏 card_overlay 同一条路径）。
             if policy.changed() {

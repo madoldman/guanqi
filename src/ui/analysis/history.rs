@@ -8,8 +8,8 @@ use crate::engine::{MoveInfo, RootInfo};
 
 use super::types::{
     loss_from_points, hash_record, move_block_text, CandidateSnap, GameSummary, HistoryPoint,
-    LossSummary, Severity, WorstMove, DEEP_VISITS_THRESHOLD, HISTORY_CAP, MATCH_MIN_MOVES,
-    WORST_LIMIT,
+    LossSummary, MoveLoss, Severity, WorstMove, DEEP_VISITS_THRESHOLD, HISTORY_CAP,
+    MATCH_MIN_MOVES, WORST_LIMIT,
 };
 use super::AnalysisState;
 
@@ -321,6 +321,31 @@ impl AnalysisState {
             notes.insert(sig, move_block_text(&loss, Some(&actual), best.as_deref()));
         }
         notes
+    }
+
+    /// 单手即时反馈（人机对弈用）：第 `turn` 手（1 起）的损失与走子前
+    /// 局面的引擎首选。返回 `None` = 该手损失暂不可算（两端历史点未齐
+    /// ——引擎应手的分析还在路上；调用方稍后重试，不臆造 0）。
+    ///
+    /// 与 [`Self::move_annotations`] 同一条滚动签名路径：首选查走子前
+    /// 局面（turn−1 前缀签名）的候选表，表缺失 / 首选为弃着 / 表为空
+    /// 都记 `None`（不臆造坐标）。
+    pub fn move_feedback(
+        &self,
+        board: &Board,
+        turn: usize,
+    ) -> Option<(MoveLoss, Option<(Coord, f64)>)> {
+        let points = self.line_points(board);
+        let before = turn.checked_sub(1).and_then(|i| points.get(i).copied()).flatten()?;
+        let after = points.get(turn).copied().flatten()?;
+        let record = board.record_at(turn.checked_sub(1)?)?;
+        let loss = loss_from_points(turn, record.player, before, after)?;
+        let mut sig = 0xcbf2_9ce4_8422_2325;
+        for record in board.line_records().iter().take(turn - 1) {
+            hash_record(&mut sig, record);
+        }
+        let best = self.candidates.get(&sig).and_then(|snap| snap.best);
+        Some((loss, best))
     }
 
     /// 差异手报告条目（复盘报告导出用，[`super::super::report`]
