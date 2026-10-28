@@ -26,7 +26,7 @@
 //! 看得见的每一步改动都留下更符合直觉，也避免「关了窗才发现刚才调的
 //! visits 没保存」的困惑。
 
-use egui::{Align2, Ui, Vec2};
+use egui::{Align2, Ui};
 
 use super::analysis::{AnalysisState, BatchConfig, BatchSide, batch_estimate};
 use super::theme;
@@ -99,7 +99,7 @@ fn body(ui: &mut Ui, analysis: &mut AnalysisState, board: &Board) -> BatchScanAc
         ));
         ui.weak("快扫进行中，切到别的局面会自动取消。");
         ui.add_space(4.0);
-        if wide_button(ui, "取消快扫").clicked() {
+        if theme::wide_button(ui, "取消快扫").clicked() {
             action = BatchScanAction::Cancel;
         }
         return action;
@@ -130,29 +130,27 @@ fn body(ui: &mut Ui, analysis: &mut AnalysisState, board: &Board) -> BatchScanAc
         );
     }
 
-    // ---- 底部动作条：发起（空盘置灰并说明）/ 取消 ----
+    // ---- 底部动作条（主题层统一形态）：发起在禁用态带原因（空盘）----
     ui.add_space(6.0);
     let empty = len == 0;
-    ui.horizontal(|ui| {
-        let start = if empty {
-            ui.add_enabled(false, egui::Button::new("开始快扫"))
-                .on_disabled_hover_text("空盘无谱可扫")
-        } else {
-            ui.add(egui::Button::new("开始快扫"))
-        };
-        let cancel = ui.add(egui::Button::new("取消"));
-        if start.clicked() {
-            action = BatchScanAction::Start;
-        } else if cancel.clicked() {
-            action = BatchScanAction::Close;
+    if let Some(index) = theme::action_row(
+        ui,
+        &[
+            theme::Action { label: "开始快扫", primary: true, enabled: !empty },
+            theme::Action { label: "取消", primary: false, enabled: true },
+        ],
+    ) {
+        match index {
+            0 => action = BatchScanAction::Start,
+            _ => action = BatchScanAction::Close,
         }
-    });
+    }
+    if empty {
+        // 禁用原因挂在动作条之后（action_row 不支持逐钮悬停文案），
+        // 空盘是唯一禁用场景，一行说明比悬停更直接。
+        ui.weak("空盘无谱可扫。");
+    }
     action
-}
-
-/// 等宽铺满的动作按钮（与侧栏 `wide_button` 同款观感）。
-fn wide_button(ui: &mut Ui, text: &str) -> egui::Response {
-    ui.add_sized(Vec2::new(ui.available_width(), 0.0), egui::Button::new(text))
 }
 
 /// 配置编辑区（起止手数 / 每手 visits / 只扫一方 / 含变着 / 自动加深），
@@ -165,7 +163,10 @@ fn settings_body(ui: &mut Ui, draft: &mut BatchConfig, len: usize, changed: &mut
         let from = (draft.from.min(len.saturating_sub(1)) + 1) as i32;
         let mut from_edit = from;
         if ui
-            .add(egui::DragValue::new(&mut from_edit).range(1..=len as i32))
+            .add_sized(
+                [64.0, 0.0],
+                egui::DragValue::new(&mut from_edit).range(1..=len as i32),
+            )
             .changed()
         {
             draft.from = (from_edit.max(1) as usize - 1).min(len.saturating_sub(1));
@@ -176,7 +177,10 @@ fn settings_body(ui: &mut Ui, draft: &mut BatchConfig, len: usize, changed: &mut
         let to_disp = draft.to.min(len) as i32;
         let mut to_edit = to_disp;
         if ui
-            .add(egui::DragValue::new(&mut to_edit).range(1..=len as i32))
+            .add_sized(
+                [64.0, 0.0],
+                egui::DragValue::new(&mut to_edit).range(1..=len as i32),
+            )
             .changed()
         {
             draft.to = (to_edit.max(1) as usize).min(len);
@@ -209,7 +213,7 @@ fn settings_body(ui: &mut Ui, draft: &mut BatchConfig, len: usize, changed: &mut
                 }
             })
             .custom_parser(|s| s.trim().parse::<f64>().ok().map(|v| v as u32 as f64));
-        if ui.add(value).changed() {
+        if ui.add_sized([88.0, 0.0], value).changed() {
             draft.visits = draft.visits.max(1);
             *changed = true;
         }
@@ -246,14 +250,17 @@ fn settings_body(ui: &mut Ui, draft: &mut BatchConfig, len: usize, changed: &mut
         ui.horizontal(|ui| {
             ui.weak("前");
             if ui
-                .add(egui::DragValue::new(&mut draft.deepen_top).range(1..=50))
+                .add_sized([52.0, 0.0], egui::DragValue::new(&mut draft.deepen_top).range(1..=50))
                 .changed()
             {
                 *changed = true;
             }
             ui.weak("手，加深到");
             if ui
-                .add(egui::DragValue::new(&mut draft.deepen_visits).range(1..=10_000))
+                .add_sized(
+                    [72.0, 0.0],
+                    egui::DragValue::new(&mut draft.deepen_visits).range(1..=10_000),
+                )
                 .changed()
             {
                 *changed = true;

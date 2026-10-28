@@ -89,7 +89,7 @@ pub fn show(
     let mut action = NewGameAction::None;
     egui::Window::new("新对局")
         .open(open)
-        .default_width(320.0)
+        .default_width(380.0)
         .show(ctx, |ui| {
             body(
                 ui,
@@ -145,7 +145,8 @@ fn body(
 
                 ui.label("贴目");
                 // 手改贴目的检测在 show 的帧末比对（见 komi_touched 文档）。
-                ui.add(
+                ui.add_sized(
+                    [96.0, 0.0],
                     egui::DragValue::new(&mut draft.komi)
                         .speed(0.5)
                         .range(0.0..=30.0)
@@ -280,7 +281,8 @@ fn body(
                                 ui.weak("每方总时长");
                                 let mut mins = (seconds / 60.0).max(1.0);
                                 if ui
-                                    .add(
+                                    .add_sized(
+                                        [80.0, 0.0],
                                         egui::DragValue::new(&mut mins)
                                             .range(1..=180)
                                             .suffix(" 分"),
@@ -298,7 +300,8 @@ fn body(
                                 ui.weak("主时间");
                                 let mut mins = (main_seconds / 60.0).max(1.0);
                                 if ui
-                                    .add(
+                                    .add_sized(
+                                        [80.0, 0.0],
                                         egui::DragValue::new(&mut mins)
                                             .range(1..=180)
                                             .suffix(" 分"),
@@ -314,7 +317,8 @@ fn body(
                                 ui.weak("读秒");
                                 let mut secs = period_seconds.max(1.0);
                                 if ui
-                                    .add(
+                                    .add_sized(
+                                        [72.0, 0.0],
                                         egui::DragValue::new(&mut secs)
                                             .range(3..=60)
                                             .suffix(" 秒"),
@@ -330,7 +334,8 @@ fn body(
                                 ui.weak("×");
                                 let mut times = periods.max(1);
                                 if ui
-                                    .add(
+                                    .add_sized(
+                                        [56.0, 0.0],
                                         egui::DragValue::new(&mut times)
                                             .range(1..=10)
                                             .suffix(" 次"),

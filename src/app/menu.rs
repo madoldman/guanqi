@@ -10,6 +10,17 @@ use super::PendingConfirm;
 use crate::engine::Difficulty;
 use crate::play;
 
+/// 菜单内容统一包一层「纵向 + 横向拉伸」布局：条目按钮 / 子菜单 /
+/// 分隔线全部铺满菜单宽度，悬停高亮整行（原生菜单观感）。
+///
+/// egui 0.36 的菜单 popup 不自带 cross_justify，裸按钮是「文字宽的
+/// 盒子」，高亮与分隔线不满行——这是菜单观感粗糙的主因。所有
+/// `menu_button` 的内容都必须经本函数包裹。
+fn menu_body<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), add)
+        .inner
+}
+
 impl GuanqiApp {
 /// 「文件」菜单：棋谱的打开 / 另存，与研究副本的三个动作。
 ///
@@ -20,7 +31,7 @@ impl GuanqiApp {
 /// 置灰一律给原因（[`egui::Response::on_disabled_hover_text`]）：
 /// 静默无效的菜单项比没有更糟——用户会以为点了没生效。
 pub(super) fn file_menu(&mut self, ui: &mut egui::Ui) {
-    ui.menu_button("文件", |ui| {
+    ui.menu_button("文件", |ui| menu_body(ui, |ui| {
         let disabled_reason = self.portal_unavailable.clone();
         let mut entry = ui.add_enabled(
             disabled_reason.is_none(),
@@ -99,7 +110,7 @@ pub(super) fn file_menu(&mut self, ui: &mut egui::Ui) {
             ui.close();
         }
         ui.separator();
-        ui.menu_button("研究副本", |ui| {
+        ui.menu_button("研究副本", |ui| menu_body(ui, |ui| {
             // 仅空盘置灰（原谱 / 任意副本里都可再开副本）。
             let copy_disabled = if self.loaded.is_none() {
                 Some("未载入棋谱，无谱可复制")
@@ -125,7 +136,7 @@ pub(super) fn file_menu(&mut self, ui: &mut egui::Ui) {
                 let entry = ui.add_enabled(false, egui::Button::new("切换文档…▸"));
                 entry.on_disabled_hover_text("未载入棋谱");
             } else {
-                ui.menu_button("切换文档…", |ui| {
+                ui.menu_button("切换文档…", |ui| menu_body(ui, |ui| {
                     for entry in self.doc_entries() {
                         if ui
                             .add(egui::Button::selectable(entry.active, &entry.name))
@@ -135,7 +146,7 @@ pub(super) fn file_menu(&mut self, ui: &mut egui::Ui) {
                             ui.close();
                         }
                     }
-                });
+                }));
             }
             // 「丢弃当前副本」：当前是原谱时置灰（无可丢）。有研究
             // 成果时 App 侧照旧弹确认框（确认机制与文案不变）。
@@ -162,8 +173,8 @@ pub(super) fn file_menu(&mut self, ui: &mut egui::Ui) {
                 }
                 ui.close();
             }
-        });
-    });
+        }));
+    }));
 }
 
 /// 「对局」菜单：人机对弈开关、难度子菜单与终局动作。
@@ -173,7 +184,7 @@ pub(super) fn file_menu(&mut self, ui: &mut egui::Ui) {
 /// 隐藏——菜单项忽有忽无会让用户以为功能丢了，置灰 + 悬停原因才
 /// 是「同一个动作、此刻不可用」的诚实表达）。
 pub(super) fn play_menu(&mut self, ui: &mut egui::Ui) {
-    ui.menu_button("对局", |ui| {
+    ui.menu_button("对局", |ui| menu_body(ui, |ui| {
         if ui.button("新对局…").clicked() {
             self.new_game_open = true;
             ui.close();
@@ -186,7 +197,7 @@ pub(super) fn play_menu(&mut self, ui: &mut egui::Ui) {
         }
         // 难度子菜单：五档单选，当前项打勾；hover 给 visits 与
         // 预计等待（与原侧栏分段选择器的 hover 文案同一口径）。
-        ui.menu_button("难度", |ui| {
+        ui.menu_button("难度", |ui| menu_body(ui, |ui| {
             for &d in Difficulty::ALL.iter() {
                 let selected = self.engine_cfg.play_difficulty == d;
                 let response = ui
@@ -201,7 +212,7 @@ pub(super) fn play_menu(&mut self, ui: &mut egui::Ui) {
                     ui.close();
                 }
             }
-        });
+        }));
         ui.separator();
         // ---- 终局动作（认输 / 让引擎认输 / 弃着）----
         // 启用条件与原侧栏按钮**逐字照搬**：对弈中 && 未结束 &&
@@ -266,7 +277,7 @@ pub(super) fn play_menu(&mut self, ui: &mut egui::Ui) {
         if in_game {
             entry.on_disabled_hover_text("时限在对局开始时确定，对局中不可改");
         }
-    });
+    }));
 }
 
 /// 当前生效规则的中文名（「对局」菜单的只读行；与本局锁定 / 棋谱
@@ -335,7 +346,7 @@ fn human_pass(&mut self) {
 /// [`AnalysisState`] 的门控与视角 / 限定选点），因此既有的偏好
 /// 持久化（`sync_prefs` 每帧快照 + 防抖落盘）对菜单改动照旧生效。
 pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
-    ui.menu_button("分析", |ui| {
+    ui.menu_button("分析", |ui| menu_body(ui, |ui| {
         // ---- 整谱快扫：打开对话框（设置 + 预估 + 发起同屏）----
         if ui.button("整谱快扫…").clicked() {
             self.batch_scan_open = true;
@@ -403,7 +414,7 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
         // ---- 限定选点：区域开关 / 清除区域 / 清除排除列表 ----
         // 「清除排除列表」在原侧栏卡片里有独立按钮，搬家后必须仍
         // 可达（无排除项时置灰，说明「列表本来是空的」）。
-        ui.menu_button("限定选点", |ui| {
+        ui.menu_button("限定选点", |ui| menu_body(ui, |ui| {
             let limits = self.analysis.limits();
             let region_on = limits.has_region();
             // ---- 「排除首选看次优」便捷入口（KaTrain find_alternatives
@@ -531,7 +542,7 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
             // 迭代借用与点击后的可变借用。
             if avoid_count > 0 {
                 ui.separator();
-                ui.menu_button("移除排除项", |ui| {
+                ui.menu_button("移除排除项", |ui| menu_body(ui, |ui| {
                     let size = self.board.size();
                     let avoid: Vec<_> = self.analysis.limits().avoid.to_vec();
                     for (i, (player, at)) in avoid.iter().enumerate() {
@@ -547,7 +558,7 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
                             ui.close();
                         }
                     }
-                });
+                }));
             }
             let has_any = has_region || avoid_count > 0;
             let entry = ui.add_enabled(has_any, egui::Button::new("清除全部限制"));
@@ -557,11 +568,11 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
                 self.analysis.clear_limits();
                 ui.close();
             }
-        });
+        }));
         // ---- 叠加层：七项复选（与原侧栏同名同状态）----
         // 策略热度图 / 候选点领地两项是 opt-in 数据，翻转后必须
         // 经 AnalysisState 重发查询（走与侧栏一致的 want/sent 比对）。
-        ui.menu_button("叠加层", |ui| {
+        ui.menu_button("叠加层", |ui| menu_body(ui, |ui| {
             let overlay = &mut self.overlay;
             ui.checkbox(&mut overlay.show_candidates, "候选点圆圈");
             ui.checkbox(&mut overlay.show_heat, "局势热度图");
@@ -601,9 +612,9 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
             if pv_visits.changed() {
                 self.analysis.set_want_pv_visits(overlay.show_pv_visits);
             }
-        });
+        }));
         // ---- 候选显示（门控）：三选一 + 延迟秒数 ----
-        ui.menu_button("候选显示", |ui| {
+        ui.menu_button("候选显示", |ui| menu_body(ui, |ui| {
             let gating = self.analysis.gating();
             let delay = match gating {
                 crate::ui::analysis::CandidateGating::Delayed { secs } => secs,
@@ -648,7 +659,10 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
                     ui.weak("延迟");
                     let mut edit = secs as i32;
                     if ui
-                        .add(egui::DragValue::new(&mut edit).range(1..=30).suffix(" 秒"))
+                        .add_sized(
+                            [72.0, 0.0],
+                            egui::DragValue::new(&mut edit).range(1..=30).suffix(" 秒"),
+                        )
                         .changed()
                     {
                         self.analysis.set_gating(
@@ -659,9 +673,9 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
                     }
                 });
             }
-        });
+        }));
         // ---- 目数视角：两选一 ----
-        ui.menu_button("目数视角", |ui| {
+        ui.menu_button("目数视角", |ui| menu_body(ui, |ui| {
             let view = self.analysis.display_view();
             for mode in [
                 crate::ui::analysis::DisplayView::Black,
@@ -675,22 +689,22 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
                     self.analysis.set_display_view(mode);
                 }
             }
-        });
+        }));
         // ---- 底部面板：胜率曲线 / 棋谱树（小棋盘归叠加层，不重复）；
         // 思考过程卡片在侧栏（内容轻：一行读数 + 滑杆 + 几行概要，
         // 侧栏卡片比底部薄面板更合身），开关也放这里便于集中找到 ----
-        ui.menu_button("面板", |ui| {
+        ui.menu_button("面板", |ui| menu_body(ui, |ui| {
             ui.checkbox(&mut self.curve_open, "胜率曲线");
             ui.checkbox(&mut self.tree_open, "棋谱树");
             ui.checkbox(&mut self.thinking_open, "思考过程卡片").on_hover_text(
                 "侧栏显示本次分析的稳定性读数与时间轴回放（首选翻转、何时稳定）",
             );
-        });
+        }));
         // ---- 解题模式（阶段 22.2）：不剧透总闸 + 重试 / 看答案 ----
         // 必须用户显式开启（死活题与让子局结构上无法区分，绝不自动识别）；
         // 无参照时置灰并说明原因。开关不持久化（绑定「这一份参照题谱」
         // 的使用场景，见 solving 模块文档）。
-        ui.menu_button("解题模式", |ui| {
+        ui.menu_button("解题模式", |ui| menu_body(ui, |ui| {
             let has_ref = self.reference.is_some();
             let mut solving = self.solving_mode;
             let entry = ui.add_enabled(has_ref, egui::Checkbox::new(&mut solving, "解题模式（不剧透）"));
@@ -726,7 +740,7 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
             }
             ui.separator();
             ui.weak("开启后隐藏候选 / 胜率 / 目差 / 讲解 / 失误 / 思考过程 / 曲线等分析呈现；落子后按题谱给出对照判定。");
-        });
-    });
+        }));
+    }));
 }
 }

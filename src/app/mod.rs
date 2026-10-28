@@ -1114,14 +1114,21 @@ impl eframe::App for GuanqiApp {
                 .show(&ctx, |ui| {
                     ui.label(text);
                     ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("继续（丢弃研究成果）").clicked() {
-                            verdict = Some(true);
-                        }
-                        if ui.button("取消").clicked() {
-                            verdict = Some(false);
-                        }
-                    });
+                    match ui::theme::action_row(
+                        ui,
+                        &[
+                            ui::theme::Action {
+                                label: "继续（丢弃研究成果）",
+                                primary: true,
+                                enabled: true,
+                            },
+                            ui::theme::Action { label: "取消", primary: false, enabled: true },
+                        ],
+                    ) {
+                        Some(0) => verdict = Some(true),
+                        Some(_) => verdict = Some(false),
+                        None => {}
+                    }
                 });
             match verdict {
                 Some(true) => {
@@ -1164,17 +1171,25 @@ impl eframe::App for GuanqiApp {
                     ui.label(text);
                     ui.weak("可先 Ctrl+Shift+S 另存；下面三个出口任选其一。");
                     ui.add_space(6.0);
-                    ui.vertical(|ui| {
-                        if ui.button("先另存再继续").clicked() {
-                            verdict = Some(UnsavedVerdict::SaveThenContinue);
-                        }
-                        if ui.button("不保存继续").clicked() {
-                            verdict = Some(UnsavedVerdict::Discard);
-                        }
-                        if ui.button("取消").clicked() {
-                            verdict = Some(UnsavedVerdict::Cancel);
-                        }
-                    });
+                    // 三出口横排右对齐（主题层统一动作条；原竖排三行
+                    // 全宽按钮在 400px 窗里显得空旷且层级不清）。
+                    match ui::theme::action_row(
+                        ui,
+                        &[
+                            ui::theme::Action {
+                                label: "先另存再继续",
+                                primary: true,
+                                enabled: true,
+                            },
+                            ui::theme::Action { label: "不保存继续", primary: false, enabled: true },
+                            ui::theme::Action { label: "取消", primary: false, enabled: true },
+                        ],
+                    ) {
+                        Some(0) => verdict = Some(UnsavedVerdict::SaveThenContinue),
+                        Some(1) => verdict = Some(UnsavedVerdict::Discard),
+                        Some(_) => verdict = Some(UnsavedVerdict::Cancel),
+                        None => {}
+                    }
                 });
             match verdict {
                 Some(UnsavedVerdict::SaveThenContinue) => {

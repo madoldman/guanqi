@@ -204,7 +204,15 @@ impl MiniBoard {
                     .strong(),
             );
             ui.separator();
-            if ui.button(if self.playing { "⏸ 暂停" } else { "▶ 播放" }).clicked() {
+            // 播放 / 暂停共用固定最小宽度：两态文字（⏸ 暂停 / ▶ 播放）
+            // 自然宽度不等，不加约束时切换一次后续控件整体横跳。
+            if ui
+                .add(
+                    egui::Button::new(if self.playing { "⏸ 暂停" } else { "▶ 播放" })
+                        .min_size(Vec2::new(84.0, 0.0)),
+                )
+                .clicked()
+            {
                 self.playing = !self.playing;
                 self.last_advance = Instant::now();
             }
@@ -219,7 +227,8 @@ impl MiniBoard {
             }
             ui.weak("间隔");
             if ui
-                .add(
+                .add_sized(
+                    [68.0, 0.0],
                     egui::DragValue::new(&mut self.interval)
                         .speed(0.1)
                         .range(INTERVAL_RANGE)

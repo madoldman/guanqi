@@ -9,9 +9,10 @@
 
 use std::path::{Path, PathBuf};
 
-use egui::{Color32, Context, Ui};
+use egui::{Context, Ui};
 
 use crate::engine::{find_katago_in_path, save_settings, scan_weights, EngineConfig};
+use crate::ui::theme;
 
 /// 设置窗口状态（编辑草稿 + 权重候选缓存 + 提示）。
 pub struct SettingsUi {
@@ -116,7 +117,7 @@ pub fn show(
     let mut action = SettingsAction::None;
     egui::Window::new("引擎设置")
         .open(open)
-        .default_width(480.0)
+        .default_width(520.0)
         .show(ctx, |ui| body(ui, state, cfg, &mut action));
     action
 }
@@ -128,11 +129,7 @@ fn body(ui: &mut Ui, state: &mut SettingsUi, cfg: &mut EngineConfig, action: &mu
         .show(ui, |ui| {
             ui.label("引擎路径");
             ui.horizontal(|ui| {
-                ui.add_sized(
-                    [330.0, 20.0],
-                    egui::TextEdit::singleline(&mut state.draft.engine_path),
-                );
-                if ui.button("在 PATH 中查找").clicked()
+                if path_row(ui, &mut state.draft.engine_path, "在 PATH 中查找")
                     && let Some(found) = find_katago_in_path()
                 {
                     state.draft.engine_path = found.display().to_string();
@@ -142,11 +139,7 @@ fn body(ui: &mut Ui, state: &mut SettingsUi, cfg: &mut EngineConfig, action: &mu
 
             ui.label("权重目录");
             ui.horizontal(|ui| {
-                ui.add_sized(
-                    [330.0, 20.0],
-                    egui::TextEdit::singleline(&mut state.draft.weights_dir),
-                );
-                if ui.button("重新扫描").clicked() {
+                if path_row(ui, &mut state.draft.weights_dir, "重新扫描") {
                     state.rescan();
                 }
             });
@@ -158,7 +151,8 @@ fn body(ui: &mut Ui, state: &mut SettingsUi, cfg: &mut EngineConfig, action: &mu
 
             ui.label("思考量");
             ui.vertical(|ui| {
-                ui.add(
+                ui.add_sized(
+                    [96.0, 0.0],
                     egui::DragValue::new(&mut state.draft.visits)
                         .range(1..=1_000_000)
                         .suffix(" visits"),
@@ -177,7 +171,8 @@ fn body(ui: &mut Ui, state: &mut SettingsUi, cfg: &mut EngineConfig, action: &mu
             // 现在「保存并重启引擎」会把它同步进配置文件，重启即生效。
             ui.label("搜索线程");
             ui.vertical(|ui| {
-                ui.add(
+                ui.add_sized(
+                    [96.0, 0.0],
                     egui::DragValue::new(&mut state.draft.search_threads)
                         .range(1..=256)
                         .suffix(" 线程"),
@@ -204,6 +199,7 @@ fn body(ui: &mut Ui, state: &mut SettingsUi, cfg: &mut EngineConfig, action: &mu
                 .map_or(auto, |r| r.name());
             let rules_combo = egui::ComboBox::from_id_salt("analysis_rules")
                 .selected_text(selected)
+                .width(ui.available_width())
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut state.draft.rules, None, auto);
                     for rule in crate::engine::Rules::ALL {
@@ -222,31 +218,50 @@ fn body(ui: &mut Ui, state: &mut SettingsUi, cfg: &mut EngineConfig, action: &mu
         });
 
     ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        // 两按钮等宽（去掉总间距后均分可用宽），主操作「保存并重启引擎」
-        // 用琥珀描边强调。
-        let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-        if ui.add_sized([width, 0.0], egui::Button::new("保存")).clicked() {
-            state.save(cfg);
+    // 底部动作条（主题层统一形态：自然宽度、右对齐、主操作琥珀描边）。
+    if let Some(index) = theme::action_row(
+        ui,
+        &[
+            theme::Action { label: "保存并重启引擎", primary: true, enabled: true },
+            theme::Action { label: "保存", primary: false, enabled: true },
+        ],
+    ) {
+        match index {
+            0 => {
+                if state.save(cfg) {
+                    *action = SettingsAction::ApplyRestart;
+                }
+            }
+            _ => {
+                state.save(cfg);
+            }
         }
-        let restart = egui::Button::new("保存并重启引擎")
-            .stroke(egui::Stroke::new(1.0, crate::ui::theme::colors::ACCENT_BAR));
-        if ui.add_sized([width, 0.0], restart).clicked()
-            && state.save(cfg)
-        {
-            *action = SettingsAction::ApplyRestart;
-        }
-    });
+    }
     if let Some((ok, text)) = &state.message {
         let color = if *ok {
-            Color32::from_rgb(140, 220, 140)
+            theme::colors::OK
         } else {
-            Color32::from_rgb(255, 120, 110)
+            theme::colors::ERROR
         };
         ui.colored_label(color, text);
     }
     ui.add_space(4.0);
     ui.weak("修改引擎路径 / 权重 / 搜索线程后，需要重启引擎进程才能生效。");
+}
+
+/// 「输入框吃剩余宽 + 按钮自然宽」的路径编辑行，返回按钮是否被点击。
+///
+/// 原实现是固定 330px 的输入框硬塞进格子：窗口偏窄时挤压同行按钮、
+/// 偏宽时右侧留一截空白。改为右到左布局先落按钮（自然宽），输入框
+/// 自动占满剩余宽度，窗口怎么拉都贴合。
+fn path_row(ui: &mut Ui, text: &mut String, button_label: &str) -> bool {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let clicked = ui.button(button_label).clicked();
+        // 输入框在 right_to_left 布局中后画（占据按钮左侧的剩余宽）。
+        ui.add_sized([ui.available_width(), 0.0], egui::TextEdit::singleline(text));
+        clicked
+    })
+    .inner
 }
 
 /// 权重下拉选择：显示文件名与体积，按训练步数新→旧（`scan_weights` 已排序）。
@@ -258,7 +273,7 @@ fn weight_selector(ui: &mut Ui, state: &mut SettingsUi) {
         && !path.is_file()
     {
         ui.colored_label(
-            Color32::from_rgb(255, 120, 110),
+            theme::colors::ERROR,
             format!("权重文件不存在：{}", path.display()),
         );
     }
@@ -275,6 +290,7 @@ fn weight_selector(ui: &mut Ui, state: &mut SettingsUi) {
         .unwrap_or_else(|| "未选择".to_owned());
     egui::ComboBox::from_id_salt("weight_file")
         .selected_text(selected)
+        .width(ui.available_width())
         .show_ui(ui, |ui| {
             for path in &state.weights {
                 let name = path

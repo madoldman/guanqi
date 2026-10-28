@@ -24,7 +24,7 @@
 //! 用户扫描结果不变。5000 节点 × 40 visits 按单线程实测（0.94s/节点）
 //! 约 79 分钟，30 手截断是大库可用性的关键闸门。
 
-use egui::{Align2, Ui, Vec2};
+use egui::{Align2, Ui};
 
 use super::analysis::{AnalysisState, REFSCAN_VISITS};
 use super::theme;
@@ -38,11 +38,6 @@ use crate::refbook::Reference;
 /// 扫描本就以「节点数 × 线性耗时」计，档位过细只会让预估数字眼花，
 /// 检出率收益在 200 以上边际递减；需要非整档的用户走自定义编辑。
 const REFSCAN_VISITS_PRESETS: [u32; 3] = [40, 100, 200];
-
-/// 等宽铺满的动作按钮（与侧栏 `wide_button` 同款观感）。
-fn wide_button(ui: &mut Ui, text: &str) -> egui::Response {
-    ui.add_sized(Vec2::new(ui.available_width(), 0.0), egui::Button::new(text))
-}
 
 /// 参照打分对话框的执行结果（由 `App` 在绘制结束后执行）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -109,7 +104,7 @@ fn body(
         ));
         ui.weak("打分期间当前对局的常规分析会变慢（共用引擎），但不会被停掉。");
         ui.add_space(4.0);
-        if wide_button(ui, "取消打分").clicked() {
+        if theme::wide_button(ui, "取消打分").clicked() {
             action = RefScanAction::Cancel;
         }
         return action;
@@ -130,7 +125,10 @@ fn body(
     ui.horizontal(|ui| {
         ui.weak("只扫前");
         if ui
-            .add(egui::DragValue::new(&mut config.max_move_no).range(5..=120).suffix(" 手"))
+            .add_sized(
+                [72.0, 0.0],
+                egui::DragValue::new(&mut config.max_move_no).range(5..=120).suffix(" 手"),
+            )
             .changed()
         {
             config.max_move_no = config.max_move_no.max(5);
@@ -164,7 +162,7 @@ fn body(
                 }
             })
             .custom_parser(|s| s.trim().parse::<f64>().ok().map(|v| v as u32 as f64));
-        if ui.add(value).changed() {
+        if ui.add_sized([88.0, 0.0], value).changed() {
             config.visits = config.visits.max(20);
             changed = true;
         }
@@ -196,25 +194,25 @@ fn body(
         );
     }
 
-    // ---- 动作条 ----
+    // ---- 动作条（主题层统一形态：右对齐、自然宽度、主操作琥珀描边；
+    // 原先「取消」硬编码 80px 而主按钮被拉满剩余宽，长短失衡）----
     ui.add_space(6.0);
     ui.weak(format!(
         "按当前规则「{}」与贴目 {komi:.1} 评估；扫描结果只保留到本会话结束，\
          换参照即清空。",
         rules_line(game_rules),
     ));
-    ui.horizontal(|ui| {
-        let start_w = ui.available_width() - 88.0;
-        if ui
-            .add_sized(Vec2::new(start_w, 0.0), egui::Button::new("开始打分"))
-            .clicked()
-        {
-            action = RefScanAction::Start;
-        }
-        if ui.add_sized(Vec2::new(80.0, 0.0), egui::Button::new("取消")).clicked() {
-            action = RefScanAction::Close;
-        }
-    });
+    match theme::action_row(
+        ui,
+        &[
+            theme::Action { label: "开始打分", primary: true, enabled: true },
+            theme::Action { label: "取消", primary: false, enabled: true },
+        ],
+    ) {
+        Some(0) => action = RefScanAction::Start,
+        Some(_) => action = RefScanAction::Close,
+        None => {}
+    }
     action
 }
 
