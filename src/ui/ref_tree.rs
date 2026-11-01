@@ -564,10 +564,16 @@ fn row_ui(ui: &mut Ui, state: &mut RefTreeUi, row: &RefTreeRow, tree: &GameTree,
             .fill(theme::colors::ACCENT_DIM)
             .stroke(Stroke::new(1.6, HIT));
     }
-    let response = ui.add_sized(
-        [ui.available_width().max(60.0), ROW_H],
-        button,
-    );
+    // 行宽拉满 + 文字**左对齐**垂直居中（top_down_justified(LEFT)）：
+    // 原先 `add_sized` 的居中布局会把行文字推到行中央，与左侧缩进连线
+    // 错位——树行的语义就是左对齐文本。min_size 提供行高与宽度保底。
+    let response = ui
+        .with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+            let full = button
+                .min_size(Vec2::new(ui.available_width().max(60.0), ROW_H));
+            ui.add(full)
+        })
+        .inner;
     // 截断标记：行尾弱橙「…」（按钮文本尾部追加，随文本走）。
     let response = if row.truncated {
         response.on_hover_text("该分支在深度 / 数量上限处截断")

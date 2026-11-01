@@ -9,9 +9,10 @@
 
 use std::path::{Path, PathBuf};
 
-use egui::{Color32, Context, Ui};
+use egui::{Context, Ui};
 
 use crate::engine::{find_katago_in_path, save_settings, scan_weights, EngineConfig};
+use crate::ui::theme;
 
 /// 设置窗口状态（编辑草稿 + 权重候选缓存 + 提示）。
 pub struct SettingsUi {
@@ -33,6 +34,10 @@ pub struct SettingsUi {
         search_threads: u32,
         /// 规则草稿：`None` = 自动（跟随棋谱）；`Some(规则)` = 显式指定。
         rules: Option<crate::engine::Rules>,
+        /// 激进度偏置（查询级 overrideSettings，0 = 引擎默认）。
+        playout_doubling_advantage: f64,
+        /// 分析广度（查询级 overrideSettings，0 = 引擎默认）。
+        wide_root_noise: f64,
     }
 
 impl SettingsUi {
@@ -45,6 +50,8 @@ impl SettingsUi {
                 visits: cfg.visits,
                 search_threads: cfg.search_threads,
                 rules: cfg.rules.as_deref().and_then(crate::engine::Rules::from_wire),
+                playout_doubling_advantage: cfg.playout_doubling_advantage,
+                wide_root_noise: cfg.wide_root_noise,
             },
             weights: Vec::new(),
             message: None,
@@ -70,6 +77,10 @@ impl SettingsUi {
             play_difficulty: base.play_difficulty,
             // 规则存规范名（下拉只产规范名，防自由文本进 settings.json）。
             rules: self.draft.rules.map(|r| r.wire().to_owned()),
+            // 分析偏置随草稿持久化；查询级字段，保存后 sync 比对自动重发
+            // （PDA 变化会清空历史，无需重启引擎进程）。
+            playout_doubling_advantage: self.draft.playout_doubling_advantage.clamp(-3.0, 3.0),
+            wide_root_noise: self.draft.wide_root_noise.clamp(0.0, 3.0),
             // 时限制式与「新对局规则」不在本窗口编辑（新对局窗口改），
             // 原值保留。
             time_system: base.time_system,
@@ -116,87 +127,89 @@ pub fn show(
     let mut action = SettingsAction::None;
     egui::Window::new("引擎设置")
         .open(open)
-        .default_width(480.0)
+        .default_width(520.0)
+        // egui 0.36 的 Window 默认 ScrollArea::neither()（不滚动），内容
+        // 超高直接溢出窗口底部被裁（保存按钮掉出视口，probe 实测 y=1034）。
+        // 显式开 vscroll：Window 内建滚动与窗口尺寸正确集成；max_height
+        // 钳制窗高，内容超出即滚。绝不要再外面包一层 ScrollArea（双层
+        // 滚动嵌套会把卡片拉满视口高——本轮已踩）。
+        .vscroll(true)
+        .max_height(560.0)
         .show(ctx, |ui| body(ui, state, cfg, &mut action));
     action
 }
 
 fn body(ui: &mut Ui, state: &mut SettingsUi, cfg: &mut EngineConfig, action: &mut SettingsAction) {
-    egui::Grid::new("settings_grid")
-        .num_columns(2)
-        .spacing([10.0, 6.0])
-        .show(ui, |ui| {
-            ui.label("引擎路径");
-            ui.horizontal(|ui| {
-                ui.add_sized(
-                    [330.0, 20.0],
-                    egui::TextEdit::singleline(&mut state.draft.engine_path),
-                );
-                if ui.button("在 PATH 中查找").clicked()
-                    && let Some(found) = find_katago_in_path()
-                {
-                    state.draft.engine_path = found.display().to_string();
-                }
-            });
-            ui.end_row();
+    // 设置卡片流（theme::setting_card 系列，观感基准见其文档）：每个
+    // 设置项一个浮起卡片，标题/说明在左、简单控件右置垂直居中，复杂
+    // 内容（路径行 / 下拉全宽）纵向排。
+    theme::setting_card_free(ui, "引擎路径", None, |ui| {
+        if path_row(ui, &mut state.draft.engine_path, "在 PATH 中查找")
+            && let Some(found) = find_katago_in_path()
+        {
+            state.draft.engine_path = found.display().to_string();
+        }
+    });
 
-            ui.label("权重目录");
-            ui.horizontal(|ui| {
-                ui.add_sized(
-                    [330.0, 20.0],
-                    egui::TextEdit::singleline(&mut state.draft.weights_dir),
-                );
-                if ui.button("重新扫描").clicked() {
-                    state.rescan();
-                }
-            });
-            ui.end_row();
+    theme::setting_card_free(ui, "权重目录", None, |ui| {
+        if path_row(ui, &mut state.draft.weights_dir, "重新扫描") {
+            state.rescan();
+        }
+    });
 
-            ui.label("权重文件");
-            weight_selector(ui, state);
-            ui.end_row();
+    theme::setting_card_free(ui, "权重文件", None, |ui| {
+        weight_selector(ui, state);
+    });
 
-            ui.label("思考量");
-            ui.vertical(|ui| {
-                ui.add(
-                    egui::DragValue::new(&mut state.draft.visits)
-                        .range(1..=1_000_000)
-                        .suffix(" visits"),
-                )
-                .on_hover_text(
-                    "visits = 引擎搜索时对每个候选点的模拟访问次数，总和即思考量。\
-                     越大越强、越慢：本机实测（b18 权重 + OpenCL）约 60 visits/秒，\
-                     300 visits ≈ 5–6 秒，2000 visits ≈ 半分钟。",
-                );
-                ui.weak("访问次数，越大越强越慢（悬停看量级）");
-            });
-            ui.end_row();
+    theme::setting_card(
+        ui,
+        "思考量",
+        Some("访问次数，越大越强越慢（悬停看量级）"),
+        |ui| {
+            ui.add_sized(
+                [110.0, theme::row_height(ui)],
+                egui::DragValue::new(&mut state.draft.visits)
+                    .range(1..=1_000_000)
+                    .suffix(" visits"),
+            )
+            .on_hover_text(
+                "visits = 引擎搜索时对每个候选点的模拟访问次数，总和即思考量。\
+                 越大越强、越慢：本机实测（b18 权重 + OpenCL）约 60 visits/秒，\
+                 300 visits ≈ 5–6 秒，2000 visits ≈ 半分钟。",
+            );
+        },
+    );
 
-            // 搜索线程数：写入 analysis.cfg 的 numSearchThreads。此前无
-            // 控件（只能手改配置文件），且该值只在首次生成配置时生效。
-            // 现在「保存并重启引擎」会把它同步进配置文件，重启即生效。
-            ui.label("搜索线程");
-            ui.vertical(|ui| {
-                ui.add(
-                    egui::DragValue::new(&mut state.draft.search_threads)
-                        .range(1..=256)
-                        .suffix(" 线程"),
-                )
-                .on_hover_text(
-                    "KataGo 搜索线程数（写入 analysis.cfg 的 numSearchThreads）。\
-                     OpenCL 只做网络前向、搜索全在 CPU 线程上，线程越多越能喂满 GPU 批。\
-                     实测（b18 + 680M iGPU）：16 线程比 8 快 17–21%（2000 visits：\
-                     23.8s vs 28.6s），界面未被饿死；若个别机器发滞可降到物理核数。\
-                     修改后需「保存并重启引擎」生效。",
-                );
-                ui.weak("实测 16 比 8 快 17–21%；发滞可降物理核数");
-            });
-            ui.end_row();
+    // 搜索线程数：写入 analysis.cfg 的 numSearchThreads。「保存并重启
+    // 引擎」会把它同步进配置文件，重启即生效。
+    theme::setting_card(
+        ui,
+        "搜索线程",
+        Some("实测 16 比 8 快 17–21%；发滞可降物理核数"),
+        |ui| {
+            ui.add_sized(
+                [110.0, theme::row_height(ui)],
+                egui::DragValue::new(&mut state.draft.search_threads)
+                    .range(1..=256)
+                    .suffix(" 线程"),
+            )
+            .on_hover_text(
+                "KataGo 搜索线程数（写入 analysis.cfg 的 numSearchThreads）。\
+                 OpenCL 只做网络前向、搜索全在 CPU 线程上，线程越多越能喂满 GPU 批。\
+                 实测（b18 + 680M iGPU）：16 线程比 8 快 17–21%（2000 visits：\
+                 23.8s vs 28.6s），界面未被饿死；若个别机器发滞可降到物理核数。\
+                 修改后需「保存并重启引擎」生效。",
+            );
+        },
+    );
 
-            // 规则下拉：自动（跟随棋谱 RU[]）/ 六种规范规则。改动后随
-            // 「保存」持久化；分析层（AnalysisState）检测到规则变化会
-            // 自动重发查询并清空旧规则下的历史数据。
-            ui.label("规则");
+    // 规则下拉：自动（跟随棋谱 RU[]）/ 六种规范规则。改动后随「保存」
+    // 持久化；分析层检测到规则变化会自动重发查询并清空旧规则下的历史。
+    theme::setting_card(
+        ui,
+        "规则",
+        Some("「自动」按棋谱 RU[] 宽容映射；谱上未写按中国规则"),
+        |ui| {
             let auto = "自动（跟随棋谱）";
             let selected = state
                 .draft
@@ -204,6 +217,7 @@ fn body(ui: &mut Ui, state: &mut SettingsUi, cfg: &mut EngineConfig, action: &mu
                 .map_or(auto, |r| r.name());
             let rules_combo = egui::ComboBox::from_id_salt("analysis_rules")
                 .selected_text(selected)
+                .width(190.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut state.draft.rules, None, auto);
                     for rule in crate::engine::Rules::ALL {
@@ -218,35 +232,100 @@ fn body(ui: &mut Ui, state: &mut SettingsUi, cfg: &mut EngineConfig, action: &mu
                      同一局面差可达约 1 目）。「自动」按载入棋谱的 RU[] 属性\
                      宽容映射；谱上未写则按中国规则。",
                 );
-            ui.end_row();
-        });
+        },
+    );
 
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        // 两按钮等宽（去掉总间距后均分可用宽），主操作「保存并重启引擎」
-        // 用琥珀描边强调。
-        let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-        if ui.add_sized([width, 0.0], egui::Button::new("保存")).clicked() {
-            state.save(cfg);
+    // 激进度偏置（PDA）：查询级 overrideSettings，恒随查询显式发送。
+    // ⚠️ 非 0 扭曲评估（探针实测 ±2 → 同局面目差 ±8–10 目）——
+    // 这是搜索偏置不是「换视角」，复盘求准确数字时必须保持 0。
+    theme::setting_card(
+        ui,
+        "激进度",
+        Some("0 = 关闭；非 0 会扭曲评估（研究用）"),
+        |ui| {
+            ui.add_sized(
+                [110.0, theme::row_height(ui)],
+                egui::DragValue::new(&mut state.draft.playout_doubling_advantage)
+                    .speed(0.1)
+                    .range(-3.0..=3.0),
+            )
+            .on_hover_text(
+                "playoutDoublingAdvantage：正值使引擎偏实地 / 激进，负值偏厚势 / 缓慢。\
+                 ⚠️ 非 0 会直接扭曲胜率与目差（实测 +2 → 目差 +9.7），仅用于\
+                 对弈风格与研究向实验；改动会清空逐手历史并重查，无需重启引擎。",
+            );
+        },
+    );
+
+    // 分析广度（WRN）：非 0 时候选分布变宽而评估几乎不变（实测
+    // 2.0 → 首选占比 0.68→0.14、目差漂移在噪声内）。
+    theme::setting_card(
+        ui,
+        "分析广度",
+        Some("0 = 默认；调大可看更多候选（评估不变）"),
+        |ui| {
+            ui.add_sized(
+                [110.0, theme::row_height(ui)],
+                egui::DragValue::new(&mut state.draft.wide_root_noise)
+                    .speed(0.1)
+                    .range(0.0..=3.0),
+            )
+            .on_hover_text(
+                "wideRootNoise：加大根节点噪声，让搜索探索更多候选点。\
+                 实测 2.0 时首选 visits 占比从 68% 降到 14%，胜率 / 目差几乎不变。\
+                 改动后自动重查，无需重启引擎。",
+            );
+        },
+    );
+
+    // 底部动作条（主题层统一形态：自然宽度、右对齐、主操作琥珀描边）。
+    if let Some(index) = theme::action_row(
+        ui,
+        &[
+            theme::Action { label: "保存并重启引擎", primary: true, enabled: true },
+            theme::Action { label: "保存", primary: false, enabled: true },
+        ],
+    ) {
+        match index {
+            0 => {
+                if state.save(cfg) {
+                    *action = SettingsAction::ApplyRestart;
+                }
+            }
+            _ => {
+                state.save(cfg);
+            }
         }
-        let restart = egui::Button::new("保存并重启引擎")
-            .stroke(egui::Stroke::new(1.0, crate::ui::theme::colors::ACCENT_BAR));
-        if ui.add_sized([width, 0.0], restart).clicked()
-            && state.save(cfg)
-        {
-            *action = SettingsAction::ApplyRestart;
-        }
-    });
+    }
     if let Some((ok, text)) = &state.message {
         let color = if *ok {
-            Color32::from_rgb(140, 220, 140)
+            theme::colors::OK
         } else {
-            Color32::from_rgb(255, 120, 110)
+            theme::colors::ERROR
         };
         ui.colored_label(color, text);
     }
     ui.add_space(4.0);
     ui.weak("修改引擎路径 / 权重 / 搜索线程后，需要重启引擎进程才能生效。");
+}
+
+/// 「输入框吃剩余宽 + 按钮自然宽」的路径编辑行，返回按钮是否被点击。
+///
+/// 原实现是固定 330px 的输入框硬塞进格子：窗口偏窄时挤压同行按钮、
+/// 偏宽时右侧留一截空白。改为右到左布局先落按钮（自然宽），输入框
+/// 自动占满剩余宽度，窗口怎么拉都贴合。输入框高度给实值
+/// （[`theme::row_height`]，0 高期望区域的溢出陷阱见该函数文档）。
+fn path_row(ui: &mut Ui, text: &mut String, button_label: &str) -> bool {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let clicked = ui.button(button_label).clicked();
+        // 输入框在 right_to_left 布局中后画（占据按钮左侧的剩余宽）。
+        ui.add_sized(
+            [ui.available_width(), theme::row_height(ui)],
+            egui::TextEdit::singleline(text),
+        );
+        clicked
+    })
+    .inner
 }
 
 /// 权重下拉选择：显示文件名与体积，按训练步数新→旧（`scan_weights` 已排序）。
@@ -258,7 +337,7 @@ fn weight_selector(ui: &mut Ui, state: &mut SettingsUi) {
         && !path.is_file()
     {
         ui.colored_label(
-            Color32::from_rgb(255, 120, 110),
+            theme::colors::ERROR,
             format!("权重文件不存在：{}", path.display()),
         );
     }
@@ -275,6 +354,7 @@ fn weight_selector(ui: &mut Ui, state: &mut SettingsUi) {
         .unwrap_or_else(|| "未选择".to_owned());
     egui::ComboBox::from_id_salt("weight_file")
         .selected_text(selected)
+        .width(ui.available_width())
         .show_ui(ui, |ui| {
             for path in &state.weights {
                 let name = path

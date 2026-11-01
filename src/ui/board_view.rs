@@ -248,7 +248,7 @@ pub fn show(
             |ui| {
                 ui.label(
                     RichText::new("候选点已隐藏——按 F 显示（手动模式）")
-                        .color(Color32::from_rgb(150, 156, 166))
+                        .color(theme::colors::TEXT_MUTED)
                         .size(11.0),
                 );
             },
@@ -907,8 +907,11 @@ fn draw_status(
                         });
                     }
 
-                    // 段 7：快捷键说明（弱色小字）。
-                    ui.weak("点击落子 · ← 后退 · → 前进 · Ctrl+←/→ 切分支 · Ctrl+Z 悔棋");
+                    // 段 7：快捷键说明（弱色小字，右对齐贴边——它是帮助
+                    // 文本，与左侧数据段分开后状态栏左右各司其职）。
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.weak("点击落子 · ← 后退 · → 前进 · Ctrl+←/→ 切分支 · Ctrl+Z 悔棋");
+                    });
                 });
         },
     );

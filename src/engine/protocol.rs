@@ -221,6 +221,21 @@ pub struct AnalysisQuery {
     /// [`WireOverrideSettings`] 这**唯一一个** overrideSettings 对象
     /// （发两次后者顶掉前者，见该结构文档）。
     pub max_time: Option<f64>,
+    /// 激进度偏置（`overrideSettings.playoutDoublingAdvantage`）：**每条
+    /// 查询都显式发送**（0 = 引擎默认，与不发送等效——本项目生成的
+    /// analysis.cfg 不写该键，显式 0 同时钉死「用户手改 cfg 的 PDA 被
+    /// 查询级覆盖」的单一口径，与视角字段同一精神）。非 0 会**扭曲评估**
+    /// （v1.18.2 实测 +2.0 → 同局面目差 +9.7 / −2.0 → −7.7，见
+    /// /tmp/probe_pda_wrn/），仅用于对弈风格与研究向实验；界面在非 0 时
+    /// 必须如实标注。嵌套字段拼错完全静默（§8.17），字段名以显式
+    /// `rename` 锁定且已经探针 A/B 验证（首选与目差随值单调变化，
+    /// 拼错对照与基线一致）。
+    pub playout_doubling_advantage: f64,
+    /// 分析广度（`overrideSettings.wideRootNoise`）：**每条查询都显式
+    /// 发送**（0 = 引擎默认）。非 0 时候选分布显著变宽（实测 2.0 →
+    /// 首选 visits 占比 0.68 → 0.14）而评估几乎不变（目差漂移在搜索
+    /// 噪声内），适合「看更多候选」的研究场景。探针验证同上。
+    pub wide_root_noise: f64,
 }
 
 /// 一组选点限制。`allow` 与 `avoid` 不可同时非空（引擎实测显式报错）。
@@ -290,6 +305,8 @@ impl AnalysisQuery {
             move_rules: None,
             view: WinrateView::Black,
             max_time: None,
+            playout_doubling_advantage: 0.0,
+            wide_root_noise: 0.0,
         }
     }
 }
@@ -374,6 +391,14 @@ struct WireOverrideSettings<'a> {
     /// 输出当前进度并按既有流程结束（终态照常返回）。
     #[serde(rename = "maxTime", skip_serializing_if = "Option::is_none")]
     max_time: Option<f64>,
+    /// 激进度偏置。**恒发送**（0 = 显式默认）：字段值探针 A/B 实测生效
+    /// （[`AnalysisQuery::playout_doubling_advantage`] 文档）；显式 0 与
+    /// 「引擎默认」等效，且把口径钉死在应用设置单一路径上。
+    #[serde(rename = "playoutDoublingAdvantage")]
+    playout_doubling_advantage: f64,
+    /// 分析广度。**恒发送**（0 = 显式默认），同上。
+    #[serde(rename = "wideRootNoise")]
+    wide_root_noise: f64,
 }
 
 /// 线上规则条目：坐标串借自 [`AnalysisQuery::move_rules`] 的字符串。
@@ -476,6 +501,8 @@ impl AnalysisQuery {
             override_settings: WireOverrideSettings {
                 report_analysis_winrates_as: self.view.wire(),
                 max_time: self.max_time,
+                playout_doubling_advantage: self.playout_doubling_advantage,
+                wide_root_noise: self.wide_root_noise,
             },
         };
         serde_json::to_string(&wire).unwrap_or_else(|_| {

@@ -350,7 +350,7 @@ fn card<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
 
 /// 全宽普通按钮（侧栏内统一宽度；仅消息卡「重试分析」在用）。
 fn wide_button(ui: &mut Ui, text: &str) -> egui::Response {
-    ui.add_sized([ui.available_width(), 0.0], egui::Button::new(text))
+    theme::wide_button(ui, text)
 }
 
 /// 信息行：弱色前缀 + 正文值（引擎状态 / 棋谱属性这类「标签：值」行）。
@@ -634,7 +634,7 @@ fn clock_rows(ui: &mut Ui, play: &PlayState, to_play: Stone, finished: bool) {
             crate::play::TimeSystem::Absolute { .. } => clock.main < 60.0,
             crate::play::TimeSystem::Byoyomi { .. } => clock.in_byoyomi(),
         };
-        let color = if urgent { theme::colors::WARN } else { Color32::from_rgb(214, 218, 226) };
+        let color = if urgent { theme::colors::WARN } else { theme::colors::TEXT };
         ui.horizontal_wrapped(|ui| {
             let mark = if spending { "▶" } else { "" };
             ui.label(RichText::new(format!(
@@ -808,6 +808,24 @@ fn card_engine(
         info_line(ui, "规则", &rules_line).on_hover_text(
             "引擎按哪套规则计算胜率与目差（数子 / 数目口径不同，同一局面差             可达约 1 目）。显式指定时按设置；「自动」按棋谱 RU[] 宽容映射，             谱上未写按中国。",
         );
+        // 分析偏置（激进度 / 广度）：默认 0 不占位；非 0 时必须显式可见
+        // ——此刻的胜率 / 目差 / 候选分布是被偏置扭曲过的口径（PDA 实测
+        // ±2 → 目差 ±8–10 目），不标注就会被当成正常分析误读。
+        if cfg.playout_doubling_advantage != 0.0 || cfg.wide_root_noise != 0.0 {
+            let pda = cfg.playout_doubling_advantage;
+            let wrn = cfg.wide_root_noise;
+            let mut parts: Vec<String> = Vec::new();
+            if pda != 0.0 {
+                parts.push(format!("激进度 {pda:+.1}（评估被扭曲）"));
+            }
+            if wrn != 0.0 {
+                parts.push(format!("广度 {wrn:.1}"));
+            }
+            info_line(ui, "偏置", &parts.join(" · ")).on_hover_text(
+                "设置里开启了非 0 的分析偏置：激进度（PDA）会直接扭曲胜率与\
+                 目差数字，广度（WRN）让候选分布变宽。求准确分析请把它们调回 0。",
+            );
+        }
         if let Some(snapshot) = &analysis.snapshot {
             info_line(
                 ui,
@@ -964,9 +982,9 @@ fn doc_row(ui: &mut Ui, entry: &DocEntry, action: &mut PanelAction) {
         let fill = if entry.active {
             theme::colors::ACCENT_DIM
         } else if row.hovered() || row.is_pointer_button_down_on() {
-            Color32::from_rgb(52, 57, 70)
+            theme::colors::ROW_HOVER
         } else {
-            Color32::from_rgb(39, 43, 53)
+            theme::colors::ROW_REST
         };
         painter.rect_filled(rect, 6.0, fill);
         if entry.active {
@@ -994,7 +1012,7 @@ fn doc_row(ui: &mut Ui, entry: &DocEntry, action: &mut PanelAction) {
         }
         // 两行排版：文档名 + 副行（来源手数 / 研究成果）。
         let name_color = if entry.active {
-            Color32::from_rgb(255, 214, 140)
+            theme::colors::TEXT_ON_ACCENT
         } else if entry.from_move.is_some() {
             Color32::from_rgb(208, 212, 220)
         } else {
@@ -1019,7 +1037,7 @@ fn doc_row(ui: &mut Ui, entry: &DocEntry, action: &mut PanelAction) {
             Align2::LEFT_TOP,
             &sub,
             FontId::proportional(10.0),
-            Color32::from_rgb(150, 156, 166),
+            theme::colors::TEXT_MUTED,
         );
         if row.clicked() {
             *action = PanelAction::SwitchDoc(entry.number);
@@ -1034,7 +1052,7 @@ fn card_explain(ui: &mut Ui, analysis: &AnalysisState, board: &Board) {
         theme::section_title(ui, "讲解");
         for line in explain::explain(analysis, board) {
             let color = match line.tone {
-                explain::Tone::Normal => Color32::from_rgb(214, 218, 226),
+                explain::Tone::Normal => theme::colors::TEXT,
                 explain::Tone::Good => theme::colors::OK,
                 explain::Tone::Warn => theme::colors::WARN,
             };
@@ -1567,7 +1585,7 @@ fn card_winrate(ui: &mut Ui, analysis: &AnalysisState) {
                                 raw_wr * 100.0
                             ))
                             .size(12.0)
-                            .color(Color32::from_rgb(150, 156, 166)),
+                            .color(theme::colors::TEXT_MUTED),
                         )
                         .on_hover_text(
                             "策略网络对当前局面的第一直觉（原始网络输出，未搜索），\
@@ -1617,7 +1635,7 @@ fn card_candidates(
                 }
                 super::analysis::CandidateGating::Manual => {
                     ui.colored_label(
-                        Color32::from_rgb(150, 156, 166),
+                        theme::colors::TEXT_MUTED,
                         "候选点已隐藏——按 F 显示（手动模式）。",
                     );
                 }
@@ -1709,9 +1727,9 @@ fn candidate_row(
     let fill = if selected {
         theme::colors::ACCENT_DIM
     } else if interactive && (response.hovered() || response.is_pointer_button_down_on()) {
-        Color32::from_rgb(52, 57, 70)
+        theme::colors::ROW_HOVER
     } else {
-        Color32::from_rgb(39, 43, 53)
+        theme::colors::ROW_REST
     };
     painter.rect_filled(rect, 5.0, fill);
     if selected {
@@ -1723,9 +1741,9 @@ fn candidate_row(
         );
     }
     let text_color = if selected {
-        Color32::from_rgb(255, 214, 140)
+        theme::colors::TEXT_ON_ACCENT
     } else {
-        Color32::from_rgb(214, 218, 226)
+        theme::colors::TEXT
     };
     painter.text(
         rect.min + Vec2::new(10.0, height / 2.0),
@@ -1746,7 +1764,7 @@ fn candidate_row(
         Align2::RIGHT_CENTER,
         &visits,
         FontId::monospace(11.0),
-        Color32::from_rgb(150, 156, 166),
+        theme::colors::TEXT_MUTED,
     );
     response = if info.mv.is_some() {
         response.on_hover_text(pv_hover.as_deref().unwrap_or("点击在棋盘上定位该点"))
@@ -2065,15 +2083,15 @@ fn worst_row(ui: &mut Ui, entry: crate::ui::analysis::WorstMove, action: &mut Pa
         rect,
         5.0,
         if hover {
-            Color32::from_rgb(52, 57, 70)
+            theme::colors::ROW_HOVER
         } else {
-            Color32::from_rgb(39, 43, 53)
+            theme::colors::ROW_REST
         },
     );
     // Good / Fine 的 severity_color 兜底灰（140,140,148）在行底色上偏暗、
     // 与 hover 亮字冲突，提亮为中性灰；疑问手及以上用原档位色不动。
     let text_color = match entry.severity {
-        Severity::Good | Severity::Fine => Color32::from_rgb(214, 218, 226),
+        Severity::Good | Severity::Fine => theme::colors::TEXT,
         _ => overlay::severity_color(entry.severity),
     };
     painter.text(
@@ -2082,7 +2100,7 @@ fn worst_row(ui: &mut Ui, entry: crate::ui::analysis::WorstMove, action: &mut Pa
         &text,
         FontId::monospace(12.0),
         if hover {
-            Color32::from_rgb(255, 214, 140)
+            theme::colors::TEXT_ON_ACCENT
         } else {
             text_color
         },
@@ -2293,7 +2311,7 @@ fn card_thinking(ui: &mut Ui, analysis: &AnalysisState, manual_revealed: bool) {
                 }
                 super::analysis::CandidateGating::Manual => {
                     ui.colored_label(
-                        Color32::from_rgb(150, 156, 166),
+                        theme::colors::TEXT_MUTED,
                         "选点信息已隐藏——按 F 显示（手动模式，与候选点同口径）。",
                     );
                 }

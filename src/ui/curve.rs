@@ -56,6 +56,11 @@ const LABEL: Color32 = Color32::from_rgb(160, 160, 168);
 /// 有稳定概念。
 pub(crate) const SCORE_SPAN_MIN: f64 = 2.0;
 
+/// 失误柱状条的柱高（逻辑像素）与满高目数（≥8 目全高——恶手量级；
+/// 柱高只做量级示意，精确数值看悬停读数）。
+const MISTAKE_BAR_H: f32 = 16.0;
+const MISTAKE_BAR_CAP: f64 = 8.0;
+
 /// 目差虚线的实段 / 空段长度（逻辑像素）。
 const DASH_LEN: f32 = 6.0;
 const DASH_GAP: f32 = 4.0;
@@ -108,8 +113,15 @@ fn nice_decimals(span: f64) -> usize {
 
 /// 绘制胜率曲线面板内容。外层底部面板由 `app` 条件创建：
 /// 面板隐藏时不进入本函数，零额外计算。`show_score_lead` 为目差折线
-/// 开关（关闭时不计算刻度、零绘制开销）。
-pub fn show(ui: &mut Ui, analysis: &AnalysisState, board: &Board, show_score_lead: bool) {
+/// 开关（关闭时不计算刻度、零绘制开销）；`show_mistake_bars` 为底部
+/// 失误柱状条开关（关闭时零绘制开销）。
+pub fn show(
+    ui: &mut Ui,
+    analysis: &AnalysisState,
+    board: &Board,
+    show_score_lead: bool,
+    show_mistake_bars: bool,
+) {
     // 显示视角：黑视角（默认）按存储值画；「黑白交替」时轮白的点换算
     // （轮黑点原样）。换算只发生在绘制与悬停读数，数据本身不动。
     let view = analysis.display_view();
@@ -257,6 +269,33 @@ pub fn show(ui: &mut Ui, analysis: &AnalysisState, board: &Board, show_score_lea
             None => {
                 painter.circle_filled(center, DOT_RADIUS, overlay::winrate_color(*wr));
             }
+        }
+    }
+
+    // 失误柱状条（LizzieYzy「显示柱状失误条」的移植）：疑问手及以上
+    // 的手在曲线区底部画一柱，横跨该手在 X 轴上的区间，高度 ∝ 目差
+    // 损失（≥ [`BAR_CAP`] 目全高），色 = 严重程度（与棋盘失误标注 /
+    // 侧栏计数同一套配色）。「哪一段在跳水」整段可见，不再只在侧栏
+    // 数字里。画在点标记之后（柱在数据层之上）、游标与悬停之前。
+    if show_mistake_bars {
+        for (p, loss) in known.iter().zip(&losses) {
+            let Some(l) = loss.filter(|l| l.severity.is_marked()) else {
+                continue;
+            };
+            let h = ((l.score_loss / MISTAKE_BAR_CAP).clamp(0.0, 1.0)) as f32 * MISTAKE_BAR_H;
+            if h <= 0.0 {
+                continue;
+            }
+            let x0 = x((p.turn - 1) as f32);
+            let x1 = x(p.turn as f32);
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(x0 + 0.5, plot.bottom() - h),
+                    Pos2::new(x1 - 0.5, plot.bottom()),
+                ),
+                1.0,
+                overlay::severity_color(l.severity),
+            );
         }
     }
 

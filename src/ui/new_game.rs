@@ -24,6 +24,7 @@ use crate::board::Size;
 use crate::engine::{Difficulty, Rules};
 use crate::play::{GameSetup, TimeSystem};
 use crate::ui::analysis::EngineStatus;
+use crate::ui::theme;
 
 /// 新对局窗口的动作（由调用方执行）。
 #[derive(Default)]
@@ -89,7 +90,7 @@ pub fn show(
     let mut action = NewGameAction::None;
     egui::Window::new("新对局")
         .open(open)
-        .default_width(320.0)
+        .default_width(440.0)
         .show(ctx, |ui| {
             body(
                 ui,
@@ -130,248 +131,239 @@ fn body(
     let start_clicked;
     {
         let draft = state.draft_mut(current_difficulty, current_time_system, current_rules);
-        egui::Grid::new("new_game_grid")
-            .num_columns(2)
-            .spacing([10.0, 6.0])
-            .show(ui, |ui| {
-                ui.label("棋盘尺寸");
-                ui.horizontal(|ui| {
-                    for n in [9u8, 13, 19] {
-                        let size = Size::new(n).expect("枚举值均为合法尺寸");
-                        ui.radio_value(&mut draft.size, size, format!("{n}路"));
-                    }
-                });
-                ui.end_row();
+        // 设置卡片流（theme::setting_card 系列，观感基准见其文档）：
+        // 每个设置项一个浮起卡片——标题/说明在左、简单控件右置垂直居中，
+        // 复杂内容（难度 / 时限的展开区）纵向排。
+        theme::setting_card(ui, "棋盘尺寸", None, |ui| {
+            for n in [9u8, 13, 19] {
+                let size = Size::new(n).expect("枚举值均为合法尺寸");
+                ui.radio_value(&mut draft.size, size, format!("{n}路"));
+            }
+        });
 
-                ui.label("贴目");
-                // 手改贴目的检测在 show 的帧末比对（见 komi_touched 文档）。
-                ui.add(
-                    egui::DragValue::new(&mut draft.komi)
-                        .speed(0.5)
-                        .range(0.0..=30.0)
-                        .suffix(" 目"),
+        // 手改贴目的检测在 show 的帧末比对（见 komi_touched 文档）。
+        theme::setting_card(ui, "贴目", None, |ui| {
+            ui.add_sized(
+                [110.0, theme::row_height(ui)],
+                egui::DragValue::new(&mut draft.komi)
+                    .speed(0.5)
+                    .range(0.0..=30.0)
+                    .suffix(" 目"),
+            );
+        });
+
+        theme::setting_card(ui, "让子", None, |ui| {
+            // 0 / 1 语义相同（无让子黑先），只给 0 与 2..=9。
+            let options = [0usize, 2, 3, 4, 5, 6, 7, 8, 9];
+            for h in options {
+                ui.selectable_value(
+                    &mut draft.handicap,
+                    h,
+                    if h == 0 { "无".to_owned() } else { h.to_string() },
                 );
-                ui.end_row();
+            }
+        });
 
-                ui.label("让子");
-                ui.horizontal(|ui| {
-                    // 0 / 1 语义相同（无让子黑先），只给 0 与 2..=9。
-                    let options = [0usize, 2, 3, 4, 5, 6, 7, 8, 9];
-                    for h in options {
-                        ui.selectable_value(
-                            &mut draft.handicap,
-                            h,
-                            if h == 0 { "无".to_owned() } else { h.to_string() },
-                        );
-                    }
-                });
-                ui.end_row();
+        theme::setting_card(ui, "我执", None, |ui| {
+            ui.radio_value(&mut draft.human, crate::board::Stone::Black, "黑");
+            ui.radio_value(&mut draft.human, crate::board::Stone::White, "白");
+        });
 
-                ui.label("我执");
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut draft.human, crate::board::Stone::Black, "黑");
-                    ui.radio_value(&mut draft.human, crate::board::Stone::White, "白");
-                });
-                ui.end_row();
-
-                ui.label("难度");
-                ui.vertical(|ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        for d in Difficulty::ALL {
-                            ui.radio_value(&mut draft.difficulty, d, d.name());
-                        }
-                    });
-                    ui.weak(format!(
-                        "引擎走子 {} visits，预计每手约 {} 秒",
-                        draft.difficulty.visits(),
-                        draft.difficulty.estimate_secs()
-                    ));
-                });
-                ui.end_row();
-
-                ui.label("规则");
-                ui.vertical(|ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        for rule in Rules::ALL {
-                            let selected = draft.rules == rule;
-                            if ui
-                                .add(egui::Button::selectable(selected, rule.name()))
-                                .clicked()
-                            {
-                                draft.rules = rule;
-                                // 便利项：未手改贴目时，日本 / 韩国规则
-                                // 默认 6.5 目、中国 7.5（数目规则的社区
-                                // 惯例）；其余规则不动贴目。
-                                if !komi_touched {
-                                    match rule {
-                                        Rules::Japanese | Rules::Korean => draft.komi = 6.5,
-                                        Rules::Chinese => draft.komi = 7.5,
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                    });
-                    ui.weak("本局按此规则分析，另存写入 RU[]。");
-                });
-                ui.end_row();
-
-                // 时限制式（三选一）：制式本身就是「是否判负」的开关——
-                // 选包干 / 读秒即按规则判负，无另设勾选项。读秒参数只在
-                // 读秒制下展开编辑。
-                ui.label("时限");
-                ui.vertical(|ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        for system in [
-                            TimeSystem::Unlimited,
-                            TimeSystem::Absolute { seconds: 0.0 },
-                            TimeSystem::Byoyomi {
-                                main_seconds: 0.0,
-                                period_seconds: 0.0,
-                                periods: 0,
-                            },
-                        ] {
-                            // 逐制式比对变体类型（参数不参与相等性——编辑
-                            // 中的草稿值不该让段落失焦）。
-                            let selected = std::mem::discriminant(&draft.time_system)
-                                == std::mem::discriminant(&system);
-                            if ui
-                                .add(egui::Button::selectable(selected, system.name()))
-                                .clicked()
-                            {
-                                // 切制式时保留用户已调好的参数：包干沿用
-                                // 旧总时长，读秒沿用旧参数（首次切换从该
-                                // 制式的常规缺省起步）。
-                                let old = draft.time_system;
-                                draft.time_system = match system {
-                                    TimeSystem::Unlimited => TimeSystem::Unlimited,
-                                    TimeSystem::Absolute { .. } => match old {
-                                        TimeSystem::Absolute { seconds } => {
-                                            TimeSystem::Absolute { seconds }
-                                        }
-                                        _ => TimeSystem::Absolute { seconds: 600.0 },
-                                    },
-                                    TimeSystem::Byoyomi { .. } => match old {
-                                        TimeSystem::Byoyomi {
-                                            main_seconds,
-                                            period_seconds,
-                                            periods,
-                                        } => TimeSystem::Byoyomi {
-                                            main_seconds,
-                                            period_seconds,
-                                            periods,
-                                        },
-                                        _ => TimeSystem::Byoyomi {
-                                            main_seconds: 600.0,
-                                            period_seconds: 30.0,
-                                            periods: 3,
-                                        },
-                                    },
-                                };
-                            }
-                        }
-                    });
-                    match draft.time_system {
-                        TimeSystem::Unlimited => {
-                            ui.weak("不封顶、不判负；界面显示双方累计用时。");
-                        }
-                        TimeSystem::Absolute { seconds } => {
-                            ui.horizontal(|ui| {
-                                ui.weak("每方总时长");
-                                let mut mins = (seconds / 60.0).max(1.0);
-                                if ui
-                                    .add(
-                                        egui::DragValue::new(&mut mins)
-                                            .range(1..=180)
-                                            .suffix(" 分"),
-                                    )
-                                    .changed()
-                                {
-                                    draft.time_system =
-                                        TimeSystem::Absolute { seconds: mins * 60.0 };
-                                }
-                            });
-                            ui.weak("用尽即判负（B+T / W+T）。");
-                        }
-                        TimeSystem::Byoyomi { main_seconds, period_seconds, periods } => {
-                            ui.horizontal(|ui| {
-                                ui.weak("主时间");
-                                let mut mins = (main_seconds / 60.0).max(1.0);
-                                if ui
-                                    .add(
-                                        egui::DragValue::new(&mut mins)
-                                            .range(1..=180)
-                                            .suffix(" 分"),
-                                    )
-                                    .changed()
-                                {
-                                    draft.time_system = TimeSystem::Byoyomi {
-                                        main_seconds: mins * 60.0,
-                                        period_seconds,
-                                        periods,
-                                    };
-                                }
-                                ui.weak("读秒");
-                                let mut secs = period_seconds.max(1.0);
-                                if ui
-                                    .add(
-                                        egui::DragValue::new(&mut secs)
-                                            .range(3..=60)
-                                            .suffix(" 秒"),
-                                    )
-                                    .changed()
-                                {
-                                    draft.time_system = TimeSystem::Byoyomi {
-                                        main_seconds,
-                                        period_seconds: secs,
-                                        periods,
-                                    };
-                                }
-                                ui.weak("×");
-                                let mut times = periods.max(1);
-                                if ui
-                                    .add(
-                                        egui::DragValue::new(&mut times)
-                                            .range(1..=10)
-                                            .suffix(" 次"),
-                                    )
-                                    .changed()
-                                {
-                                    draft.time_system = TimeSystem::Byoyomi {
-                                        main_seconds,
-                                        period_seconds,
-                                        periods: times,
-                                    };
-                                }
-                            });
-                            ui.weak(
-                                "主时间用尽后每手须在读秒内落子，超一手耗一次，次数用完判负。",
-                            );
-                        }
-                    }
-                    ui.weak("时限与规则在对局开始时确定，对局中不可修改。");
-                });
-                ui.end_row();
+        theme::setting_card_free(ui, "难度", None, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for d in Difficulty::ALL {
+                    ui.radio_value(&mut draft.difficulty, d, d.name());
+                }
             });
+            ui.weak(format!(
+                "引擎走子 {} visits，预计每手约 {} 秒",
+                draft.difficulty.visits(),
+                draft.difficulty.estimate_secs()
+            ));
+        });
 
-        ui.add_space(8.0);
+        // 下拉而非按钮排：六个规则名长短悬殊（「Tromp-Taylor」约
+        // 110px），按钮排任何合理窗口宽都会换行成「5+1」的孤行；与
+        // 设置窗口的规则选择器统一为 ComboBox（同一概念同一控件）。
+        theme::setting_card(
+            ui,
+            "规则",
+            Some("本局按此规则分析，另存写入 RU[]。"),
+            |ui| {
+                let selected = draft.rules.name();
+                let combo = egui::ComboBox::from_id_salt("new_game_rules")
+                    .selected_text(selected)
+                    .width(190.0)
+                    .show_ui(ui, |ui| {
+                        for rule in Rules::ALL {
+                            ui.selectable_value(&mut draft.rules, rule, rule.name());
+                        }
+                    });
+                // 便利项：未手改贴目时，日本 / 韩国规则默认 6.5 目、
+                // 中国 7.5（数目规则的社区惯例）；其余规则不动贴目。
+                if combo.response.changed() && !komi_touched {
+                    match draft.rules {
+                        Rules::Japanese | Rules::Korean => draft.komi = 6.5,
+                        Rules::Chinese => draft.komi = 7.5,
+                        _ => {}
+                    }
+                }
+            },
+        );
+
+        // 时限制式（三选一）：制式本身就是「是否判负」的开关——选包干 /
+        // 读秒即按规则判负，无另设勾选项。读秒参数只在读秒制下展开编辑。
+        theme::setting_card_free(ui, "时限", None, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for system in [
+                    TimeSystem::Unlimited,
+                    TimeSystem::Absolute { seconds: 0.0 },
+                    TimeSystem::Byoyomi {
+                        main_seconds: 0.0,
+                        period_seconds: 0.0,
+                        periods: 0,
+                    },
+                ] {
+                    // 逐制式比对变体类型（参数不参与相等性——编辑中的
+                    // 草稿值不该让段落失焦）。
+                    let selected = std::mem::discriminant(&draft.time_system)
+                        == std::mem::discriminant(&system);
+                    if ui
+                        .add(egui::Button::selectable(selected, system.name()))
+                        .clicked()
+                    {
+                        // 切制式时保留用户已调好的参数：包干沿用旧总时长，
+                        // 读秒沿用旧参数（首次切换从常规缺省起步）。
+                        let old = draft.time_system;
+                        draft.time_system = match system {
+                            TimeSystem::Unlimited => TimeSystem::Unlimited,
+                            TimeSystem::Absolute { .. } => match old {
+                                TimeSystem::Absolute { seconds } => TimeSystem::Absolute { seconds },
+                                _ => TimeSystem::Absolute { seconds: 600.0 },
+                            },
+                            TimeSystem::Byoyomi { .. } => match old {
+                                TimeSystem::Byoyomi {
+                                    main_seconds,
+                                    period_seconds,
+                                    periods,
+                                } => TimeSystem::Byoyomi {
+                                    main_seconds,
+                                    period_seconds,
+                                    periods,
+                                },
+                                _ => TimeSystem::Byoyomi {
+                                    main_seconds: 600.0,
+                                    period_seconds: 30.0,
+                                    periods: 3,
+                                },
+                            },
+                        };
+                    }
+                }
+            });
+            match draft.time_system {
+                TimeSystem::Unlimited => {
+                    ui.weak("不封顶、不判负；界面显示双方累计用时。");
+                }
+                TimeSystem::Absolute { seconds } => {
+                    theme::param_row(ui, |ui| {
+                        ui.weak("每方总时长");
+                        let mut mins = (seconds / 60.0).max(1.0);
+                        if ui
+                            .add_sized(
+                                [80.0, theme::row_height(ui)],
+                                egui::DragValue::new(&mut mins)
+                                    .range(1..=180)
+                                    .suffix(" 分"),
+                            )
+                            .changed()
+                        {
+                            draft.time_system = TimeSystem::Absolute { seconds: mins * 60.0 };
+                        }
+                    });
+                    ui.weak("用尽即判负（B+T / W+T）。");
+                }
+                TimeSystem::Byoyomi { main_seconds, period_seconds, periods } => {
+                    // 三参数竖排、每行一个框：同行多框时像素取整会让等高
+                    // 框中心漂移 1–2px（实测 10 分/30 秒/3 次中心
+                    // 621→623→624），每行至多一个框就没有阶梯存在的条件；
+                    // 参数名做行标签，语义也更清楚。
+                    theme::param_row(ui, |ui| {
+                        ui.weak("主时间");
+                        let mut mins = (main_seconds / 60.0).max(1.0);
+                        if ui
+                            .add_sized(
+                                [80.0, theme::row_height(ui)],
+                                egui::DragValue::new(&mut mins)
+                                    .range(1..=180)
+                                    .suffix(" 分"),
+                            )
+                            .changed()
+                        {
+                            draft.time_system = TimeSystem::Byoyomi {
+                                main_seconds: mins * 60.0,
+                                period_seconds,
+                                periods,
+                            };
+                        }
+                    });
+                    theme::param_row(ui, |ui| {
+                        ui.weak("读秒");
+                        let mut secs = period_seconds.max(1.0);
+                        if ui
+                            .add_sized(
+                                [80.0, theme::row_height(ui)],
+                                egui::DragValue::new(&mut secs)
+                                    .range(3..=60)
+                                    .suffix(" 秒"),
+                            )
+                            .changed()
+                        {
+                            draft.time_system = TimeSystem::Byoyomi {
+                                main_seconds,
+                                period_seconds: secs,
+                                periods,
+                            };
+                        }
+                    });
+                    theme::param_row(ui, |ui| {
+                        ui.weak("读秒次数");
+                        let mut times = periods.max(1);
+                        if ui
+                            .add_sized(
+                                [80.0, theme::row_height(ui)],
+                                egui::DragValue::new(&mut times)
+                                    .range(1..=10)
+                                    .suffix(" 次"),
+                            )
+                            .changed()
+                        {
+                            draft.time_system = TimeSystem::Byoyomi {
+                                main_seconds,
+                                period_seconds,
+                                periods: times,
+                            };
+                        }
+                    });
+                    ui.weak(
+                        "主时间用尽后每手须在读秒内落子，超一手耗一次，次数用完判负。",
+                    );
+                }
+            }
+            ui.weak("时限与规则在对局开始时确定，对局中不可修改。");
+        });
+
         // 让子 > 1 时白先（标准让子棋惯例），提前说明避免误解。
         if draft.effective_handicap() > 0 {
             ui.weak("让子局：黑棋按星位预摆，白方先行。");
         }
 
-        // 主按钮：琥珀填充全宽（与侧栏「新对局…」同一强调风格）。
-        let start_button = egui::Button::new(
-            egui::RichText::new("开始新对局").strong().color(crate::ui::theme::colors::ACCENT_BAR),
-        )
-        .fill(crate::ui::theme::colors::ACCENT_DIM)
-        .stroke(egui::Stroke::new(1.0, crate::ui::theme::colors::ACCENT_BAR))
-        .min_size(egui::vec2(ui.available_width(), 0.0));
-        let start = ui
-            .add_enabled(disabled_reason(engine).is_none(), start_button)
-            .on_disabled_hover_text(
-                disabled_reason(engine).map_or_else(|| "".to_owned(), |reason| reason.to_owned()),
-            );
+        // 主按钮：主题层唯一样式源（琥珀填充 + 文字色），全宽且**文字
+        // 水平居中**（形态依据见 theme::primary_wide 文档）。
+        let enabled = disabled_reason(engine).is_none();
+        let start = theme::primary_wide(ui, "开始新对局", enabled).on_disabled_hover_text(
+            disabled_reason(engine).map_or_else(|| "".to_owned(), |reason| reason.to_owned()),
+        );
         start_clicked = start.clicked();
     }
     // 开始动作在草稿借用结束后执行（GameSetup 是 Copy，直接读）。

@@ -27,6 +27,7 @@ use crate::board::{rules, Coord, Size, Stone};
 use crate::ui::analysis::Snapshot;
 use crate::ui::board_view::{draw_board, draw_coordinates, draw_grid, draw_stars, draw_stone, Layout};
 use crate::ui::overlay::Overlay;
+use crate::ui::theme;
 
 /// 回放默认间隔（秒 / 手）。
 pub(crate) const DEFAULT_INTERVAL_SECS: f64 = 1.0;
@@ -204,7 +205,17 @@ impl MiniBoard {
                     .strong(),
             );
             ui.separator();
-            if ui.button(if self.playing { "⏸ 暂停" } else { "▶ 播放" }).clicked() {
+            // 播放 / 暂停共用固定宽度：两态文字（⏸ 暂停 / ▶ 播放）自然
+            // 宽度不等，不加约束时切换一次后续控件整体横跳。add_sized
+            // 的居中布局同时保证文字在 84px 内水平居中（min_size 拉宽会
+            // 让文字随 horizontal 容器贴左）。
+            if ui
+                .add_sized(
+                    [84.0, theme::row_height(ui)],
+                    egui::Button::new(if self.playing { "⏸ 暂停" } else { "▶ 播放" }),
+                )
+                .clicked()
+            {
                 self.playing = !self.playing;
                 self.last_advance = Instant::now();
             }
@@ -219,7 +230,8 @@ impl MiniBoard {
             }
             ui.weak("间隔");
             if ui
-                .add(
+                .add_sized(
+                    [68.0, theme::row_height(ui)],
                     egui::DragValue::new(&mut self.interval)
                         .speed(0.1)
                         .range(INTERVAL_RANGE)

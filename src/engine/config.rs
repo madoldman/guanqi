@@ -66,6 +66,10 @@ pub struct UiPrefs {
     pub show_mistakes: bool,
     /// 胜率曲线面板叠加**目差线**开关。
     pub show_score_lead: bool,
+    /// 曲线面板底部**失误柱状条**（疑问手及以上逐手一柱，高度 = 目差
+    /// 损失，色 = 严重程度）。默认开：LizzieYzy「显示柱状失误条」的
+    /// 移植，与棋盘失误标注同一套分级口径。
+    pub show_mistake_bars: bool,
     /// 小棋盘 PV 回放面板开关。
     pub show_mini_board: bool,
     /// ---- 面板开关 ----
@@ -129,6 +133,7 @@ impl Default for UiPrefs {
             show_pv_visits: false,
             show_mistakes: true,
             show_score_lead: true,
+            show_mistake_bars: true,
             show_mini_board: false,
             curve_open: true,
             tree_open: false,
@@ -285,6 +290,15 @@ pub struct EngineConfig {
     /// `RU[]`；复盘 / 载谱的规则口径仍由设置面板字段管（自动跟随 /
     /// 显式指定），互不覆盖。旧配置缺此键回退中国规则。
     pub new_game_rules: Rules,
+    /// 激进度偏置（查询级 `overrideSettings.playoutDoublingAdvantage`，
+    /// 每条查询显式发送）。0 = 引擎默认；非 0 **扭曲评估**（实测 ±2 →
+    /// 目差 ±8–10 目），仅用于对弈风格与研究向实验，界面在非 0 时
+    /// 显著标注。旧配置缺此键回退 0（struct 级 `#[serde(default)]`）。
+    pub playout_doubling_advantage: f64,
+    /// 分析广度（查询级 `overrideSettings.wideRootNoise`，每条查询显式
+    /// 发送）。0 = 引擎默认；非 0 时候选分布变宽而评估几乎不变（实测
+    /// 见 `engine::protocol` 模块文档）。旧配置缺此键回退 0。
+    pub wide_root_noise: f64,
     /// 界面偏好（叠加层 / 面板开关、门控、视角、快扫设置、窗口几何、
     /// 文件目录记忆）。旧配置缺此键时整体回退默认值
     /// （struct 级 `#[serde(default)]`）；见 [`UiPrefs`]。
@@ -306,6 +320,8 @@ impl Default for EngineConfig {
             rules: None,
             time_system: TimeSystem::default(),
             new_game_rules: Rules::Chinese,
+            playout_doubling_advantage: 0.0,
+            wide_root_noise: 0.0,
             ui_prefs: UiPrefs::default(),
         }
     }
@@ -746,6 +762,44 @@ fn config_from_value(value: &serde_json::Value, notices: &mut Vec<String>) -> En
         Some(raw) => field(notices, "new_game_rules", raw, "默认", r#""chinese""#),
         None => default.new_game_rules,
     };
+    // 分析偏置（激进度 / 分析广度）：f64，超出可用范围时钳回并提示
+    // （手改配置防呆；设置面板的 DragValue 本就限制在范围内）。
+    let playout_doubling_advantage = match map.get("playout_doubling_advantage") {
+        Some(raw) => match serde_json::from_value::<f64>(raw.clone()) {
+            Ok(v) if (-3.0..=3.0).contains(&v) => v,
+            Ok(v) => {
+                notices.push(format!(
+                    "「playout_doubling_advantage」的值 {v} 超出 ±3，已钳回边界"
+                ));
+                v.clamp(-3.0, 3.0)
+            }
+            Err(_) => {
+                notices.push(format!(
+                    "「playout_doubling_advantage」的值 {raw} 无法识别，已按默认 0 处理"
+                ));
+                default.playout_doubling_advantage
+            }
+        },
+        None => default.playout_doubling_advantage,
+    };
+    let wide_root_noise = match map.get("wide_root_noise") {
+        Some(raw) => match serde_json::from_value::<f64>(raw.clone()) {
+            Ok(v) if (0.0..=3.0).contains(&v) => v,
+            Ok(v) => {
+                notices.push(format!(
+                    "「wide_root_noise」的值 {v} 超出 0–3，已钳回边界"
+                ));
+                v.clamp(0.0, 3.0)
+            }
+            Err(_) => {
+                notices.push(format!(
+                    "「wide_root_noise」的值 {raw} 无法识别，已按默认 0 处理"
+                ));
+                default.wide_root_noise
+            }
+        },
+        None => default.wide_root_noise,
+    };
 
     // ---- 界面偏好（UiPrefs）：整体坏值提示 + 内部字段兜底 ----
     let ui_prefs = match map.get("ui_prefs") {
@@ -803,6 +857,8 @@ fn config_from_value(value: &serde_json::Value, notices: &mut Vec<String>) -> En
         rules,
         time_system,
         new_game_rules,
+        playout_doubling_advantage,
+        wide_root_noise,
         ui_prefs,
     }
 }
