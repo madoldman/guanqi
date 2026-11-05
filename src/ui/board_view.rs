@@ -79,9 +79,10 @@ pub fn show(
     overlay: &Overlay,
     manual_revealed: bool,
     solving: bool,
+    guess: bool,
     mut play: Option<&mut PlayState>,
 ) {
-    handle_keyboard(ui, board, notice, branch_notice, play.as_deref());
+    handle_keyboard(ui, board, notice, branch_notice, guess, play.as_deref());
 
     // 限制状态整帧共用一份快照（状态栏标识与棋盘绘制同源）。
     let limits = analysis.limits().clone();
@@ -214,7 +215,7 @@ pub fn show(
                 analysis.toggle_avoid(board.to_play(), at);
             }
             if response.clicked() {
-                handle_click(board, notice, branch_notice, &layout, response.interact_pointer_pos(), play.as_deref_mut());
+                handle_click(board, notice, branch_notice, &layout, response.interact_pointer_pos(), guess, play.as_deref_mut());
             }
         }
     }
@@ -373,6 +374,7 @@ fn handle_keyboard(
     board: &mut Board,
     notice: &mut Option<IllegalReason>,
     branch_notice: &mut Option<String>,
+    guess: bool,
     play: Option<&PlayState>,
 ) {
     if ui.ctx().egui_wants_keyboard_input() {
@@ -414,7 +416,15 @@ fn handle_keyboard(
         let human = play.map_or(Stone::Black, |p| p.human);
         undo_to_human(board, human)
     } else if undo {
-        board.undo().is_some()
+        // 猜下一手模式下悔棋被拦：悔棋会**删除**已记录的着手（叶子上
+        // undo 摘节点），而猜谱的前提就是棋谱原封不动；← 后退即可。
+        if guess {
+            *branch_notice =
+                Some("猜下一手模式下没有悔棋：棋谱不会被改动，← 后退即可。".to_owned());
+            false
+        } else {
+            board.undo().is_some()
+        }
     } else if prev {
         board.prev_branch()
     } else if next {
@@ -439,11 +449,48 @@ fn handle_click(
     branch_notice: &mut Option<String>,
     layout: &Layout,
     pos: Option<Pos2>,
+    guess: bool,
     play: Option<&mut PlayState>,
 ) {
     let Some(pos) = pos else { return };
     let Some(at) = layout.hit_test(pos) else { return };
+    // 猜下一手（P3）：点击 = 对「棋谱下一手」的一次猜测，拦截在落子
+    // 之前——棋谱绝不被改动（猜对是导航进已有节点，猜错不落子）。
+    if guess {
+        *branch_notice = guess_click(board, at);
+        return;
+    }
     play_with_feedback(board, notice, branch_notice, at, play);
+}
+
+/// 猜下一手的一次判定：`at` 是否棋谱的下一手。
+///
+/// 「棋谱的下一手」= 当前节点**第一个子分支**的首手（SGF 载入时主变
+/// 恒为首子树，即实战着法）。猜对：`go_to_node` 跳进已有节点（与
+/// 「沿主变前进」同一「绝不新建分支」的预览式语义）；猜错：不落子，
+/// 提示交由状态行（`branch_notice` 通道，与「已创建变着」同位）。
+/// 下一手是弃着时点盘面必然落空，提示改按 P 猜弃着。
+///
+/// 返回要显示的状态行提示（`None` = 清空）。
+fn guess_click(board: &mut Board, at: Coord) -> Option<String> {
+    let Some(expected) = board.child_move(0).map(|record| record.action) else {
+        return Some(
+            "已到当前线末尾：棋谱没有更多着手了（退出猜下一手可自由研究）。".to_owned(),
+        );
+    };
+    match expected {
+        Action::Place(point) if point == at => {
+            let child = board.child_id(0).expect("child_move 有值则 child_id 必有");
+            board.go_to_node(child);
+            (board.cursor() == board.line_len())
+                .then(|| "已猜完当前线的全部着手。".to_owned())
+        }
+        Action::Place(_) => Some(format!(
+            "猜错了：{} 不是棋谱的下一手，再试试。",
+            at.to_gtp(board.size())
+        )),
+        Action::Pass => Some("棋谱的下一手是弃着：按 P 猜弃着。".to_owned()),
+    }
 }
 
 /// 落子 + 统一反馈（手点与侧栏「照库落子」共用的走子口径）。

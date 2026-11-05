@@ -47,6 +47,14 @@ impl GuanqiApp {
         if on && self.reference.is_none() {
             return;
         }
+        // 与猜下一手互斥（P3）：两个学习模式同开只会互相混淆
+        // （一个对照题谱、一个对照本谱）；菜单入口已置灰，这里兜底。
+        if on && self.guess_mode {
+            self.notices.push(LoadNotice::Warn(
+                "已开启猜下一手：先关闭它再进解题模式（两个学习模式互斥）。".to_owned(),
+            ));
+            return;
+        }
         if self.solving_mode == on {
             return;
         }

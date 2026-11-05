@@ -126,6 +126,12 @@ impl GuanqiApp {
             ));
             return;
         }
+        if self.guess_mode {
+            self.notices.push(LoadNotice::Warn(
+                "猜下一手模式下没有自动播放：替你猜就失去练习意义。".to_owned(),
+            ));
+            return;
+        }
         if self.board.move_count() == 0 {
             self.notices.push(LoadNotice::Warn(
                 "当前棋盘没有着手，无从播放。".to_owned(),

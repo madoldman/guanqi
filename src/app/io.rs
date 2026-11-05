@@ -71,6 +71,9 @@ pub(super) fn clear_board_derived(&mut self) {
     // 自动播放随换盘停止（复盘导航 P2）：旧线的播放节奏对新盘没有
     // 意义，续播只会让「刚载入的谱自己动起来」。
     self.autoplay_remaining = None;
+    // 猜下一手随换盘退出（竞品移植第三批 P3）：猜的对象是「这一份
+    // 棋谱」，换盘后继续猜就是对着新谱猜旧谱的答案。
+    self.guess_mode = false;
 }
 
 /// 从字节流载入棋谱（[`Self::load_game`] 的读盘后半段；headless 工具

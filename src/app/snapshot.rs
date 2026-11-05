@@ -122,6 +122,8 @@ pub struct StateSnapshot {
     pub ref_scan: Option<RefScanSnapshot>,
     /// 解题模式是否开启（阶段 22.2；不剧透总闸的原始状态）。
     pub solving: bool,
+    /// 猜下一手是否开启（竞品移植第三批 P3；同属学习类不剧透总闸）。
+    pub guess: bool,
     /// 解题模式「已查看答案」留痕。
     pub answer_shown: bool,
     /// 最近一条「参照对照：」判定文本（解题模式落子判定的取证口径；
@@ -780,6 +782,7 @@ impl GuanqiApp {
                 }),
             }),
             solving: self.solving_mode,
+            guess: self.guess_mode,
             answer_shown: self.answer_shown,
             judge_notice: self.last_judge_notice(),
             ref_scan: {
@@ -1100,6 +1103,7 @@ impl StateSnapshot {
             "ref_tree_view": ref_tree_view,
             "ref_scan": ref_scan,
             "solving": self.solving,
+            "guess": self.guess,
             "answer_shown": self.answer_shown,
             "judge_notice": self.judge_notice,
             "board_rect": self.board_rect,

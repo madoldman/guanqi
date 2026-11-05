@@ -465,6 +465,12 @@ impl Board {
         self.nodes[child].record.as_ref()
     }
 
+    /// 第 `i` 个子分支的节点 id（猜下一手 P3 用：猜对时
+    /// [`go_to_node`](Self::go_to_node) 跳进**已有**节点，绝不新建分支）。
+    pub fn child_id(&self, i: usize) -> Option<usize> {
+        self.nodes[self.current].children.get(i).copied()
+    }
+
     /// 当前选中的子分支下标（0 = 主变）；无子分支时为 0。
     pub fn selected_child(&self) -> usize {
         self.nodes[self.current].selected

@@ -48,6 +48,7 @@ mod navigate;
 mod play_flow;
 mod ref_export;
 mod reference;
+mod guess;
 mod snapshot;
 mod solving;
 
@@ -155,6 +156,10 @@ pub struct GuanqiApp {
     /// 思考过程 / 热度图 / 策略图 / 曲线 / 小棋盘 / 参照续法）按各自的
     /// 显示判定短路；棋盘与走子交互完全不受影响（用户就是要自己下）。
     solving_mode: bool,
+    /// 猜下一手模式（竞品移植第三批 P3，见 `app::guess`）：隐藏分析
+    /// 呈现 + 点击判定「棋谱下一手」。与解题模式互斥、不持久化、
+    /// 换盘即退。棋谱绝不被改动（判定拦截在棋盘层）。
+    guess_mode: bool,
     /// 解题模式下「已查看答案」留痕（「显示参照续法」动作置位；重试本题
     /// 与关闭解题模式清除）。看答案**不自动退出**解题模式——由用户决定；
     /// 留痕让「本局已看过答案」在界面上可判读。
@@ -500,6 +505,7 @@ impl GuanqiApp {
             loaded: None,
             reference: None,
             solving_mode: false,
+            guess_mode: false,
             answer_shown: false,
             judged_sig: None,
             notices: analysis_panel::NoticeFeed::new(),
@@ -726,6 +732,12 @@ impl eframe::App for GuanqiApp {
                 self.overlay.show_move_numbers = !self.overlay.show_move_numbers;
                 self.mark_prefs_dirty();
             }
+            // 猜弃着（P；P3）：仅猜下一手模式下有语义，其余时刻无绑定。
+            if self.guess_mode
+                && ui.input(|i| i.key_pressed(egui::Key::P) && i.modifiers.is_none())
+            {
+                self.guess_pass();
+            }
         }
         // 自动播放倒计时推进（P2）：在守卫块外无条件 tick——启动的
         // 守卫在 toggle_autoplay 里，这里只负责「已启动就继续走」。
@@ -742,6 +754,9 @@ impl eframe::App for GuanqiApp {
             self.manual_revealed = false;
             self.manual_sig = None;
         }
+        // 学习类模式的显示闸取值提前（方法调用不能与同列表的
+        // &mut self.board 等可变借用共存，直接读字段才可以）。
+        let study_hidden = self.study_hidden();
         // 顶部菜单栏：文件（棋谱与副本）/ 对局（人机对弈与终局动作）/
         // 分析（快扫 / 限定选点 / 叠加层 / 候选显示 / 视角 / 面板），
         // 右侧「新对局… / 设置…」主操作——原先这俩是 CentralPanel 顶部
@@ -833,7 +848,7 @@ impl eframe::App for GuanqiApp {
                     &doc_entries,
                     self.thinking_open,
                     reference_view.as_ref(),
-                    self.solving_mode,
+                    study_hidden,
                     solving_view.as_ref(),
                     self.ref_tree_ui.open,
                 );
@@ -933,7 +948,7 @@ impl eframe::App for GuanqiApp {
         // 胜率曲线底部面板（TASKS 4.3）：隐藏时不创建，零额外计算；
         // 需在 CentralPanel 之前创建，中央区才会让出空间。解题模式下
         // 整面板不创建（胜率 / 目差曲线都是剧透）。
-        if self.curve_open && !self.solving_mode {
+        if self.curve_open && !self.study_hidden() {
             egui::Panel::bottom("curve_panel")
                 .default_size(120.0)
                 .resizable(true)
@@ -953,7 +968,7 @@ impl eframe::App for GuanqiApp {
         // 优先聚焦候选点、回落引擎首选，来源标注在面板标题行。
         // 隐藏时不创建，不占主棋盘空间。解题模式下不创建（PV 回放
         // 会把引擎首选摆上盘面，正是剧透）。
-        if self.overlay.show_mini_board && !self.solving_mode {
+        if self.overlay.show_mini_board && !self.study_hidden() {
             egui::Panel::bottom("mini_board_panel")
                 .default_size(mini_board::MINI_SIDE + 46.0)
                 .size_range(120.0..=460.0)
@@ -1035,7 +1050,8 @@ impl eframe::App for GuanqiApp {
                 &mut self.analysis,
                 &self.overlay,
                 self.manual_revealed,
-                self.solving_mode,
+                study_hidden,
+                self.guess_mode,
                 Some(&mut self.play),
             );
         });

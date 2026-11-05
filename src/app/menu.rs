@@ -442,6 +442,8 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
             Some("对弈模式下没有自动播放：落子节奏由对局双方决定。")
         } else if self.solving_mode {
             Some("解题模式下没有自动播放：自动走题面等于剧透。")
+        } else if self.guess_mode {
+            Some("猜下一手模式下没有自动播放：替你猜就失去练习意义。")
         } else {
             None
         };
@@ -796,6 +798,36 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
                 "侧栏显示本次分析的稳定性读数与时间轴回放（首选翻转、何时稳定）",
             );
         }));
+        // ---- 猜下一手（竞品移植第三批 P3，Sabaki guess mode 的移植）----
+        // 学习类模式第二员：遮住后续着手自己点。与解题模式互斥、
+        // 不持久化、换盘即退（同解题口径，见 guess 模块文档）。
+        let guess_conflict = if self.play.mode {
+            Some("对弈模式下没有猜下一手。")
+        } else if self.solving_mode {
+            Some("解题模式下不可用：两个学习模式互斥，先关闭解题模式。")
+        } else if self.board.line_len() == 0 {
+            Some("当前棋盘没有着手，无从猜起。")
+        } else {
+            None
+        };
+        let mut guess_on = self.guess_mode;
+        let mut entry = ui.add_enabled(
+            guess_conflict.is_none(),
+            egui::Checkbox::new(&mut guess_on, "猜下一手"),
+        );
+        if let Some(reason) = guess_conflict {
+            entry = entry.on_disabled_hover_text(reason);
+        } else {
+            entry = entry.on_hover_text(
+                "隐藏分析呈现，点击你认为的下一手：猜对前进，猜错不落子\
+                 （棋谱不会改动）；下一手是弃着时按 P 猜。开手数标注（M）\
+                 可以看清已猜到第几手。",
+            );
+        }
+        if guess_conflict.is_none() && entry.changed() {
+            self.set_guess_mode(guess_on);
+            ui.close();
+        }
         // ---- 解题模式（阶段 22.2）：不剧透总闸 + 重试 / 看答案 ----
         // 必须用户显式开启（死活题与让子局结构上无法区分，绝不自动识别）；
         // 无参照时置灰并说明原因。开关不持久化（绑定「这一份参照题谱」

@@ -224,6 +224,15 @@ impl GuanqiApp {
     ///   落子非法（已被占用 / 劫争等）由 `play_with_feedback` 写入非法
     ///   提示，与手点同一条错误路径。
     pub(super) fn play_from_book(&mut self, player: crate::board::Stone, at: crate::board::Coord) {
+        // 猜下一手模式下拒绝（P3 防御性守卫）：照库落子会创建分支改动
+        // 棋谱，与猜谱「棋谱绝不被改动」的前提冲突（正常路径该卡片在
+        // 学习类模式下只展示续法计数的简略形态，这里防手滑路径）。
+        if self.guess_mode {
+            self.notices.push(LoadNotice::Warn(
+                "照库落子被拒：猜下一手模式下棋谱不能被改动。".to_owned(),
+            ));
+            return;
+        }
         if self.board.cursor() != self.board.line_len() {
             self.notices.push(LoadNotice::Warn(
                 "照库落子被拒：当前在回看历史（非棋谱末端），只在末端可照库落子。".to_owned(),
