@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use super::{DEFAULT_KOMI, GuanqiApp, PendingConfirm, PostSaveAction};
+use super::{DEFAULT_KOMI, GuanqiApp, PendingConfirm, PostSaveAction, UnsavedConfirm};
 use crate::sgf::{GameMeta, load_from_bytes, save_to_file};
 use crate::ui::analysis_panel::LoadNotice;
 
@@ -24,6 +24,37 @@ pub(super) fn load_game(&mut self, path: PathBuf) {
         }
         Ok(bytes) => self.load_game_from_bytes(path, bytes),
     }
+}
+
+/// 拖放进来的文件 → 打开棋谱（竞品移植第三批 P6，KaTrain
+/// drag-and-drop 的移植）。与「打开棋谱…」同一确认链：副本研究 /
+/// 未保存内容先确认，确认后**直接载入拖放路径**（不退回对话框——
+/// 路径在拖放时已产生，见 `PendingConfirm::LoadDropped`）。
+///
+/// 非 `.sgf` 扩展名如实拒绝：拖错文件要有反馈，不静默忽略。
+/// portal 拿到的路径同样可能拖自文件管理器，此处的读取失败路径
+/// （文件不存在 / 权限）与对话框路径完全共用。
+pub(super) fn drop_open_sgf(&mut self, path: PathBuf) {
+    let is_sgf = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("sgf"));
+    if !is_sgf {
+        self.notices.push(LoadNotice::Warn(format!(
+            "拖入的文件不是 .sgf 棋谱：{}",
+            path.display()
+        )));
+        return;
+    }
+    if self.research_moves() > 0 {
+        self.pending_confirm = PendingConfirm::LoadDropped(path);
+        return;
+    }
+    if self.is_dirty() {
+        self.unsaved_confirm = Some(UnsavedConfirm::LoadDropped(path));
+        return;
+    }
+    self.load_game(path);
 }
 
 /// 清掉所有**从属于当前棋盘**的派生状态（定位高亮与临时提示）。
@@ -204,6 +235,9 @@ pub(super) fn save_game(&mut self, path: PathBuf) {
                 }
                 PostSaveAction::OpenDialog => {
                     self.open_file_dialog();
+                }
+                PostSaveAction::LoadDropped(path) => {
+                    self.load_game(path);
                 }
                 PostSaveAction::Exit => {
                     // 落盘后放行退出：下一帧 ui 顶部重新发 Close

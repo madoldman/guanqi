@@ -297,6 +297,10 @@ enum PendingConfirm {
     /// `PathBuf` 恒为空串占位、从未被读取——正是本项目两次栽跟头的
     /// 「只写不读」字段，删除。
     LoadGame,
+    /// 确认后**直接载入**拖放进来的棋谱（竞品移植第三批 P6）：路径在
+    /// 拖放时已产生，与 [`Self::LoadGame`]（确认后重新弹对话框）的
+    /// 区别仅在于此。非 Copy 的 `PathBuf` 在此，其余变体不受影响。
+    LoadDropped(std::path::PathBuf),
     /// 确认后开始新对局。
     NewGame(crate::play::GameSetup),
 }
@@ -307,7 +311,7 @@ impl PendingConfirm {
     fn text(&self, copies: usize, moves: usize) -> String {
         let base = match self {
             Self::DropCopy { .. } => "丢弃该研究副本后".to_owned(),
-            Self::LoadGame => "载入新棋谱会替换原谱".to_owned(),
+            Self::LoadGame | Self::LoadDropped(_) => "载入新棋谱会替换原谱".to_owned(),
             Self::NewGame(_) => "开始新对局会替换原谱".to_owned(),
             Self::None => String::new(),
         };
@@ -317,8 +321,9 @@ impl PendingConfirm {
 
 /// 未保存内容的待确认动作：当前文档的棋谱记录已改而未另存时，
 /// 「关窗 / 新对局 / 打开棋谱」先经此确认。确认后执行对应原动作。
-/// `PartialEq`（无 `Eq`：`GameSetup` 含 f64 贴目）仅复制性需要。
-#[derive(Clone, Copy, PartialEq, Debug)]
+/// `PartialEq`（无 `Eq`：`GameSetup` 含 f64 贴目）仅比较性需要；
+/// 无 `Copy`：`LoadDropped` 携带拖放路径（竞品移植第三批 P6）。
+#[derive(Clone, PartialEq, Debug)]
 enum UnsavedConfirm {
     /// 确认后退出应用（再发一次 `ViewportCommand::Close`）。
     Exit,
@@ -327,6 +332,8 @@ enum UnsavedConfirm {
     /// 确认后发起「打开棋谱」对话框（路径由用户此后选择，同
     /// [`PendingConfirm::LoadGame`] 的理由，这里不携带路径）。
     OpenDialog,
+    /// 确认后**直接载入**拖放进来的棋谱（路径拖放时已产生）。
+    LoadDropped(std::path::PathBuf),
 }
 
 impl UnsavedConfirm {
@@ -338,7 +345,7 @@ impl UnsavedConfirm {
             Self::NewGame(_) => {
                 "开始新对局会替换当前棋谱，未保存的改动将丢失。".to_owned()
             }
-            Self::OpenDialog => {
+            Self::OpenDialog | Self::LoadDropped(_) => {
                 "打开棋谱会替换当前棋谱，未保存的改动将丢失。".to_owned()
             }
         }
@@ -357,6 +364,8 @@ enum PostSaveAction {
     NewGame(crate::play::GameSetup),
     /// 继续发起「打开棋谱」对话框。
     OpenDialog,
+    /// 继续直接载入拖放进来的棋谱（竞品移植第三批 P6）。
+    LoadDropped(std::path::PathBuf),
     /// 继续退出应用。
     Exit,
 }
@@ -670,6 +679,17 @@ impl eframe::App for GuanqiApp {
         }
         if ui.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.ctrl && i.modifiers.shift) {
             self.save_file_dialog();
+        }
+        // 拖放打开棋谱（竞品移植第三批 P6）：取第一个拖入文件
+        // （egui 0.36 的 DroppedFile 是 trait 对象，path() 恒有——原生
+        // 平台是绝对路径），非 .sgf 如实拒绝。同一帧拖入多个只取首个
+        // （文件管理器多选拖放是误操作的常态，「打开第一个」比
+        // 「报错拒收全部」温和）。
+        let dropped = ui.ctx().input(|i| i.raw.dropped_files.clone());
+        if let Some(path) = dropped.first().map(|file| file.path().to_path_buf())
+            && !path.as_os_str().is_empty()
+        {
+            self.drop_open_sgf(path);
         }
         // F 键：候选类手动显示模式（第 5 项）的「显示」确认。仅手动门控
         // 下消费该按键（其它模式 F 无绑定，不干扰）；局面签名记在按下时
@@ -1204,6 +1224,7 @@ impl eframe::App for GuanqiApp {
                         PendingConfirm::DropCopy { number } => self.drop_copy(number),
                         // 载入的路径在确认后才由用户选择，此处重新发起对话框。
                         PendingConfirm::LoadGame => self.open_file_dialog_after_confirm(),
+                        PendingConfirm::LoadDropped(path) => self.load_game(path),
                         PendingConfirm::NewGame(setup) => self.start_new_game(setup),
                         PendingConfirm::None => {}
                     }
@@ -1224,7 +1245,11 @@ impl eframe::App for GuanqiApp {
         // 未保存内容确认条（关窗 / 新对局 / 打开棋谱，同一套出口）：
         // 「先另存再继续」（另存成功后自动继续原操作）/「不保存继续」/
         // 「取消」。三处入口共用这一个窗口，出口语义一致。
-        if let Some(confirm) = self.unsaved_confirm {
+        // Clone 而非按值取出：确认条渲染期间原动作仍驻留 `unsaved_confirm`
+        // （三个出口各自 take 后执行）；`LoadDropped` 带路径后不再 Copy，
+        // 整体 clone 一份供本帧读文本与出口放回（确认框打开频率低，开销
+        // 可忽略）。
+        if let Some(confirm) = self.unsaved_confirm.clone() {
             let ctx = ui.ctx().clone();
             let text = confirm.text();
             let mut verdict: Option<UnsavedVerdict> = None;
@@ -1261,10 +1286,15 @@ impl eframe::App for GuanqiApp {
             match verdict {
                 Some(UnsavedVerdict::SaveThenContinue) => {
                     let confirm = self.unsaved_confirm.take().expect("分支内必为 Some");
-                    let then = match confirm {
+                    // 按引用匹配、`LoadDropped` 克隆路径：`confirm` 整体
+                    // 保留到「另存发起失败放回确认条」的分支再用。
+                    let then = match &confirm {
                         UnsavedConfirm::Exit => PostSaveAction::Exit,
-                        UnsavedConfirm::NewGame(setup) => PostSaveAction::NewGame(setup),
+                        UnsavedConfirm::NewGame(setup) => PostSaveAction::NewGame(*setup),
                         UnsavedConfirm::OpenDialog => PostSaveAction::OpenDialog,
+                        UnsavedConfirm::LoadDropped(path) => {
+                            PostSaveAction::LoadDropped(path.clone())
+                        }
                     };
                     // 另存成功后自动继续 then（save_game 的 Ok 分支）。
                     // 发起失败（等待中 / portal 不可用）时回调留在
@@ -1291,6 +1321,7 @@ impl eframe::App for GuanqiApp {
                                 self.unsaved_confirm = Some(confirm);
                             }
                         }
+                        UnsavedConfirm::LoadDropped(path) => self.load_game(path),
                     }
                 }
                 Some(UnsavedVerdict::Cancel) => {

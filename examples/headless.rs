@@ -630,6 +630,25 @@ impl Driver {
                 // 一帧 dump 的棋盘区域矩形 + board_view::Layout 的几何
                 // 口径（等分网格、边缘留白 = 1.2 × 间距）反算屏幕点。
                 // 比硬编码像素坐标可移植（视口 / 面板宽度变化不失效）。
+                // 模拟拖放：把路径包成 egui::DroppedFile 的 trait 对象
+                // 塞进下一帧 raw input（竞品移植第三批 P6 的验证入口；
+                // bytes() 真读文件，路径不存在时与应用侧读取失败同路径）。
+                "drop" => {
+                    #[derive(Debug)]
+                    struct Dropped(PathBuf);
+                    impl egui::DroppedFile for Dropped {
+                        fn path(&self) -> &std::path::Path {
+                            &self.0
+                        }
+                        fn bytes(&self) -> Result<Vec<u8>, String> {
+                            std::fs::read(&self.0).map_err(|e| e.to_string())
+                        }
+                    }
+                    let path = PathBuf::from(unquote(rest));
+                    self.tick_with(|input| {
+                        input.dropped_files.push(std::sync::Arc::new(Dropped(path)));
+                    });
+                }
                 "click_gtp" => {
                     let rect = self
                         .app
