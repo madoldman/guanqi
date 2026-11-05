@@ -168,10 +168,18 @@ pub fn setting_card_free(
 /// `ui.layout()` 的水平对齐），这里恰好是 Center。高度给实值
 /// （[`row_height`]）避免 0 高溢出（见 [`field_group`] 文档）。
 pub fn wide_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.add_sized(
-        [ui.available_width(), row_height(ui)],
-        egui::Button::new(text),
-    )
+    wide_button_enabled(ui, text, true)
+}
+
+/// [`wide_button`] 的禁用态版：置灰逻辑在按钮内完成，调用方只给
+/// `enabled` 与 `on_disabled_hover_text`。实现走 `top_down_justified
+/// (CENTER)`（全宽 + 文字居中的 sanctioned 组合），**不走 min_size
+/// 拉宽**——左对齐容器里那样按钮文字会贴左（见 [`primary_button`] 文档）。
+pub fn wide_button_enabled(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
+    ui.with_layout(egui::Layout::top_down_justified(egui::Align::Center), |ui| {
+        ui.add_enabled(enabled, egui::Button::new(text))
+    })
+    .inner
 }
 
 /// **主按钮**的唯一样式源（对话框首要动作：开始新对局、主操作确认等）：

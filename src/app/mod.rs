@@ -914,6 +914,9 @@ impl eframe::App for GuanqiApp {
             // 路径后的合并与写盘在 on_portal_event 的 ExportAiSgf 分支。
             // 结果表为空时按钮不会渲染（卡片本身缺席），此处不再守卫。
             analysis_panel::PanelAction::ExportAiSgf => self.export_ai_dialog(),
+            // 主变落成变着（竞品移植第三批 P5）：把当前首选主变真实
+            // 落成变着分支（守卫与提示见 doc::commit_best_pv）。
+            analysis_panel::PanelAction::CommitBestPv => self.commit_best_pv(),
             analysis_panel::PanelAction::None => {}
         }
 

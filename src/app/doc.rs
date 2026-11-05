@@ -298,3 +298,85 @@ fn original_name(&self) -> String {
 }
 
 }
+
+// ---- 主变落成变着（竞品移植第三批 P5，KaTrain「中键把 PV 加进棋谱
+// 树」的移植）----
+
+impl GuanqiApp {
+    /// 把引擎当前首选的主变（截断到 `PV_LIMIT`）真实落成一条变着分支。
+    ///
+    /// 与「沿主变前进」（预览式，只在已有着法上导航）互补：本动作
+    /// **创建**分支——研究「如果按引擎走会怎样」并留在谱里。守卫链：
+    /// - 学习类模式拒（解题 / 猜下一手：候选列表本就隐藏，按钮不可达；
+    ///   这里防其它路径）；对弈模式 UI 侧置灰 + 此处兜底拒；
+    /// - 快照必须是**终态**且 `turn` 与当前游标一致——过期 / 中间态的
+    ///   主变落进棋谱就是误导（与 play.rs 走子口径同一纪律）；
+    /// - 逐手 `Board::play` / `pass`，中途非法即停（快照与局面失配的
+    ///   兜底：一个都不落时如实报错并提示重查）。
+    ///
+    /// 与手点同一走子语义（计入棋谱树、可悔棋、局面变化触发重发）；
+    /// 已有同形子分支时 `play` 直接续走、不新建（Board 既有行为）。
+    pub(super) fn commit_best_pv(&mut self) {
+        if self.guess_mode || self.solving_mode {
+            self.notices.push(LoadNotice::Warn(
+                "学习类模式下不可用：主变落盘会改动棋谱。".to_owned(),
+            ));
+            return;
+        }
+        if self.play.mode {
+            self.notices.push(LoadNotice::Warn(
+                "对弈模式下不可用：引擎推荐不写进对局谱。".to_owned(),
+            ));
+            return;
+        }
+        let snapshot_ok = self
+            .analysis
+            .snapshot
+            .as_ref()
+            .is_some_and(|snap| snap.is_final && snap.turn == self.board.cursor());
+        if !snapshot_ok {
+            self.notices.push(LoadNotice::Warn(
+                "还没有可落盘的主变：等当前局面分析出终态再试。".to_owned(),
+            ));
+            return;
+        }
+        let Some(snapshot) = self.analysis.snapshot.as_ref() else {
+            return;
+        };
+        let Some(best) = snapshot.moves.iter().find(|info| info.order == 0) else {
+            self.notices.push(LoadNotice::Warn(
+                "引擎没有返回候选点，无从落盘。".to_owned(),
+            ));
+            return;
+        };
+        let size = snapshot.size;
+        // 借用整理：先把手数与主变序列取出来，再进可变的走子循环。
+        let pv: Vec<Option<crate::board::Coord>> = best.pv.clone();
+        let mut played: Vec<String> = Vec::new();
+        for mv in pv.iter().take(crate::ui::analysis_panel::PV_LIMIT) {
+            match mv {
+                Some(at) => {
+                    if self.board.play(*at).is_err() {
+                        break;
+                    }
+                    played.push(at.to_gtp(size));
+                }
+                None => {
+                    self.board.pass();
+                    played.push("弃着".to_owned());
+                }
+            }
+        }
+        if played.is_empty() {
+            self.notices.push(LoadNotice::Warn(
+                "主变落成变着失败：快照与当前局面不符（已自动重查）。".to_owned(),
+            ));
+            return;
+        }
+        self.notices.push(LoadNotice::Ok(format!(
+            "主变已落成变着：{} 手（{}）。每手都可 Ctrl+Z 悔回。",
+            played.len(),
+            played.join(" → ")
+        )));
+    }
+}

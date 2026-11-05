@@ -107,6 +107,11 @@ pub enum PanelAction {
     /// 保存对话框（默认名 `<参照名>-AI标注.sgf`），选中后把打分结果合入
     /// 参照树**副本**另存为新 SGF。不携带数据：结果表与参照树由 App 持有。
     ExportAiSgf,
+    /// 点了候选点卡片的「主变落成变着」（竞品移植第三批 P5，KaTrain
+    /// 「中键把 PV 加进棋谱树」的移植）：把当前首选的主变（截断到
+    /// [`PV_LIMIT`]）真实落成一条变着分支。不携带数据：快照由 App 复核
+    /// （终态 + 与当前游标一致，防落成半条过期主变）。
+    CommitBestPv,
 }
 
 /// 「打开棋谱」流程的用户可见提示（App 写入，随侧栏提示行显示）。
@@ -592,7 +597,7 @@ fn panel_body(
         card_limits_info(ui, analysis, board);
 
         // ---- 候选点（点击定位 / 排除 / 沿主变前进——展示固有交互）----
-        card_candidates(ui, analysis, overlay, manual_revealed, &mut action);
+        card_candidates(ui, analysis, overlay, manual_revealed, play.mode, &mut action);
 
         // ---- 引擎思考过程（阶段 21 #2：稳定性读数 + 时间轴回放；
         // `thinking_open` 为「分析 → 面板」里的开关，与曲线 / 棋谱树同款）----
@@ -1620,6 +1625,7 @@ fn card_candidates(
     analysis: &AnalysisState,
     overlay: &Overlay,
     manual_revealed: bool,
+    play_mode: bool,
     action: &mut PanelAction,
 ) {
     card(ui, |ui| {
@@ -1653,6 +1659,31 @@ fn card_candidates(
                 }
                 // 胜率色阶图例：候选圆圈颜色的解读说明，离候选列表最近。
                 winrate_legend(ui);
+                // 「主变落成变着」（竞品移植第三批 P5）：KaTrain「中键把
+                // PV 加进棋谱树」的按钮化入口——中键手势不可发现，按钮
+                // 常驻卡片尾部。对弈模式置灰（引擎推荐不写进对局谱）；
+                // 快扫 / 参照打分进行中置灰（扫描口径会随落盘漂移）。
+                // 其余守卫（快照终态 / 游标一致 / 学习类模式）在 App 侧。
+                let busy = analysis.batch_progress().is_some()
+                    || analysis.ref_scan_progress().is_some();
+                let mut entry =
+                    theme::wide_button_enabled(ui, "主变落成变着", !play_mode && !busy);
+                if play_mode {
+                    entry = entry
+                        .on_disabled_hover_text("对弈模式下不可用：引擎推荐不写进对局谱。");
+                } else if busy {
+                    entry = entry
+                        .on_disabled_hover_text("快扫 / 参照打分进行中，结束后再试。");
+                } else {
+                    entry = entry.on_hover_text(
+                        "把当前首选的主变（前 8 手）真实落成一条变着分支——\
+                         中途非法即停。研究用：每手都可 Ctrl+Z 悔回，\
+                         已有同形子分支时直接续走不新建。",
+                    );
+                }
+                if entry.clicked() {
+                    *action = PanelAction::CommitBestPv;
+                }
             }
             Some(_) => {
                 ui.weak("引擎未返回候选点。");
