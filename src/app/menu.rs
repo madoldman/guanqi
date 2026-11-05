@@ -9,6 +9,7 @@ use super::play_flow::result_letter;
 use super::PendingConfirm;
 use crate::engine::Difficulty;
 use crate::play;
+use crate::ui::analysis_panel::LoadNotice;
 use crate::ui::theme;
 
 /// 菜单内容统一包一层「纵向 + 横向拉伸」布局：条目按钮 / 子菜单 /
@@ -431,6 +432,32 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
             // 打开时以当前游标为初值：微调比清零再输入顺手。
             self.goto_target = self.board.cursor();
             self.goto_open = true;
+            ui.close();
+        }
+        // 「变着升主变」（竞品移植第三批 P7，KaTrain PageUp 同款）：把
+        // 包含当前节点的分支整条升为主变——研究线转正后另存即主变。
+        // 按局面签名键控的数据（注释 / 胜率历史）不受分支次序影响。
+        let mut entry = ui.add_enabled(!no_moves, egui::Button::new("变着升主变"));
+        if no_moves {
+            entry = entry.on_disabled_hover_text(disabled_reason);
+        } else {
+            entry = entry.on_hover_text(
+                "把包含当前节点的分支在每一层都提到兄弟分支之首（= SGF 主变），\
+                 另存时它就是主变线。只重排次序，不增删改任何着手；\
+                 当前节点已在主变上时提示而不改动。",
+            );
+        }
+        if !no_moves && entry.clicked() {
+            if self.board.promote_current_line() {
+                // 谱树布局换代：分支次序变了，树面板必须重算。
+                self.tree_epoch += 1;
+                self.notices.push(LoadNotice::Ok(
+                    "已升为主变：当前线成为主变线，另存时排在首位。".to_owned(),
+                ));
+            } else {
+                self.notices
+                    .push(LoadNotice::Ok("当前节点已在主变上，无需升级。".to_owned()));
+            }
             ui.close();
         }
         // ---- 自动播放（竞品移植第三批 P2，Sabaki autoplay 的移植）----

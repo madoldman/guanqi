@@ -547,6 +547,58 @@ impl Board {
         true
     }
 
+    /// 把包含当前节点的分支**升为主变**（竞品移植第三批 P7，KaTrain
+    /// `PageUp` / LizzieYzy「变着升主变」的移植）：从根到当前节点路径上
+    /// 的每个祖先，把路径子分支挪到兄弟分支首位并标记选中。
+    ///
+    /// 只重排各层 `children` 顺序与 `selected` 标记，**不增删改任何
+    /// 节点**；游标停在原节点。升完之后「当前线」（[`refresh`] 沿
+    /// selected 链下行）即当前节点所在子树，且另存时该线各层都是
+    /// 首子树 = SGF 主变。游标已在主变上（每层路径子分支本就居首且
+    /// 已选中）时返回 `false`、不动任何状态——调用方据此提示
+    /// 「已经是主变」而非假装成功。
+    ///
+    /// 按局面签名键控的数据（注释索引、胜率历史、候选表快照）不受
+    /// 分支次序影响，无需失效；谱树布局由 App 换代（`tree_epoch`）。
+    pub fn promote_current_line(&mut self) -> bool {
+        // 收集根到当前节点的路径（path[0] = 根）。
+        let mut path = Vec::new();
+        let mut cur = Some(self.current);
+        while let Some(now) = cur {
+            path.push(now);
+            cur = self.nodes[now].parent;
+        }
+        path.reverse();
+        // 先判后改：任一层已居首且选中 = 不动它的必要条件；全都不需要动
+        // 才是「已在主变」。收集需要挪动的 (父, 位置) 对再统一执行，
+        // 避免边遍历边改 children。
+        let mut moves: Vec<(usize, usize)> = Vec::new();
+        for pair in path.windows(2) {
+            let (parent, child) = (pair[0], pair[1]);
+            let node = &self.nodes[parent];
+            let pos = node
+                .children
+                .iter()
+                .position(|&c| c == child)
+                .expect("路径相邻节点必有父子关系");
+            if pos != 0 || node.selected != 0 {
+                moves.push((parent, pos));
+            }
+        }
+        if moves.is_empty() {
+            return false;
+        }
+        for (parent, pos) in moves {
+            let child = self.nodes[parent].children.remove(pos);
+            self.nodes[parent].children.insert(0, child);
+            self.nodes[parent].selected = 0;
+        }
+        // 谱树分支次序变了（另存的主变随之变化）：记录内容已变。
+        self.record_rev += 1;
+        self.refresh();
+        true
+    }
+
     // ---- 合法性与落子 ----
 
     /// 查询在当前盘面（游标处）落子是否合法，非法时给出可显示的原因。
@@ -823,5 +875,63 @@ impl Board {
         }
         self.captured_by_black = by_black;
         self.captured_by_white = by_white;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn b9() -> Board {
+        Board::new(Size::new(9).unwrap())
+    }
+
+    #[test]
+    fn 升主变后当前线与次序正确() {
+        let mut board = b9();
+        // 主变：C3 D3 E3；回到第 0 手建变着：C7 D7。
+        board.play(Coord::from_sgf(Size::new(9).unwrap(), "cc").unwrap()).unwrap();
+        board.play(Coord::from_sgf(Size::new(9).unwrap(), "dd").unwrap()).unwrap();
+        board.play(Coord::from_sgf(Size::new(9).unwrap(), "ee").unwrap()).unwrap();
+        board.go_to(0);
+        board.play(Coord::from_sgf(Size::new(9).unwrap(), "cg").unwrap()).unwrap();
+        board.play(Coord::from_sgf(Size::new(9).unwrap(), "dg").unwrap()).unwrap();
+        // 当前在变着线（C7 D7），升主变。
+        assert!(board.promote_current_line());
+        // 当前线 = 变着线，线长 2。
+        assert_eq!(board.line_len(), 2);
+        assert_eq!(board.cursor(), 2);
+        // 变着节点现在是第 0 层（根）的首子分支（落点 C7）。
+        board.go_to(0);
+        let c7 = Coord::from_sgf(Size::new(9).unwrap(), "cg").unwrap();
+        assert_eq!(board.child_move(0).map(|r| r.action), Some(Action::Place(c7)));
+        assert_eq!(board.cursor(), 0);
+        // 已在主变：再升返回 false。
+        assert!(!board.promote_current_line());
+    }
+
+    #[test]
+    fn 空盘与主变上升级返回假() {
+        let mut board = b9();
+        assert!(!board.promote_current_line(), "空盘无可升");
+        board.play(Coord::from_sgf(Size::new(9).unwrap(), "cc").unwrap()).unwrap();
+        assert!(!board.promote_current_line(), "单线（无分支）已在主变");
+    }
+
+    #[test]
+    fn 升级不改节点内容与游标() {
+        let mut board = b9();
+        for sgf in ["cc", "dd", "ee"] {
+            board.play(Coord::from_sgf(Size::new(9).unwrap(), sgf).unwrap()).unwrap();
+        }
+        board.go_to(0);
+        board.play(Coord::from_sgf(Size::new(9).unwrap(), "cg").unwrap()).unwrap();
+        let nodes_before = board.nodes.len();
+        let cursor_before = board.cursor();
+        assert!(board.promote_current_line());
+        assert_eq!(board.nodes.len(), nodes_before, "节点数不变");
+        assert_eq!(board.cursor(), cursor_before, "游标停在原节点");
+        // 升级记为内容变更（未保存守卫的事实来源）。
+        assert!(board.record_rev() > 0);
     }
 }
