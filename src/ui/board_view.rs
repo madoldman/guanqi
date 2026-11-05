@@ -149,6 +149,11 @@ pub fn show(
             overlay::draw_policy(&painter, &layout, board, snapshot);
         }
         draw_stones(&painter, &layout, board);
+        // 手数标注（竞品移植第三批 P4）：画在棋子之上、最后一手标记
+        // 之下——圆环仍描在最外层辨识「最新一手」，数字不与环冲突。
+        if overlay.show_move_numbers {
+            draw_move_numbers(&painter, &layout, board);
+        }
         draw_last_move_mark(&painter, &layout, board);
         // 失误标注画在棋子之上：小色点不遮棋子辨识。
         // 解题模式：失误 = 引擎对该手的亏损结论，短路。
@@ -759,6 +764,46 @@ pub(crate) fn draw_stone(painter: &Painter, center: Pos2, radius: f32, stone: St
     }
     painter.circle_filled(center - Vec2::new(radius * 0.28, radius * 0.32), radius * 0.32, sheen);
     painter.circle_stroke(center, radius, Stroke::new(1.0, edge));
+}
+
+/// 手数标注（竞品移植第三批 P4，KaTrain m / LizzieYzy 同名功能的移植）：
+/// 每颗**在盘**棋子标注它的着手数。
+///
+/// 口径：沿 `records()`（根到游标的当前线）回放——落子记数、提子随
+/// `MoveRecord.captured` 清零（被提走的子无手数可标；劫争同点重落显示
+/// 后一手的手数）。摆子（让子 / 死活题面）不是着手，不标。O(游标) 每
+/// 帧重算：400 手内是几百次数组写入，不值得为它建缓存失效机制。
+fn draw_move_numbers(painter: &Painter, layout: &Layout, board: &Board) {
+    let size = board.size();
+    let mut numbers = vec![0usize; board.grid().len()];
+    for (i, record) in board.records().iter().enumerate() {
+        if let Action::Place(at) = record.action {
+            numbers[at.index(size)] = i + 1;
+            for cap in &record.captured {
+                numbers[cap.index(size)] = 0;
+            }
+        }
+    }
+    let font = egui::FontId::proportional(layout.spacing * 0.34);
+    for (i, number) in numbers.iter().enumerate() {
+        if *number == 0 {
+            continue;
+        }
+        let Some(at) = Coord::from_index(size, i) else { continue };
+        let Some(stone) = board.get(at) else { continue };
+        // 与最后一手标记同一对色逻辑：黑子白字 / 白子黑字。
+        let color = match stone {
+            Stone::Black => Color32::from_rgba_unmultiplied(255, 255, 255, 220),
+            Stone::White => Color32::from_rgba_unmultiplied(20, 20, 22, 220),
+        };
+        painter.text(
+            layout.point(at),
+            egui::Align2::CENTER_CENTER,
+            number.to_string(),
+            font.clone(),
+            color,
+        );
+    }
 }
 
 /// 最后一手标记：在游标所指一手（若有落点）的棋子上画一圈。

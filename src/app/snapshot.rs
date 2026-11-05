@@ -423,6 +423,8 @@ pub struct Toggles {
     pub show_mistakes: bool,
     pub show_score_lead: bool,
     pub show_mini_board: bool,
+    /// 手数标注层（竞品移植第三批 P4）。
+    pub show_move_numbers: bool,
     /// 底部面板。
     pub curve_open: bool,
     pub tree_open: bool,
@@ -663,6 +665,7 @@ impl GuanqiApp {
                 show_mistakes: self.overlay.show_mistakes,
                 show_score_lead: self.overlay.show_score_lead,
                 show_mini_board: self.overlay.show_mini_board,
+                show_move_numbers: self.overlay.show_move_numbers,
                 curve_open: self.curve_open,
                 tree_open: self.tree_open,
                 thinking_open: self.thinking_open,
@@ -1083,6 +1086,7 @@ impl StateSnapshot {
                 "show_mistakes": self.toggles.show_mistakes,
                 "show_score_lead": self.toggles.show_score_lead,
                 "show_mini_board": self.toggles.show_mini_board,
+                "show_move_numbers": self.toggles.show_move_numbers,
                 "curve_open": self.toggles.curve_open,
                 "tree_open": self.toggles.tree_open,
                 "thinking_open": self.toggles.thinking_open,

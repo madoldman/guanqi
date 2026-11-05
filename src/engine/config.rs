@@ -72,6 +72,8 @@ pub struct UiPrefs {
     pub show_mistake_bars: bool,
     /// 小棋盘 PV 回放面板开关。
     pub show_mini_board: bool,
+    /// 手数标注层（竞品移植第三批 P4，默认关）。
+    pub show_move_numbers: bool,
     /// ---- 面板开关 ----
     /// 胜率曲线底部面板。
     pub curve_open: bool,
@@ -139,6 +141,7 @@ impl Default for UiPrefs {
             show_score_lead: true,
             show_mistake_bars: true,
             show_mini_board: false,
+            show_move_numbers: false,
             curve_open: true,
             tree_open: false,
             // 思考过程卡片默认开：内容轻、不占棋盘空间，且「结论怎么

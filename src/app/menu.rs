@@ -694,6 +694,10 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
                  （黄疑问手 / 橙失误 / 红恶手，与棋盘标注同一套）。悬停曲线看精确数值。",
             );
             ui.checkbox(&mut overlay.show_mini_board, "小棋盘变化图");
+            ui.checkbox(&mut overlay.show_move_numbers, "手数标注").on_hover_text(
+                "每颗在盘棋子标注它的着手数（黑子白字 / 白子黑字，快捷键 M）。\
+                 被提走的子随提子消失；摆子不是着手不标。",
+            );
             // opt-in 各项的翻转回传（与侧栏 card_overlay 同一条路径）。
             if policy.changed() {
                 self.analysis.set_want_policy(overlay.show_policy);

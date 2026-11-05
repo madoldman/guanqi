@@ -463,6 +463,7 @@ impl GuanqiApp {
                 show_score_lead: prefs.show_score_lead,
                 show_mistake_bars: prefs.show_mistake_bars,
                 show_mini_board: prefs.show_mini_board,
+                show_move_numbers: prefs.show_move_numbers,
                 focus: None,
             },
             curve_open: prefs.curve_open,
@@ -615,6 +616,7 @@ impl GuanqiApp {
             show_score_lead: overlay.show_score_lead,
             show_mistake_bars: overlay.show_mistake_bars,
             show_mini_board: overlay.show_mini_board,
+            show_move_numbers: overlay.show_move_numbers,
             curve_open: self.curve_open,
             tree_open: self.tree_open,
             thinking_open: self.thinking_open,
@@ -698,6 +700,11 @@ impl eframe::App for GuanqiApp {
             // 自动播放开关（空格；P2）。与失误跳转同一守卫块。
             if ui.input(|i| i.key_pressed(egui::Key::Space) && i.modifiers.is_none()) {
                 self.toggle_autoplay();
+            }
+            // 手数标注开关（M；P4）：复盘定位常用，给快捷键。
+            if ui.input(|i| i.key_pressed(egui::Key::M) && i.modifiers.is_none()) {
+                self.overlay.show_move_numbers = !self.overlay.show_move_numbers;
+                self.mark_prefs_dirty();
             }
         }
         // 自动播放倒计时推进（P2）：在守卫块外无条件 tick——启动的
