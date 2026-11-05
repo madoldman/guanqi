@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use crate::board::{Action, Board, Coord, Stone};
+use crate::board::{Action, Board, Coord, MoveRecord, Stone};
 use crate::engine::{MoveInfo, RootInfo};
 
 use super::types::{
@@ -75,6 +75,19 @@ impl AnalysisState {
             }
         }
         summary
+    }
+
+    /// 复盘导航（竞品移植第三批 P1）：当前线上**疑问手及以上**的逐手损失
+    /// 清单（按手数升序）。「下一处 / 上一处失误」跳转（KaTrain
+    /// `n` / `Shift+n` 的移植，App 侧与「分析」菜单共用）。
+    ///
+    /// 口径与 [`Self::loss_summary`] 完全一致：`points[i]` = 走 i 手前、
+    /// `points[i + 1]` = 走 i 手后（[`Self::line_points`] 的滚动契约），
+    /// 任一端缺失 = 未分析，不进清单、不臆造；分级只收
+    /// [`Severity::is_marked`]（与棋盘失误标注 / 曲线失误柱状条同一口径）。
+    pub fn marked_losses(&self, board: &Board) -> Vec<MoveLoss> {
+        let points = self.line_points(board);
+        marked_line_losses(&points, board.line_records())
     }
 
     /// 局后统计：黑白吻合度与最差 N 手。吻合度为 LizzieYzy
@@ -391,5 +404,93 @@ impl AnalysisState {
                 })
             })
             .collect()
+    }
+}
+
+/// [`AnalysisState::marked_losses`] 的纯计算体：history 数据与着法序列
+/// 解耦成参数，便于直接以合成数据做单元测试（`AnalysisState` 的构造
+/// 依赖真实历史缓冲，测试不必背这个包）。
+pub(crate) fn marked_line_losses(
+    points: &[Option<HistoryPoint>],
+    records: &[MoveRecord],
+) -> Vec<MoveLoss> {
+    let mut out = Vec::new();
+    for (i, record) in records.iter().enumerate() {
+        // points 比 records 长 1（第 0 点 = 初始局面），此下标恒安全。
+        let (Some(before), Some(after)) = (points[i], points[i + 1]) else {
+            continue;
+        };
+        let Some(loss) = loss_from_points(i + 1, record.player, before, after) else {
+            continue;
+        };
+        if loss.severity.is_marked() {
+            out.push(loss);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 合成一个历史点（黑方视角值；visits 固定——本函数不看 visits）。
+    fn pt(score_lead: f64) -> Option<HistoryPoint> {
+        Some(HistoryPoint {
+            turn: 0, // turn 在 loss_from_points 里被调用方下标覆盖，不参与
+            winrate: 0.5,
+            score_lead,
+            visits: 300,
+            to_play: Stone::Black,
+        })
+    }
+
+    /// 一条着法记录（只用到行棋方；弃着 / 落点不影响损失派生）。
+    fn rec(player: Stone) -> MoveRecord {
+        MoveRecord {
+            player,
+            action: Action::Pass,
+            captured: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn 疑问手及以上才进清单且按手数升序() {
+        // 黑第 1 手走 A1 一线恶手（实测算例，见 dev-task-list 4.4）：
+        // scoreLead(黑视角) -1.02 → -13.68，损失 12.66 目 = 恶手。
+        // 白第 2 手损失 13.58 目 = 恶手（符号翻转口径）。
+        // 黑第 3 手损失 0.2 目 = 尚可，不进清单。
+        let points = vec![
+            pt(-1.02),
+            pt(-13.68),
+            pt(-0.10), // 白走后黑视角回升 → 白亏 13.58
+            pt(-0.30), // 黑再亏 0.2 → 尚可
+        ];
+        let records = vec![rec(Stone::Black), rec(Stone::White), rec(Stone::Black)];
+        let losses = marked_line_losses(&points, &records);
+        assert_eq!(losses.len(), 2, "尚可的手不进清单");
+        assert_eq!(losses[0].turn, 1);
+        assert!((losses[0].score_loss - 12.66).abs() < 1e-9);
+        assert_eq!(losses[0].severity, Severity::Blunder);
+        assert_eq!(losses[1].turn, 2);
+        assert!((losses[1].score_loss - 13.58).abs() < 1e-9);
+        assert_eq!(losses[1].player, Stone::White);
+    }
+
+    #[test]
+    fn 任一端缺失不臆造() {
+        // 第 1 手走子前局面未分析（points[0] = None）→ 损失未知，不进清单；
+        // 第 2 手两端齐全且超阈值 → 进清单。
+        let points = vec![None, pt(-1.02), pt(-13.68)];
+        let records = vec![rec(Stone::Black), rec(Stone::Black)];
+        let losses = marked_line_losses(&points, &records);
+        assert_eq!(losses.len(), 1);
+        assert_eq!(losses[0].turn, 2);
+    }
+
+    #[test]
+    fn 空数据返回空清单() {
+        assert!(marked_line_losses(&[], &[]).is_empty());
+        assert!(marked_line_losses(&[pt(0.0)], &[]).is_empty());
     }
 }

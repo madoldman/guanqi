@@ -396,6 +396,43 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
             self.analysis.cancel_ref_scan();
             ui.close();
         }
+        // ---- 复盘导航（竞品移植第三批 P1）：失误间跳转 + 跳到手数 ----
+        // 键位：N / Shift+N（App 层）；菜单给不记得快捷键的入口（跳转
+        // 执行体与快捷键同一个 goto_mistake）。棋盘上没有着手时全部置灰。
+        ui.separator();
+        let no_moves = self.board.move_count() == 0;
+        let disabled_reason = "当前棋盘没有着手";
+        let mut entry = ui.add_enabled(!no_moves, egui::Button::new("下一处失误（N）"));
+        if no_moves {
+            entry = entry.on_disabled_hover_text(disabled_reason);
+        } else {
+            entry = entry.on_hover_text(
+                "跳到当前线下一处「疑问手及以上」失误（KaTrain n 的移植）。\
+                 只认已分析的手，分析数据随浏览 / 整谱快扫积累。",
+            );
+        }
+        if !no_moves && entry.clicked() {
+            self.goto_mistake(true);
+            ui.close();
+        }
+        let mut entry = ui.add_enabled(!no_moves, egui::Button::new("上一处失误（Shift+N）"));
+        if no_moves {
+            entry = entry.on_disabled_hover_text(disabled_reason);
+        }
+        if !no_moves && entry.clicked() {
+            self.goto_mistake(false);
+            ui.close();
+        }
+        let mut entry = ui.add_enabled(!no_moves, egui::Button::new("跳到手数…"));
+        if no_moves {
+            entry = entry.on_disabled_hover_text(disabled_reason);
+        }
+        if !no_moves && entry.clicked() {
+            // 打开时以当前游标为初值：微调比清零再输入顺手。
+            self.goto_target = self.board.cursor();
+            self.goto_open = true;
+            ui.close();
+        }
         // ---- 另存写回：逐手注释开关（随 ui_prefs 持久化）----
         // 归「分析」菜单而非另存对话框：portal 另存对话框是系统原生
         // 窗口塞不进自绘控件，且注释是分析产物的写出口径，与分析设置

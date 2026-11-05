@@ -350,12 +350,19 @@ fn draw_branch_selector(ui: &mut Ui, board: &Board) -> BranchSel {
 
 /// ← 后退一手，→ 前进一手，Ctrl+Z 悔棋；
 /// Ctrl+← / Ctrl+→ 在相邻子分支间切换（不占用 ←/→ 的前进后退）；
+/// Shift+← / Shift+→ 快退 / 快进 10 手（长谱翻页，KaTrain shift=10 手
+/// 同款语义）；Home / End 跳到当前线的开局 / 最后一手之后的盘面；
 /// 任何一次成功的导航都清除非法落子与建分支两类提示。
 ///
 /// 对弈模式开启时 Ctrl+Z 语义变化：回到人类该走的**上一个决策点**
 /// （撤掉引擎应手 + 人类上一手，或仅撤人类刚落的一手，至多 2 手，
 /// 见 [`undo_to_human`]）；复盘模式保持原单步语义。
 /// 悔棋失败（无棋可悔）不弹窗——状态行无变化即反馈。
+///
+/// 文本输入焦点让位：设置窗口 / 对话框的输入框里按 ← → Home End 是
+/// 编辑动作，不应再驱动棋盘（此前裸箭头没有这层守卫，属于顺带
+/// 修正的既有边界）。N / Shift+N 的失误跳转在 App 层（需要分析
+/// 数据），同样带该守卫。
 fn handle_keyboard(
     ui: &Ui,
     board: &mut Board,
@@ -363,17 +370,37 @@ fn handle_keyboard(
     branch_notice: &mut Option<String>,
     play: Option<&PlayState>,
 ) {
-    let (back, forward, undo, prev, next) = ui.input(|i| {
+    if ui.ctx().egui_wants_keyboard_input() {
+        return;
+    }
+    let (home, end, back10, fwd10, back, forward, undo, prev, next) = ui.input(|i| {
         (
-            i.key_pressed(egui::Key::ArrowLeft) && !i.modifiers.ctrl,
-            i.key_pressed(egui::Key::ArrowRight) && !i.modifiers.ctrl,
+            i.key_pressed(egui::Key::Home),
+            i.key_pressed(egui::Key::End),
+            i.key_pressed(egui::Key::ArrowLeft) && i.modifiers.shift && !i.modifiers.ctrl,
+            i.key_pressed(egui::Key::ArrowRight) && i.modifiers.shift && !i.modifiers.ctrl,
+            i.key_pressed(egui::Key::ArrowLeft) && !i.modifiers.ctrl && !i.modifiers.shift,
+            i.key_pressed(egui::Key::ArrowRight) && !i.modifiers.ctrl && !i.modifiers.shift,
             i.key_pressed(egui::Key::Z) && i.modifiers.ctrl,
             i.key_pressed(egui::Key::ArrowLeft) && i.modifiers.ctrl,
             i.key_pressed(egui::Key::ArrowRight) && i.modifiers.ctrl,
         )
     });
     let play_undo = undo && play.is_some_and(|p| p.mode);
-    let moved = if back {
+    let moved = if home {
+        board.go_to(0)
+    } else if end {
+        board.go_to(board.line_len())
+    } else if back10 || fwd10 {
+        // ±10 手：逐步走（到线端 step 返回 false 自然停），任一步成功
+        // 即视为「移动过」（清两类提示的口径与单步一致）。
+        let step = if back10 {
+            Board::step_back
+        } else {
+            Board::step_forward
+        };
+        (0..10).fold(false, |any, _| step(board) || any)
+    } else if back {
         board.step_back()
     } else if forward {
         board.step_forward()
@@ -910,7 +937,10 @@ fn draw_status(
                     // 段 7：快捷键说明（弱色小字，右对齐贴边——它是帮助
                     // 文本，与左侧数据段分开后状态栏左右各司其职）。
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.weak("点击落子 · ← 后退 · → 前进 · Ctrl+←/→ 切分支 · Ctrl+Z 悔棋");
+                        ui.weak(
+                            "点击落子 · ←/→ 前进后退 · Shift+←/→ ±10 手 · Home/End 首/末 \
+                             · Ctrl+←/→ 切分支 · Ctrl+Z 悔棋",
+                        );
                     });
                 });
         },

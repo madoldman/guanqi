@@ -44,6 +44,7 @@ mod doc;
 mod export;
 mod io;
 mod menu;
+mod navigate;
 mod play_flow;
 mod ref_export;
 mod reference;
@@ -117,6 +118,10 @@ pub struct GuanqiApp {
     /// 另存时是否写逐手注释块（「分析」菜单开关，随 ui_prefs 持久化；
     /// 默认开）。只影响「另存为」的写回内容，不改任何分析数据流。
     annotate_moves: bool,
+    /// 「跳到手数…」对话框是否打开（复盘导航 P1，见 `app::navigate`）。
+    goto_open: bool,
+    /// 跳转目标手数（对话框内编辑；0 = 开局盘面，N = 第 N 手之后的盘面）。
+    goto_target: usize,
     /// 对弈即时反馈已提示到的手数（KaTrain「即时反馈」的移植）：人类
     /// 落子后损失可算时在消息卡提示一次，本字段去重。悔棋 / 回看使游标
     /// 低于它时自动回落（重走同一手会重新提示，反馈按当前着点重算），
@@ -469,6 +474,8 @@ impl GuanqiApp {
             settings_open: false,
             batch_scan_open: false,
             ref_scan_open: false,
+            goto_open: false,
+            goto_target: 0,
             annotate_moves: prefs.annotate_moves,
             play_feedback_shown: 0,
             startup_notice,
@@ -663,6 +670,24 @@ impl eframe::App for GuanqiApp {
         if manual_gating && ui.input(|i| i.key_pressed(egui::Key::F)) {
             self.manual_revealed = true;
             self.manual_sig = Some(self.board.records().to_vec());
+        }
+        // 复盘导航快捷键（竞品移植第三批 P1）：N / Shift+N 在「疑问手及
+        // 以上」失误间跳转（KaTrain n / Shift+n 的移植，见 app::navigate）。
+        // Home / End / Shift+←/→ 在棋盘层（board_view::handle_keyboard）。
+        // 文本输入聚焦时让位（与棋盘层同一守卫），避免在设置 / 对话框
+        // 输入框里打字触发跳转。
+        if !ui.ctx().egui_wants_keyboard_input() {
+            let (next_m, prev_m) = ui.input(|i| {
+                (
+                    i.key_pressed(egui::Key::N) && !i.modifiers.shift && !i.modifiers.ctrl,
+                    i.key_pressed(egui::Key::N) && i.modifiers.shift && !i.modifiers.ctrl,
+                )
+            });
+            if next_m {
+                self.goto_mistake(true);
+            } else if prev_m {
+                self.goto_mistake(false);
+            }
         }
         // 局面一变即撤回手动确认：游标 / 分支 / 落子 / 换谱都会改签名。
         // 顺序（先处理按键、再比对签名）意味着「同帧内局面刚变又按 F」时
@@ -1063,6 +1088,13 @@ impl eframe::App for GuanqiApp {
                 }
                 batch_scan::BatchScanAction::Close | batch_scan::BatchScanAction::None => {}
             }
+        }
+
+        // 「跳到手数…」对话框（复盘导航 P1，见 app::navigate）：打开时
+        // 绘制，跳转 / 取消 / 关闭都在对话框内部收口。
+        if self.goto_open {
+            let ctx = ui.ctx();
+            self.goto_dialog(ctx);
         }
 
         // 参照库打分对话框（「分析 → 参照库打分…」入口，阶段 22.3）：
