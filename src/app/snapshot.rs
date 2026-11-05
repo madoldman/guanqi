@@ -860,7 +860,10 @@ impl GuanqiApp {
                 // 叠加层短路），取证值即真实可见性，无第二套口径。
                 let candidates_visible =
                     self.analysis.candidates_visible(self.manual_revealed);
-                let solving = self.solving_mode;
+                // 学习类总闸（解题 || 猜下一手，P3 扩义）：取证面必须与
+                // 显示面一致——猜谱模式下显示层同样隐藏，dump 若只看
+                // solving_mode 会谎报「可见」（取证字段骗人比不取证更糟）。
+                let solving = self.study_hidden();
                 let snapshot_exists = self.analysis.snapshot.is_some();
                 SolvingHiddenDump {
                     board_candidates: self.overlay.show_candidates
