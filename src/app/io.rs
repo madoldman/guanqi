@@ -37,6 +37,9 @@ pub(super) fn clear_board_derived(&mut self) {
     self.overlay.focus = None;
     self.branch_notice = None;
     self.notice = None;
+    // 自动播放随换盘停止（复盘导航 P2）：旧线的播放节奏对新盘没有
+    // 意义，续播只会让「刚载入的谱自己动起来」。
+    self.autoplay_remaining = None;
 }
 
 /// 从字节流载入棋谱（[`Self::load_game`] 的读盘后半段；headless 工具

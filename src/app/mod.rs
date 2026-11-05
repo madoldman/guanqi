@@ -122,6 +122,9 @@ pub struct GuanqiApp {
     goto_open: bool,
     /// 跳转目标手数（对话框内编辑；0 = 开局盘面，N = 第 N 手之后的盘面）。
     goto_target: usize,
+    /// 自动播放剩余倒计时（秒；`Some` = 播放中，竞品移植第三批 P2，
+    /// 见 `app::navigate`）。间隔在 ui_prefs 持久化，开关不持久化。
+    autoplay_remaining: Option<f32>,
     /// 对弈即时反馈已提示到的手数（KaTrain「即时反馈」的移植）：人类
     /// 落子后损失可算时在消息卡提示一次，本字段去重。悔棋 / 回看使游标
     /// 低于它时自动回落（重走同一手会重新提示，反馈按当前着点重算），
@@ -476,6 +479,7 @@ impl GuanqiApp {
             ref_scan_open: false,
             goto_open: false,
             goto_target: 0,
+            autoplay_remaining: None,
             annotate_moves: prefs.annotate_moves,
             play_feedback_shown: 0,
             startup_notice,
@@ -639,6 +643,9 @@ impl GuanqiApp {
             batch_deepen_visits: self.analysis.batch_config().deepen_visits,
             refscan_visits: self.analysis.ref_scan_config().visits,
             annotate_moves: self.annotate_moves,
+            // 自动播放间隔只经菜单改动（改时手动 mark_prefs_dirty），
+            // 这里原样携带——每帧重建快照不能把它抹成默认值。
+            autoplay_secs: self.engine_cfg.ui_prefs.autoplay_secs,
             // 窗口几何 / 文件目录记忆在各自路径上单独写入，这里原样保留。
             window_geometry: self.engine_cfg.ui_prefs.window_geometry.take(),
             last_open_dir: self.engine_cfg.ui_prefs.last_open_dir.take(),
@@ -688,7 +695,14 @@ impl eframe::App for GuanqiApp {
             } else if prev_m {
                 self.goto_mistake(false);
             }
+            // 自动播放开关（空格；P2）。与失误跳转同一守卫块。
+            if ui.input(|i| i.key_pressed(egui::Key::Space) && i.modifiers.is_none()) {
+                self.toggle_autoplay();
+            }
         }
+        // 自动播放倒计时推进（P2）：在守卫块外无条件 tick——启动的
+        // 守卫在 toggle_autoplay 里，这里只负责「已启动就继续走」。
+        self.autoplay_tick(ui.ctx().input(|i| i.stable_dt));
         // 局面一变即撤回手动确认：游标 / 分支 / 落子 / 换谱都会改签名。
         // 顺序（先处理按键、再比对签名）意味着「同帧内局面刚变又按 F」时
         // 以新局面的签名记录确认 ⇒ 按键对当前局面生效，符合直觉。

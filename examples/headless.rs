@@ -298,6 +298,13 @@ struct Driver {
     /// 最近一帧的 accesskit 节点（NodeId → label）。
     /// egui `Id::accesskit_id()` 把控件 Id 换算成 NodeId。
     labels: HashMap<egui::accesskit::NodeId, String>,
+    /// 上一帧开始时刻：下一帧的 `predicted_dt` / `time` 用真实帧数据
+    /// 填充。此前用 `RawInput::default()` 的 1/60，而帧间真 sleep 30ms
+    /// ⇒ 模拟时间只有墙钟一半，自动播放 / 任何吃 dt 的逻辑在工具里
+    /// 都会慢一倍（2026-11-06 验证自动播放时抓到）。
+    last_frame_t: Option<std::time::Instant>,
+    /// 工具启动时刻：`input.time` 的单调基准（egui 只要求单调递增）。
+    epoch: std::time::Instant,
 }
 
 impl Driver {
@@ -321,11 +328,25 @@ impl Driver {
             viewport: DEFAULT_VIEWPORT,
             frame_ms,
             labels: HashMap::new(),
+            last_frame_t: None,
+            epoch: std::time::Instant::now(),
         }
     }
 
     /// 推一帧（可选注入额外输入事件），帧间真 sleep。
-    fn tick(&mut self, input: egui::RawInput) {
+    fn tick(&mut self, mut input: egui::RawInput) {
+        // time / predicted_dt 用真实帧数据（见字段文档）：egui 从连续
+        // time 差值推导 unstable_dt，进而得 stable_dt——这是应用侧一切
+        // 「每帧推进」逻辑（自动播放等）的时间源，必须与墙钟一致。
+        // 此前用 RawInput::default() 的 1/60，而帧间真 sleep 30ms ⇒
+        // 模拟时间只有墙钟一半（2026-11-06 验证自动播放时抓到）。
+        let now = std::time::Instant::now();
+        let dt = self
+            .last_frame_t
+            .replace(now)
+            .map_or(1.0 / 60.0, |t| (now - t).as_secs_f32());
+        input.time = Some(self.epoch.elapsed().as_secs_f64());
+        input.predicted_dt = dt.max(0.001);
         self.app.logic(&self.ctx, &mut self.frame);
         let mut out = self
             .ctx

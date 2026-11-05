@@ -14,6 +14,12 @@
 //! 键位归属：`N` / `Shift+N` 在 App 层处理（要读分析数据，见
 //! `App::ui` 的按键段），`Home` / `End` / `Shift+←/→` 在棋盘层
 //! （`ui::board_view::handle_keyboard`，与裸箭头同源、同守卫）。
+//!
+//! **自动播放**（竞品移植第三批 P2，Sabaki autoplay 的移植）也归本
+//! 模块：到点 `step_forward` 一步，到线尾自动停；对弈 / 解题模式下
+//! 不可用（入口置灰 + tick 兜底自停），换盘（载谱 / 新对局 / 切副本）
+//! 即停（`clear_board_derived` 钩子）。间隔随 ui_prefs 持久化，开关
+//! 不持久化（播放是「这一会儿的事」，重启还自动播反而吓人）。
 
 use super::GuanqiApp;
 use crate::ui::{analysis_panel::LoadNotice, theme};
@@ -97,6 +103,73 @@ impl GuanqiApp {
         if let Some(target) = jump {
             self.board.go_to(target);
             self.goto_open = false;
+        }
+    }
+
+    // ---- 自动播放（Sabaki autoplay 的移植）----
+
+    /// 空格键 / 菜单开关共用的播放 / 停止切换。停止静默（开关本身的
+    /// 状态变化即可见反馈）；启动走守卫，不满足条件时消息卡说明原因。
+    pub(super) fn toggle_autoplay(&mut self) {
+        if self.autoplay_remaining.take().is_some() {
+            return;
+        }
+        if self.play.mode {
+            self.notices.push(LoadNotice::Warn(
+                "对弈模式下没有自动播放：落子节奏由对局双方决定。".to_owned(),
+            ));
+            return;
+        }
+        if self.solving_mode {
+            self.notices.push(LoadNotice::Warn(
+                "解题模式下没有自动播放：自动走题面等于剧透。".to_owned(),
+            ));
+            return;
+        }
+        if self.board.move_count() == 0 {
+            self.notices.push(LoadNotice::Warn(
+                "当前棋盘没有着手，无从播放。".to_owned(),
+            ));
+            return;
+        }
+        // 已在线尾 = 想从头整谱回放，这是最常见的意图。
+        if self.board.cursor() == self.board.line_len() {
+            self.board.go_to(0);
+        }
+        let secs = self.engine_cfg.ui_prefs.autoplay_secs.max(0.1);
+        self.autoplay_remaining = Some(secs);
+        self.notices.push(LoadNotice::Ok(format!(
+            "自动播放开始（每 {secs} 秒一手，空格停止）。"
+        )));
+    }
+
+    /// 每帧推进倒计时（`App::ui` 调用，`dt` = 本帧稳定时长）。
+    ///
+    /// 到点 `step_forward` 一步（分支点进首子分支，与裸 `→` 同语义）；
+    /// 到线尾自动停并提示。对弈 / 解题模式中途被打开时兜底自停
+    /// （正常路径菜单入口已置灰，这里防菜单之外的改变路径）。
+    pub(super) fn autoplay_tick(&mut self, dt: f32) {
+        if self.play.mode || self.solving_mode {
+            self.autoplay_remaining = None;
+            return;
+        }
+        let mut fire = false;
+        if let Some(remaining) = self.autoplay_remaining.as_mut() {
+            *remaining -= dt;
+            if *remaining <= 0.0 {
+                fire = true;
+            }
+        }
+        if !fire {
+            return;
+        }
+        let interval = self.engine_cfg.ui_prefs.autoplay_secs.max(0.1);
+        if self.board.step_forward() {
+            self.autoplay_remaining = Some(interval);
+        } else {
+            self.autoplay_remaining = None;
+            self.notices
+                .push(LoadNotice::Ok("已到当前线末尾，自动播放停止。".to_owned()));
         }
     }
 }

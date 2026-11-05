@@ -433,6 +433,56 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
             self.goto_open = true;
             ui.close();
         }
+        // ---- 自动播放（竞品移植第三批 P2，Sabaki autoplay 的移植）----
+        // 空格开关 / 菜单开关同一执行体（toggle_autoplay）；间隔档位
+        // 随 ui_prefs 持久化，开关不持久化。对弈 / 解题模式下置灰：
+        // 前者节奏由对局决定，后者自动走题面等于剧透。
+        ui.separator();
+        let autoplay_conflict = if self.play.mode {
+            Some("对弈模式下没有自动播放：落子节奏由对局双方决定。")
+        } else if self.solving_mode {
+            Some("解题模式下没有自动播放：自动走题面等于剧透。")
+        } else {
+            None
+        };
+        let mut autoplay_on = self.autoplay_remaining.is_some();
+        let checkbox = egui::Checkbox::new(&mut autoplay_on, "自动播放（空格）");
+        let mut entry = ui.add_enabled(autoplay_conflict.is_none(), checkbox);
+        if let Some(reason) = autoplay_conflict {
+            entry = entry.on_disabled_hover_text(reason);
+        } else {
+            entry = entry.on_hover_text(
+                "到点自动前进一步（分支点进首子分支），到当前线末尾自动停。\
+                 已在线尾时开启 = 从头整谱回放。",
+            );
+        }
+        if autoplay_conflict.is_none() && entry.changed() {
+            if autoplay_on {
+                self.toggle_autoplay();
+            } else {
+                self.autoplay_remaining = None;
+            }
+        }
+        ui.menu_button("自动播放间隔", |ui| menu_body(ui, |ui| {
+            for secs in [0.5, 1.0, 2.0, 4.0, 8.0] {
+                let selected = (self.engine_cfg.ui_prefs.autoplay_secs - secs).abs() < 0.001;
+                let label = if secs < 1.0 {
+                    format!("{secs} 秒")
+                } else {
+                    format!("{} 秒", secs as u32)
+                };
+                if ui.selectable_label(selected, label).clicked() {
+                    self.engine_cfg.ui_prefs.autoplay_secs = secs;
+                    // 播放中改间隔：下一拍立即按新间隔走（重置剩余时长，
+                    // 避免「刚改 0.5 秒却还要等满旧的 2 秒」的错觉）。
+                    if let Some(remaining) = self.autoplay_remaining.as_mut() {
+                        *remaining = secs;
+                    }
+                    self.mark_prefs_dirty();
+                    ui.close();
+                }
+            }
+        }));
         // ---- 另存写回：逐手注释开关（随 ui_prefs 持久化）----
         // 归「分析」菜单而非另存对话框：portal 另存对话框是系统原生
         // 窗口塞不进自绘控件，且注释是分析产物的写出口径，与分析设置
