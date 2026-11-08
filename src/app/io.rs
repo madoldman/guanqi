@@ -208,6 +208,41 @@ pub(super) fn apply_loaded(
     }
 }
 
+/// 复制当前棋盘的 SGF 文本到系统剪贴板（竞品移植第四批 Q4）。
+///
+/// 与 [`Self::save_game`] 完全同一套文本构建（`board_to_sgf`：含统计
+/// 块 / 逐手注释 / 元信息），差别只在落点——一个写文件、一个进剪贴板。
+/// 粘贴方向（从剪贴板读文本开谱）egui 0.36 无应用层事件通路，故只有
+/// 单向复制；无棋谱时同样可复制（空盘新对局的合法 SGF）。
+pub(super) fn copy_sgf_to_clipboard(&mut self, ctx: &egui::Context) {
+    let stats_block = if self.loaded.is_some() {
+        crate::ui::analysis::stats_block_text(
+            &self.analysis.game_summary(&self.board),
+            crate::ui::analysis::WORST_LIMIT,
+        )
+    } else {
+        None
+    };
+    let move_notes = if self.loaded.is_some() && self.annotate_moves {
+        let notes = self.analysis.move_annotations(&self.board, false);
+        (!notes.is_empty()).then_some(notes)
+    } else {
+        None
+    };
+    let text = crate::sgf::board_to_sgf(
+        &self.board,
+        self.loaded.as_ref(),
+        stats_block.as_deref(),
+        move_notes.as_ref(),
+    );
+    let bytes = text.len();
+    ctx.copy_text(text);
+    self.notices.push(LoadNotice::Ok(format!(
+        "已复制 SGF 文本到剪贴板（{} 手，{bytes} 字节），可在其它工具直接粘贴。",
+        self.board.move_count()
+    )));
+}
+
 /// 把当前棋盘（含用户新建的变着）写到用户确认的位置。
 /// 新对局后未另存过时用默认文件名存；写失败时提示可读原因，原状态不变。
 ///

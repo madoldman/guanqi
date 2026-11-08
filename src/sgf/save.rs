@@ -470,3 +470,25 @@ fn coords_prop(ident: &str, coords: &[Coord]) -> Property {
         values: coords.iter().map(|at| at.to_sgf()).collect(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::board::{Board, Coord, Size};
+
+    #[test]
+    fn 剪贴板文本可回读且手数一致() {
+        let mut board = Board::new(Size::new(9).unwrap());
+        board
+            .play(Coord::from_sgf(Size::new(9).unwrap(), "cc").unwrap())
+            .unwrap();
+        board
+            .play(Coord::from_sgf(Size::new(9).unwrap(), "dd").unwrap())
+            .unwrap();
+        let text = board_to_sgf(&board, None, None, None);
+        assert!(text.starts_with("(;"), "SGF 文本以游戏树开头");
+        let loaded = crate::sgf::load_collection(Path::new("clip.sgf"), text.as_bytes()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].board.move_count(), 2);
+    }
+}

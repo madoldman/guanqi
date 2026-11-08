@@ -58,6 +58,18 @@ pub(super) fn file_menu(&mut self, ui: &mut egui::Ui) {
             self.save_file_dialog();
             ui.close();
         }
+        // ---- 复制棋谱到剪贴板（竞品移植第四批 Q4，KaTrain Ctrl+C 的
+        // 移植）：与「另存为」同一套文本构建（含统计块 / 逐手注释），
+        // 不落盘、直接进系统剪贴板，可在其它工具（Sabaki / 文本编辑器）
+        // 直接粘贴。粘贴通路 egui 0.36 无事件，只做单向复制。----
+        if ui
+            .button("复制棋谱到剪贴板")
+            .on_hover_text("把当前棋盘连同注释 / 局后统计生成 SGF 文本，进系统剪贴板。")
+            .clicked()
+        {
+            self.copy_sgf_to_clipboard(ui.ctx());
+            ui.close();
+        }
         // ---- 参照文件（阶段 22）：外部定式库 / 死活题谱的加载与卸载 ----
         // 与「打开棋谱」正交：不替换当前对局 / 文档，无内容守卫；
         // portal 不可用时同样置灰并说明原因。
