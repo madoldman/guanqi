@@ -318,6 +318,9 @@ pub(super) fn save_game(&mut self, path: PathBuf) {
                 PostSaveAction::LoadDropped(path) => {
                     self.load_game(path);
                 }
+                PostSaveAction::SetupStart => {
+                    self.start_setup_mode();
+                }
                 PostSaveAction::Exit => {
                     // 落盘后放行退出：下一帧 ui 顶部重新发 Close
                     // （`request_close`，此时 `is_dirty` 已为 false）。

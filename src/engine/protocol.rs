@@ -170,6 +170,13 @@ pub struct AnalysisQuery {
     pub initial_stones: Vec<(Stone, Coord)>,
     /// 真实着法（行棋方 + 着法），按时间顺序；不含预设摆子。
     pub moves: Vec<(Stone, Action)>,
+    /// 初始盘面的先行方（竞品移植第四批 Q5 的摆子开局需要）：有摆子时
+    /// **显式发送** `initialPlayer`——引擎会按「黑白数量差」推断先行方，
+    /// 摆子编辑允许任意数量 / 先行方组合（如 2 黑 1 白白先），推断必错
+    /// （2026-11-08 真实引擎探针：2B1W 无该字段 → currentPlayer=B；
+    /// 带 `initialPlayer:"W"` → currentPlayer=W，KaTrain 同样随摆子发送）。
+    /// 空盘局为 `None`（线上省略，与既有形态逐位一致，零回归）。
+    pub initial_player: Option<Stone>,
     /// 查询级思考量上限；`None` 则省略字段、沿用 cfg 中的 `maxVisits`。
     /// 实测可覆盖 cfg 值。
     pub max_visits: Option<u32>,
@@ -293,6 +300,7 @@ impl AnalysisQuery {
             komi: 7.5,
             rules: "chinese".to_owned(),
             initial_stones: Vec::new(),
+            initial_player: None,
             moves,
             max_visits: None,
             include_ownership: false,
@@ -330,6 +338,9 @@ struct WireQuery<'a> {
     /// 「无该字段」是引擎接受的常规形态，字段语义本身没有空盘捷径。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     initial_stones: Vec<(String, String)>,
+    /// 先行方显式告知（`initialPlayer`，"B"/"W"）；空盘局省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initial_player: Option<&'static str>,
     moves: Vec<(&'a str, &'a str)>,
     rules: &'a str,
     komi: f64,
@@ -479,10 +490,12 @@ impl AnalysisQuery {
             .zip(&setup_strs)
             .map(|((stone, _), gtp)| (stone_tag(*stone).to_owned(), gtp.clone()))
             .collect();
+        let initial_player = self.initial_player.map(stone_tag);
         let (allow_moves, avoid_moves) = wire_move_rules(self.move_rules.as_ref());
         let wire = WireQuery {
             id: id.raw().to_string(),
             initial_stones,
+            initial_player,
             moves,
             rules: &self.rules,
             komi: self.komi,

@@ -130,6 +130,8 @@ pub struct StateSnapshot {
     pub comment: Option<String>,
     /// 黑方姓名（竞品移植第四批 Q3 的取证口径；信息编辑走纯元数据）。
     pub info_pb: Option<String>,
+    /// 摆子模式当前笔（竞品移植第四批 Q5 的取证口径；`None` = 非摆子）。
+    pub setup: Option<String>,
     /// 解题模式「已查看答案」留痕。
     pub answer_shown: bool,
     /// 最近一条「参照对照：」判定文本（解题模式落子判定的取证口径；
@@ -799,6 +801,7 @@ impl GuanqiApp {
                 .loaded
                 .as_ref()
                 .and_then(|meta| meta.info.player_black.clone()),
+            setup: self.setup_mode.map(|pen| pen.name().to_owned()),
             answer_shown: self.answer_shown,
             judge_notice: self.last_judge_notice(),
             ref_scan: {
@@ -920,6 +923,14 @@ impl StateSnapshot {
         // 个宏调用后各自的展开深度独立，无需提高 crate 的 recursion_limit。
         // 根盘面摆子（headless 取证「查询里的 initialStones 是否与谱一致」）
         // 已在 `state_snapshot` 填入 self.root_setup，这里直接引用。
+        // 第四批 Q1–Q5 的取证键也拆成独立子对象（同上：顶层键数已到
+        // 宏递归上限，新增键一律进子对象）。
+        let q_batch = serde_json::json!({
+            "collection": self.collection,
+            "comment": self.comment,
+            "info_pb": self.info_pb,
+            "setup": self.setup,
+        });
         let probe = serde_json::json!({
             "engine_warnings": self.engine_warnings,
             "last_query": self.last_query,
@@ -1100,6 +1111,7 @@ impl StateSnapshot {
             "manual_revealed": self.manual_revealed,
             "candidates_visible": self.candidates_visible,
             "notices": self.notices,
+            "q_batch": q_batch,
             "toggles": {
                 "show_candidates": self.toggles.show_candidates,
                 "show_heat": self.toggles.show_heat,
@@ -1123,9 +1135,6 @@ impl StateSnapshot {
             "ref_scan": ref_scan,
             "solving": self.solving,
             "guess": self.guess,
-            "collection": self.collection,
-            "comment": self.comment,
-            "info_pb": self.info_pb,
             "answer_shown": self.answer_shown,
             "judge_notice": self.judge_notice,
             "board_rect": self.board_rect,

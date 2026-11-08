@@ -599,6 +599,53 @@ impl Board {
         true
     }
 
+    // ---- 摆子编辑（竞品移植第四批 Q5，katsura AB/AW / Hoshi 右键编辑的移植）----
+
+    /// 摆子模式：在**根盘面**放 / 换一颗摆子（AB/AW 语义，不是着手）。
+    ///
+    /// 仅游标 0（根）合法——摆子属于根局面；占点为另一色则替换为本次
+    /// 的颜色，同色为幂等无操作。返回是否发生改动。`record_rev` 递增：
+    /// 根盘面变了就是内容变了（未保存守卫的事实来源）。
+    pub fn setup_place(&mut self, stone: Stone, at: Coord) -> bool {
+        if self.current != 0 {
+            return false;
+        }
+        let index = at.index(self.size);
+        if self.nodes[0].grid[index] == Some(stone) {
+            return false;
+        }
+        self.nodes[0].grid[index] = Some(stone);
+        self.record_rev += 1;
+        self.refresh();
+        true
+    }
+
+    /// 摆子模式：清除根盘面某点（擦除笔）。游标 0 限定同
+    /// [`Self::setup_place`]；空点为幂等无操作。
+    pub fn setup_remove(&mut self, at: Coord) -> bool {
+        if self.current != 0 {
+            return false;
+        }
+        let index = at.index(self.size);
+        if self.nodes[0].grid[index].is_none() {
+            return false;
+        }
+        self.nodes[0].grid[index] = None;
+        self.record_rev += 1;
+        self.refresh();
+        true
+    }
+
+    /// 摆子模式：设定根行棋方（PL 语义；摆子窗口的「黑先 / 白先」）。
+    /// 同值幂等不递增。
+    pub fn setup_set_to_play(&mut self, stone: Stone) {
+        if self.root_to_play != stone {
+            self.root_to_play = stone;
+            self.record_rev += 1;
+            self.refresh();
+        }
+    }
+
     // ---- 合法性与落子 ----
 
     /// 查询在当前盘面（游标处）落子是否合法，非法时给出可显示的原因。

@@ -80,6 +80,7 @@ pub fn show(
     manual_revealed: bool,
     solving: bool,
     guess: bool,
+    setup: Option<crate::app::setup::SetupPen>,
     mut play: Option<&mut PlayState>,
 ) {
     handle_keyboard(ui, board, notice, branch_notice, guess, play.as_deref());
@@ -215,7 +216,7 @@ pub fn show(
                 analysis.toggle_avoid(board.to_play(), at);
             }
             if response.clicked() {
-                handle_click(board, notice, branch_notice, &layout, response.interact_pointer_pos(), guess, play.as_deref_mut());
+                handle_click(board, notice, branch_notice, &layout, response.interact_pointer_pos(), guess, setup, play.as_deref_mut());
             }
         }
     }
@@ -443,6 +444,7 @@ fn handle_keyboard(
 /// 回看中（非叶节点）落子不再被拒绝，而是**新建变着分支**：
 /// 当前节点的子分支数增加（确实新建了兄弟分支）时给轻提示；落到已有
 /// 分支（直接切换过去）或叶子上续棋则不打扰。
+#[allow(clippy::too_many_arguments)]
 fn handle_click(
     board: &mut Board,
     notice: &mut Option<IllegalReason>,
@@ -450,6 +452,7 @@ fn handle_click(
     layout: &Layout,
     pos: Option<Pos2>,
     guess: bool,
+    setup: Option<crate::app::setup::SetupPen>,
     play: Option<&mut PlayState>,
 ) {
     let Some(pos) = pos else { return };
@@ -460,7 +463,28 @@ fn handle_click(
         *branch_notice = guess_click(board, at);
         return;
     }
+    // 摆子模式（Q5）：点击 = 摆子动作（放 / 换 / 擦），拦截在落子之前
+    // ——摆子盘上手数恒 0，绝不产生着手或分支。
+    if let Some(pen) = setup {
+        setup_click(board, pen, at);
+        return;
+    }
     play_with_feedback(board, notice, branch_notice, at, play);
+}
+
+/// 摆子模式的一次点击（按当前笔落 / 擦；盘面即时反馈，无需文字提示）。
+fn setup_click(board: &mut Board, pen: crate::app::setup::SetupPen, at: Coord) {
+    match pen {
+        crate::app::setup::SetupPen::Black => {
+            board.setup_place(crate::board::Stone::Black, at);
+        }
+        crate::app::setup::SetupPen::White => {
+            board.setup_place(crate::board::Stone::White, at);
+        }
+        crate::app::setup::SetupPen::Erase => {
+            board.setup_remove(at);
+        }
+    }
 }
 
 /// 猜下一手的一次判定：`at` 是否棋谱的下一手。

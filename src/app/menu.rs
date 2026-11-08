@@ -203,6 +203,19 @@ pub(super) fn play_menu(&mut self, ui: &mut egui::Ui) {
             self.new_game_open = true;
             ui.close();
         }
+        // ---- 摆子开局（竞品移植第四批 Q5，katsura AB/AW 编辑的移植）：
+        // 空盘文档上摆子研究定式 / 死活 / 局部，完成后引擎按摆子局面
+        // 分析。对弈模式下不可用（节奏属于对局，替换棋盘无意义）。----
+        if ui
+            .button("摆子开局…")
+            .on_hover_text(
+                "整体替换为空盘文档并进入摆子模式：点击棋盘放黑 / 白 / 擦除，                 选先行方，完成后引擎按摆子局面分析（可另存为带 AB/AW 的 SGF）。",
+            )
+            .clicked()
+        {
+            self.request_setup_start();
+            ui.close();
+        }
         ui.separator();
         // 人机对弈开关（复选）：与原侧栏同一个 `play.mode` 字段。
         // 勾选即刻生效（对局开始 = 从当前局面起人类执 `play.human`）。

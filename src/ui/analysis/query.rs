@@ -561,6 +561,11 @@ impl AnalysisState {
             .map(|at| (Stone::Black, at))
             .chain(setup_white.into_iter().map(|at| (Stone::White, at)))
             .collect();
+        // 先行方显式告知（有摆子时）：引擎按数量差推断先行方，摆子编辑
+        // 的任意数量 / 先行方组合推断必错（协议字段实测见
+        // `AnalysisQuery::initial_player` 文档）。空盘局省略字段。
+        query.initial_player = (!query.initial_stones.is_empty())
+            .then(|| board.root_to_play());
         query.komi = komi;
         // 规则：设置显式指定 > 棋谱 RU 宽容映射 > 默认 chinese。解析出的
         // 恒为规范名（绝不把 SGF 原始串发给引擎）；解析提示已由

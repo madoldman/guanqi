@@ -51,6 +51,7 @@ mod navigate;
 mod play_flow;
 mod ref_export;
 mod reference;
+pub(crate) mod setup;
 mod guess;
 mod snapshot;
 mod solving;
@@ -121,6 +122,9 @@ pub struct GuanqiApp {
     /// 对局信息编辑窗（竞品移植第四批 Q3，见 `app::info_edit`）：
     /// `Some((草稿, 首字段待聚焦))` = 编辑窗打开。
     info_edit: Option<(info_edit::InfoDraft, bool)>,
+    /// 摆子模式（竞品移植第四批 Q5，见 `app::setup`）：`Some(笔)` =
+    /// 进行中（棋盘点击 = 摆子动作，窗口提供笔 / 先行方 / 完成）。
+    setup_mode: Option<setup::SetupPen>,
     /// 当前活动文档的元信息是否改过而未另存（竞品移植第四批 Q2）：
     /// 注释 / 对局信息编辑走这里（棋盘记录改动仍由 record_rev 判）。
     /// 与 saved_rev 同一套「随文档走」语义：切文档 / 另存成功即复位。
@@ -327,6 +331,8 @@ enum PendingConfirm {
     /// 拖放时已产生，与 [`Self::LoadGame`]（确认后重新弹对话框）的
     /// 区别仅在于此。非 Copy 的 `PathBuf` 在此，其余变体不受影响。
     LoadDropped(std::path::PathBuf),
+    /// 确认后开始摆子开局（竞品移植第四批 Q5）：整体替换为空盘文档。
+    SetupStart,
     /// 确认后开始新对局。
     NewGame(crate::play::GameSetup),
 }
@@ -338,6 +344,7 @@ impl PendingConfirm {
         let base = match self {
             Self::DropCopy { .. } => "丢弃该研究副本后".to_owned(),
             Self::LoadGame | Self::LoadDropped(_) => "载入新棋谱会替换原谱".to_owned(),
+            Self::SetupStart => "摆子开局会替换原谱".to_owned(),
             Self::NewGame(_) => "开始新对局会替换原谱".to_owned(),
             Self::None => String::new(),
         };
@@ -360,6 +367,8 @@ enum UnsavedConfirm {
     OpenDialog,
     /// 确认后**直接载入**拖放进来的棋谱（路径拖放时已产生）。
     LoadDropped(std::path::PathBuf),
+    /// 确认后开始摆子开局（竞品移植第四批 Q5）。
+    SetupStart,
 }
 
 impl UnsavedConfirm {
@@ -373,6 +382,9 @@ impl UnsavedConfirm {
             }
             Self::OpenDialog | Self::LoadDropped(_) => {
                 "打开棋谱会替换当前棋谱，未保存的改动将丢失。".to_owned()
+            }
+            Self::SetupStart => {
+                "摆子开局会替换当前棋谱，未保存的改动将丢失。".to_owned()
             }
         }
     }
@@ -392,6 +404,8 @@ enum PostSaveAction {
     OpenDialog,
     /// 继续直接载入拖放进来的棋谱（竞品移植第三批 P6）。
     LoadDropped(std::path::PathBuf),
+    /// 继续开始摆子开局（竞品移植第四批 Q5）。
+    SetupStart,
     /// 继续退出应用。
     Exit,
 }
@@ -512,6 +526,7 @@ impl GuanqiApp {
             comment_edit: None,
             comment_edit_focus: false,
             info_edit: None,
+            setup_mode: None,
             meta_dirty: false,
             engine_cfg,
             settings,
@@ -1087,6 +1102,7 @@ impl eframe::App for GuanqiApp {
                 self.manual_revealed,
                 study_hidden,
                 self.guess_mode,
+                self.setup_mode,
                 Some(&mut self.play),
             );
         });
@@ -1208,6 +1224,12 @@ impl eframe::App for GuanqiApp {
             self.info_dialog(ctx);
         }
 
+        // 摆子窗口（竞品移植第四批 Q5，见 app::setup）：模式进行中绘制。
+        if self.setup_mode.is_some() {
+            let ctx = ui.ctx();
+            self.setup_dialog(ctx);
+        }
+
         // 参照库打分对话框（「分析 → 参照库打分…」入口，阶段 22.3）：
         // 范围 / 档位确认 + 预估同屏；发起与取消走 AnalysisState 的独立
         // 批处理。配置单一来源在 `analysis.ref_scan_config()`：对话框每帧
@@ -1295,6 +1317,7 @@ impl eframe::App for GuanqiApp {
                         // 载入的路径在确认后才由用户选择，此处重新发起对话框。
                         PendingConfirm::LoadGame => self.open_file_dialog_after_confirm(),
                         PendingConfirm::LoadDropped(path) => self.load_game(path),
+                        PendingConfirm::SetupStart => self.start_setup_mode(),
                         PendingConfirm::NewGame(setup) => self.start_new_game(setup),
                         PendingConfirm::None => {}
                     }
@@ -1365,6 +1388,7 @@ impl eframe::App for GuanqiApp {
                         UnsavedConfirm::LoadDropped(path) => {
                             PostSaveAction::LoadDropped(path.clone())
                         }
+                        UnsavedConfirm::SetupStart => PostSaveAction::SetupStart,
                     };
                     // 另存成功后自动继续 then（save_game 的 Ok 分支）。
                     // 发起失败（等待中 / portal 不可用）时回调留在
@@ -1392,6 +1416,7 @@ impl eframe::App for GuanqiApp {
                             }
                         }
                         UnsavedConfirm::LoadDropped(path) => self.load_game(path),
+                        UnsavedConfirm::SetupStart => self.start_setup_mode(),
                     }
                 }
                 Some(UnsavedVerdict::Cancel) => {
