@@ -110,6 +110,9 @@ pub enum PanelAction {
     /// 点了「棋谱」卡片的「编辑注释…」（竞品移植第四批 Q2）：打开
     /// 当前手注释编辑窗。不携带数据：草稿由 App 从当前注释派生。
     EditComment,
+    /// 点了「棋谱」卡片的「编辑信息…」（竞品移植第四批 Q3）：打开
+    /// 对局信息编辑窗（纯元数据；不含贴目）。不携带数据。
+    EditInfo,
     /// 点了候选点卡片的「主变落成变着」（竞品移植第三批 P5，KaTrain
     /// 「中键把 PV 加进棋谱树」的移植）：把当前首选的主变（截断到
     /// [`PV_LIMIT`]）真实落成一条变着分支。不携带数据：快照由 App 复核
@@ -953,12 +956,18 @@ fn card_game(
             ui.add_space(2.0);
             ui.label(text);
         }
-        // 「编辑注释…」（竞品移植第四批 Q2）：当前局面注释的手动写
-        // 入口——复盘笔记不用再手改 SGF 文件。根局面 = 编辑根注释。
+        // 「编辑注释… / 编辑信息…」（竞品移植第四批 Q2 / Q3）：注释与
+        // 纯元数据的手动写入口——复盘笔记与对局信息不用再手改 SGF。
+        // 根局面 = 编辑根注释；信息窗刻意不含贴目（参与分析口径）。
         ui.add_space(2.0);
-        if ui.button("编辑注释…").clicked() {
-            *action = PanelAction::EditComment;
-        }
+        ui.horizontal(|ui| {
+            if ui.button("编辑注释…").clicked() {
+                *action = PanelAction::EditComment;
+            }
+            if ui.button("编辑信息…").clicked() {
+                *action = PanelAction::EditInfo;
+            }
+        });
 
         // ---- 文档列表（原谱 + 各研究副本；点击切换）----
         // 列表放在侧栏滚动区内，副本多时随侧栏一起滚动。创建 / 丢弃

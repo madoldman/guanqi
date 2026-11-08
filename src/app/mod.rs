@@ -44,6 +44,7 @@ mod doc;
 mod export;
 mod collection;
 mod comment_edit;
+mod info_edit;
 mod io;
 mod menu;
 mod navigate;
@@ -117,6 +118,9 @@ pub struct GuanqiApp {
     /// 注释编辑窗的 TextEdit 待聚焦标记：打开后首个渲染帧请求键盘
     /// 焦点（打开即可打字，标准对话框体验；无它则要先点进文本框）。
     comment_edit_focus: bool,
+    /// 对局信息编辑窗（竞品移植第四批 Q3，见 `app::info_edit`）：
+    /// `Some((草稿, 首字段待聚焦))` = 编辑窗打开。
+    info_edit: Option<(info_edit::InfoDraft, bool)>,
     /// 当前活动文档的元信息是否改过而未另存（竞品移植第四批 Q2）：
     /// 注释 / 对局信息编辑走这里（棋盘记录改动仍由 record_rev 判）。
     /// 与 saved_rev 同一套「随文档走」语义：切文档 / 另存成功即复位。
@@ -507,6 +511,7 @@ impl GuanqiApp {
             collection: None,
             comment_edit: None,
             comment_edit_focus: false,
+            info_edit: None,
             meta_dirty: false,
             engine_cfg,
             settings,
@@ -942,6 +947,8 @@ impl eframe::App for GuanqiApp {
             analysis_panel::PanelAction::CommitBestPv => self.commit_best_pv(),
             // 注释编辑窗（竞品移植第四批 Q2）：草稿从当前注释派生。
             analysis_panel::PanelAction::EditComment => self.open_comment_editor(),
+            // 对局信息编辑窗（竞品移植第四批 Q3）。
+            analysis_panel::PanelAction::EditInfo => self.open_info_editor(),
             analysis_panel::PanelAction::None => {}
         }
 
@@ -1193,6 +1200,12 @@ impl eframe::App for GuanqiApp {
         if self.comment_edit.is_some() {
             let ctx = ui.ctx();
             self.comment_dialog(ctx);
+        }
+
+        // 对局信息编辑窗（竞品移植第四批 Q3，见 app::info_edit）。
+        if self.info_edit.is_some() {
+            let ctx = ui.ctx();
+            self.info_dialog(ctx);
         }
 
         // 参照库打分对话框（「分析 → 参照库打分…」入口，阶段 22.3）：

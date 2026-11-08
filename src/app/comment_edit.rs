@@ -36,11 +36,12 @@ impl GuanqiApp {
         let cursor = self.board.cursor();
         let mut open = true;
         let mut verdict: Option<u8> = None;
+        // 双限高同 info_edit（长注释在滚动区内滚，动作条恒在窗内可点）。
         egui::Window::new("编辑当前手注释")
             .open(&mut open)
             .resizable(false)
-            .vscroll(true)
-            .max_height(360.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .max_height(420.0)
             .show(ctx, |ui| {
                 let where_text = if cursor == 0 {
                     "根注释（本局根节点的 C[]，另存时写在文件头节点）"
@@ -51,16 +52,18 @@ impl GuanqiApp {
                     "写在第 {cursor} 手：{where_text}。"
                 ));
                 ui.add_space(4.0);
-                if let Some(draft) = self.comment_edit.as_mut() {
-                    let response = egui::TextEdit::multiline(draft)
-                        .desired_width(ui.available_width())
-                        .show(ui);
-                    // 打开即聚焦（字段级隔离：focus 标记与草稿不同字段）。
-                    if self.comment_edit_focus {
-                        response.response.request_focus();
-                        self.comment_edit_focus = false;
+                egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                    if let Some(draft) = self.comment_edit.as_mut() {
+                        let response = egui::TextEdit::multiline(draft)
+                            .desired_width(ui.available_width())
+                            .show(ui);
+                        // 打开即聚焦（字段级隔离：focus 标记与草稿不同字段）。
+                        if self.comment_edit_focus {
+                            response.response.request_focus();
+                            self.comment_edit_focus = false;
+                        }
                     }
-                }
+                });
                 ui.add_space(4.0);
                 verdict = theme::action_row(
                     ui,
