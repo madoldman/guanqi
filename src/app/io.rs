@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use super::{DEFAULT_KOMI, GuanqiApp, PendingConfirm, PostSaveAction, UnsavedConfirm};
-use crate::sgf::{GameMeta, load_from_bytes, save_to_file};
+use crate::sgf::{GameMeta, LoadedGame, load_collection, save_to_file};
 use crate::ui::analysis_panel::LoadNotice;
 
 impl GuanqiApp {
@@ -74,20 +74,45 @@ pub(super) fn clear_board_derived(&mut self) {
     // 猜下一手随换盘退出（竞品移植第三批 P3）：猜的对象是「这一份
     // 棋谱」，换盘后继续猜就是对着新谱猜旧谱的答案。
     self.guess_mode = false;
+    // 未选完的集合待选列表一并清空（Q1）：换盘后旧文件的「选哪局」
+    // 已无意义，留着只会弹一个过期的选择窗。
+    self.collection = None;
 }
 
 /// 从字节流载入棋谱（[`Self::load_game`] 的读盘后半段；headless 工具
 /// 复用以绕开 portal 对话框）。解析失败时**保留原棋盘**，只提示错误。
 pub(super) fn load_game_from_bytes(&mut self, path: PathBuf, bytes: Vec<u8>) {
-    match load_from_bytes(&path, &bytes) {
+    match load_collection(&path, &bytes) {
         Err(err) => {
             self.notices.push(LoadNotice::Failed(format!("打开棋谱失败：{err}")));
         }
-        Ok(loaded) => {
-            let (warning, partial) = (loaded.warning.clone(), loaded.partial);
-            let unplaced_props = loaded.unplaced_props;
-            let dropped_comments = loaded.dropped_comments;
-            let (board, meta) = loaded.into_parts();
+        Ok(mut games) => match games.len() {
+            // 单局文件：口径与此前逐位一致，直接应用。
+            1 => self.apply_loaded(games.swap_remove(0), None),
+            // 多局集合（竞品移植第四批 Q1）：弹「选择要载入的一局」，
+            // 确认链在打开 / 拖放时已走完，选择即应用、取消即不载。
+            // （0 局不可达：parse_collection 空文件已报 EmptyInput。）
+            _ => {
+                self.collection = Some((path, games));
+            }
+        },
+    }
+}
+
+/// 把一份已构建的载入结果应用到应用状态（换盘 / 换 meta / 分析复位 /
+/// 提示组装）。[`Self::load_game_from_bytes`] 的 Ok 分支主体：单局直接
+/// 调用；集合文件由「选择要载入的一局」窗口按用户选择调用
+/// （`from_collection = Some((第几局 1 起, 共几局))` 时在提示里注明）。
+pub(super) fn apply_loaded(
+    &mut self,
+    loaded: LoadedGame,
+    from_collection: Option<(usize, usize)>,
+) {
+    {
+        let (warning, partial) = (loaded.warning.clone(), loaded.partial);
+        let unplaced_props = loaded.unplaced_props;
+        let dropped_comments = loaded.dropped_comments;
+        let (board, meta) = loaded.into_parts();
             // 载入棋谱的贴目进入分析口径：查询 komi 改取谱上的 KM
             // （缺失时默认 7.5）。此前 `komi` 只在 start_new_game 赋值，
             // 载入 KM[6.5] 的谱仍按 7.5 分析（或按上一盘的值），侧栏
@@ -162,8 +187,24 @@ pub(super) fn load_game_from_bytes(&mut self, path: PathBuf, bytes: Vec<u8>) {
                     notice.text()
                 )),
             };
+            // 集合来源的注明（Q1）：在主提示之后追加一句，让「第几局 /
+            // 共几局」可判读（选择窗里选了第 i 局，载入后界面不再显示
+            // 序号，靠这句留痕）。保持原提示的级别（数据丢失警示不因
+            // 追加而降级为普通绿条）。
+            let notice = if let Some((index, total)) = from_collection {
+                let text = format!(
+                    "{}（文件共 {total} 局，此为第 {index} 局。）",
+                    notice.text()
+                );
+                if matches!(notice, LoadNotice::Warn(_)) {
+                    LoadNotice::Warn(text)
+                } else {
+                    LoadNotice::Ok(text)
+                }
+            } else {
+                notice
+            };
             self.notices.push(notice);
-        }
     }
 }
 

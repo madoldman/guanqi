@@ -42,6 +42,7 @@ use crate::ui::{
 mod dialog;
 mod doc;
 mod export;
+mod collection;
 mod io;
 mod menu;
 mod navigate;
@@ -104,6 +105,10 @@ pub struct GuanqiApp {
     /// 棋盘替换代数：整体替换棋盘（载谱 / 新对局）时递增，混入树布局
     /// 指纹，防止「着法序列恰好相同的另一盘棋」复用过期布局。
     tree_epoch: u64,
+    /// 待选择的 SGF 集合（多局文件，竞品移植第四批 Q1，见
+    /// `app::collection`）：`(来源路径, 按文件次序的各局)`。`Some` =
+    /// 「选择要载入的一局」窗口打开；选择 / 取消即清空。
+    collection: Option<(std::path::PathBuf, Vec<crate::sgf::LoadedGame>)>,
     /// 当前生效的引擎配置（设置保存后更新）。
     engine_cfg: EngineConfig,
     /// 设置窗口状态（编辑草稿与权重缓存）。
@@ -487,6 +492,7 @@ impl GuanqiApp {
             ref_tree_ui: ref_tree::RefTreeUi::default(),
             mini_board: mini_board::MiniBoard::default(),
             tree_epoch: 0,
+            collection: None,
             engine_cfg,
             settings,
             settings_open: false,
@@ -1155,6 +1161,13 @@ impl eframe::App for GuanqiApp {
         if self.goto_open {
             let ctx = ui.ctx();
             self.goto_dialog(ctx);
+        }
+
+        // 集合选择窗（竞品移植第四批 Q1，见 app::collection）：多局文件
+        // 解析完成后打开，选择 / 取消在窗口内收口。
+        if self.collection.is_some() {
+            let ctx = ui.ctx();
+            self.collection_dialog(ctx);
         }
 
         // 参照库打分对话框（「分析 → 参照库打分…」入口，阶段 22.3）：

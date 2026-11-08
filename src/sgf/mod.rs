@@ -35,7 +35,7 @@ mod save;
 mod tree;
 
 pub use error::{Position, SgfError, SgfErrorKind};
-pub use load::{GameMeta, LoadError, LoadedGame, load_from_bytes};
+pub use load::{GameMeta, LoadError, LoadedGame, load_collection, load_from_bytes};
 pub use save::{SaveError, board_to_sgf, save_to_file};
 pub use tree::{GameInfo, GameTree, Node, Property};
 use std::borrow::Cow;
@@ -97,6 +97,17 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<GameTree, SgfError> {
     parse_str(&decode(bytes)?)
 }
 
+/// 解析 SGF 字节流为**集合**：SGF 允许一个文件含多棵顶层游戏树（多局
+/// 文件，职业棋谱合集常见；Sabaki / katsura 等编辑器都支持）。返回按
+/// 文件次序排列的全部游戏树，普通单局文件即长度 1。
+///
+/// 口径：任一棵树解析失败 = 整份失败（与单局一致，不静默丢局）；树与
+/// 树之间允许任意空白；结尾出现其它内容同样报错（与单局的尾随内容
+/// 口径一致）。
+pub fn parse_collection(bytes: &[u8]) -> Result<Vec<GameTree>, SgfError> {
+    parse_str_collection(&decode(bytes)?)
+}
+
 /// 解析已解码的 SGF 文本；顶层只允许一棵游戏树。
 pub fn parse_str(s: &str) -> Result<GameTree, SgfError> {
     let mut cur = Cursor::new(s);
@@ -116,6 +127,32 @@ pub fn parse_str(s: &str) -> Result<GameTree, SgfError> {
         ));
     }
     Ok(tree)
+}
+
+/// [`parse_str_collection`] 的多树循环体（[`parse_collection`] 的文本层）。
+fn parse_str_collection(s: &str) -> Result<Vec<GameTree>, SgfError> {
+    let mut cur = Cursor::new(s);
+    cur.skip_ws();
+    if cur.peek().is_none() {
+        return Err(SgfError::new(SgfErrorKind::EmptyInput, Some(cur.position())));
+    }
+    let mut trees = Vec::new();
+    loop {
+        cur.skip_ws();
+        match cur.peek() {
+            Some('(') => trees.push(parse_game_tree(&mut cur)?),
+            None => return Ok(trees),
+            found => {
+                return Err(SgfError::new(
+                    SgfErrorKind::UnexpectedByte {
+                        expected: "新的一局“(\"或文件结尾",
+                        found,
+                    },
+                    Some(cur.position()),
+                ));
+            }
+        }
+    }
 }
 
 /// 游戏树：`"(" 节点序列 { 子树 } ")"`，子树即变着分支。
@@ -215,4 +252,42 @@ fn parse_rect(value: &str) -> Option<((u8, u8), (u8, u8))> {
             .then(|| (p[0] - b'a', p[1] - b'a'))
     };
     Some((point([b[0], b[1]])?, point([b[3], b[4]])?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 集合解析出全部树且保序() {
+        let trees =
+            parse_collection(b"(;GM[1]FF[4]SZ[19];B[pd];W[dp])(;GM[1]FF[4]SZ[9];B[cc])")
+                .unwrap();
+        assert_eq!(trees.len(), 2);
+        assert_eq!(trees[0].root().unwrap().text("SZ"), Some("19"));
+        assert_eq!(trees[1].root().unwrap().text("SZ"), Some("9"));
+    }
+
+    #[test]
+    fn 单局文件集合解析返回长度一() {
+        let trees = parse_collection(b"(;GM[1]FF[4];B[pd])").unwrap();
+        assert_eq!(trees.len(), 1);
+    }
+
+    #[test]
+    fn 集合中坏树整份报错与尾随内容报错() {
+        // 第二棵树缺右括号：整份失败，不静默丢局。
+        assert!(parse_collection(b"(;GM[1])(;GM[1]").is_err());
+        // 树后有非「(」非空白内容：报错（与单局尾随内容口径一致）。
+        assert!(parse_collection(b"(;GM[1])garbage").is_err());
+        // 空输入。
+        assert!(parse_collection(b"  \n").is_err());
+    }
+
+    #[test]
+    fn 单树解析口径不变() {
+        // parse_str 对多树文件仍报「顶层只允许一棵游戏树」（既有口径）。
+        assert!(parse_str("(;GM[1])(;GM[1])").is_err());
+        assert!(parse_str("(;GM[1])").is_ok());
+    }
 }

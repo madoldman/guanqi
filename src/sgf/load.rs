@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::tree::{GameInfo, GameTree, Node};
-use super::{SgfError, parse_bytes};
+use super::{SgfError, parse_bytes, parse_collection};
 use crate::board::{Action, Board, SetupError, Size, Stone};
 /// 载入整体失败（此时**不应替换**用户当前棋盘）。
 #[derive(Debug)]
@@ -210,9 +210,27 @@ impl LoadedGame {
 /// 解析并载入 SGF 字节流（来源路径原样带入结果）。
 ///
 /// 手数编号按 1 起计（与界面「第 N 手」一致）；预设摆子不计入手数。
+/// **集合文件**（多局，见 [`super::parse_collection`]）走
+/// [`load_collection`]：本函数只服务单局口径。
 pub fn load_from_bytes(source: &Path, bytes: &[u8]) -> Result<LoadedGame, LoadError> {
     let tree = parse_bytes(bytes).map_err(LoadError::Parse)?;
-    let info = GameInfo::from_tree(&tree).map_err(LoadError::Parse)?;
+    build_loaded(source, &tree)
+}
+
+/// 解析并载入 SGF **集合**字节流：返回按文件次序的全部对局。
+/// 任一棵树解析 / 载入失败则整份失败（与单局口径一致，不静默丢局）。
+///
+/// 单局文件返回长度 1 的 Vec；调用方（App 载入链）据长度决定直接应用
+/// 还是弹出「选择要载入的一局」（竞品移植第四批 Q1）。
+pub fn load_collection(source: &Path, bytes: &[u8]) -> Result<Vec<LoadedGame>, LoadError> {
+    let trees = parse_collection(bytes).map_err(LoadError::Parse)?;
+    trees.iter().map(|tree| build_loaded(source, tree)).collect()
+}
+
+/// 从一棵已解析的游戏树构建载入结果（[`load_from_bytes`] /
+/// [`load_collection`] 的共同主体）。
+fn build_loaded(source: &Path, tree: &GameTree) -> Result<LoadedGame, LoadError> {
+    let info = GameInfo::from_tree(tree).map_err(LoadError::Parse)?;
     let size = info.size;
     let root = tree.root().expect("from_tree 成功则根节点必然存在");
 
@@ -254,7 +272,7 @@ pub fn load_from_bytes(source: &Path, bytes: &[u8]) -> Result<LoadedGame, LoadEr
     let mut partial = false;
     walk(
         &mut board,
-        &tree,
+        tree,
         &mut comments,
         &mut extras,
         &mut orphan_extras,
