@@ -70,7 +70,7 @@ source=(
   "guanqi-$pkgver.tar.gz"
   'vendor.tar.gz'
 )
-sha256sums=('d99090bc21402f331f9e9ffe240d19cc1ab156be32a5278f9651313ebf89adcc'
+sha256sums=('97ff11f534b3f08f224b1652e394eab408f5975a4a921a64eebed50b0e84c055'
             '0c16d77f87d2f2d5906e0a9e10e4fac1db8980536ff221ec8081b8879ba51749')
 
 prepare() {
