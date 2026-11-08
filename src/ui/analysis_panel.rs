@@ -107,6 +107,9 @@ pub enum PanelAction {
     /// 保存对话框（默认名 `<参照名>-AI标注.sgf`），选中后把打分结果合入
     /// 参照树**副本**另存为新 SGF。不携带数据：结果表与参照树由 App 持有。
     ExportAiSgf,
+    /// 点了「棋谱」卡片的「编辑注释…」（竞品移植第四批 Q2）：打开
+    /// 当前手注释编辑窗。不携带数据：草稿由 App 从当前注释派生。
+    EditComment,
     /// 点了候选点卡片的「主变落成变着」（竞品移植第三批 P5，KaTrain
     /// 「中键把 PV 加进棋谱树」的移植）：把当前首选的主变（截断到
     /// [`PV_LIMIT`]）真实落成一条变着分支。不携带数据：快照由 App 复核
@@ -949,6 +952,12 @@ fn card_game(
         if let Some(text) = comment {
             ui.add_space(2.0);
             ui.label(text);
+        }
+        // 「编辑注释…」（竞品移植第四批 Q2）：当前局面注释的手动写
+        // 入口——复盘笔记不用再手改 SGF 文件。根局面 = 编辑根注释。
+        ui.add_space(2.0);
+        if ui.button("编辑注释…").clicked() {
+            *action = PanelAction::EditComment;
         }
 
         // ---- 文档列表（原谱 + 各研究副本；点击切换）----

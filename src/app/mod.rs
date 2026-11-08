@@ -43,6 +43,7 @@ mod dialog;
 mod doc;
 mod export;
 mod collection;
+mod comment_edit;
 mod io;
 mod menu;
 mod navigate;
@@ -109,6 +110,17 @@ pub struct GuanqiApp {
     /// `app::collection`）：`(来源路径, 按文件次序的各局)`。`Some` =
     /// 「选择要载入的一局」窗口打开；选择 / 取消即清空。
     collection: Option<(std::path::PathBuf, Vec<crate::sgf::LoadedGame>)>,
+    /// 注释编辑草稿（竞品移植第四批 Q2，见 `app::comment_edit`）：
+    /// `Some(草稿文本)` = 编辑窗打开。取消即丢弃草稿，保存写回
+    /// [`crate::sgf::GameMeta::set_comment`]。
+    comment_edit: Option<String>,
+    /// 注释编辑窗的 TextEdit 待聚焦标记：打开后首个渲染帧请求键盘
+    /// 焦点（打开即可打字，标准对话框体验；无它则要先点进文本框）。
+    comment_edit_focus: bool,
+    /// 当前活动文档的元信息是否改过而未另存（竞品移植第四批 Q2）：
+    /// 注释 / 对局信息编辑走这里（棋盘记录改动仍由 record_rev 判）。
+    /// 与 saved_rev 同一套「随文档走」语义：切文档 / 另存成功即复位。
+    meta_dirty: bool,
     /// 当前生效的引擎配置（设置保存后更新）。
     engine_cfg: EngineConfig,
     /// 设置窗口状态（编辑草稿与权重缓存）。
@@ -493,6 +505,9 @@ impl GuanqiApp {
             mini_board: mini_board::MiniBoard::default(),
             tree_epoch: 0,
             collection: None,
+            comment_edit: None,
+            comment_edit_focus: false,
+            meta_dirty: false,
             engine_cfg,
             settings,
             settings_open: false,
@@ -553,6 +568,8 @@ impl GuanqiApp {
     /// 对象上，随文档互换（创建 / 切换副本）整体移动，各自独立判脏。
     fn mark_saved(&mut self) {
         self.saved_rev = self.board.record_rev();
+        // 元信息改动（注释 / 对局信息编辑）一并视为已保存基准。
+        self.meta_dirty = false;
     }
 
     /// 当前活动文档是否有未保存的改动：棋谱记录在「上次保存 / 载入」
@@ -560,7 +577,7 @@ impl GuanqiApp {
     /// 回看不改记录，不算脏。对照基准存在 `saved_rev` 里，与棋盘的
     /// `record_rev` 比对即可，无需拼接内容指纹。
     fn is_dirty(&self) -> bool {
-        self.board.record_rev() != self.saved_rev
+        self.board.record_rev() != self.saved_rev || self.meta_dirty
     }
 
     /// 关窗流程（每帧 `ui` 顶部调用）：收到 close 请求且内容脏时取消
@@ -923,6 +940,8 @@ impl eframe::App for GuanqiApp {
             // 主变落成变着（竞品移植第三批 P5）：把当前首选主变真实
             // 落成变着分支（守卫与提示见 doc::commit_best_pv）。
             analysis_panel::PanelAction::CommitBestPv => self.commit_best_pv(),
+            // 注释编辑窗（竞品移植第四批 Q2）：草稿从当前注释派生。
+            analysis_panel::PanelAction::EditComment => self.open_comment_editor(),
             analysis_panel::PanelAction::None => {}
         }
 
@@ -1168,6 +1187,12 @@ impl eframe::App for GuanqiApp {
         if self.collection.is_some() {
             let ctx = ui.ctx();
             self.collection_dialog(ctx);
+        }
+
+        // 注释编辑窗（竞品移植第四批 Q2，见 app::comment_edit）。
+        if self.comment_edit.is_some() {
+            let ctx = ui.ctx();
+            self.comment_dialog(ctx);
         }
 
         // 参照库打分对话框（「分析 → 参照库打分…」入口，阶段 22.3）：

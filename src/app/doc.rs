@@ -163,6 +163,10 @@ pub(super) fn switch_doc(&mut self, number: usize) {
     self.active_number = incoming.number;
     // 基准对齐到新活动文档的当前修订号：每份文档各自判脏。
     self.saved_rev = self.board.record_rev();
+    // 元信息脏态同样随文档走（Q2）：切走的文档带着自己的 meta_dirty
+    // 语义进入 others，新活动文档从干净基准开始（与 saved_rev 同一
+    // 对齐口径——既有语义的既有边界，见任务清单观察记录）。
+    self.meta_dirty = false;
     self.tree_epoch = self.tree_epoch.wrapping_add(1);
     self.clear_board_derived();
 }

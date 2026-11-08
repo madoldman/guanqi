@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 
 use super::tree::{GameInfo, GameTree, Node};
 use super::{SgfError, parse_bytes, parse_collection};
-use crate::board::{Action, Board, SetupError, Size, Stone};
+use crate::board::{Action, Board, MoveRecord, SetupError, Size, Stone};
 /// 载入整体失败（此时**不应替换**用户当前棋盘）。
 #[derive(Debug)]
 pub enum LoadError {
@@ -123,9 +123,49 @@ impl GameMeta {
     /// 键为「根到游标节点的着法序列」的签名：主变与变着各自的手数可能
     /// 相同而局面不同，且 `Board::undo` 会重排节点 id，二者都不可作键。
     pub fn comment_at(&self, board: &Board) -> Option<&str> {
+        if board.cursor() == 0 {
+            // 根注释唯一来源 = info.root_comment（与保存端一致）。
+            return self
+                .info
+                .root_comment
+                .as_deref()
+                .filter(|text| !text.is_empty());
+        }
         self.comments
             .get(&position_sig(board.records()))
             .map(String::as_str)
+    }
+
+    /// 写 / 清**当前局面**（`board` 游标处）的注释（竞品移植第四批 Q2，
+    /// 「编辑注释…」窗口的写入口）。
+    ///
+    /// - 游标 0（根）走 [`GameInfo::root_comment`]：根 `C[]` 在保存端
+    ///   **只**从该字段写出（见 `save::build_root`），注释表里签名 = 空
+    ///   序列的条目不参与保存——在这里分流是唯一正确的写法；
+    /// - 其余游标走注释表（键与 [`Self::comment_at`] 同一套签名）；
+    /// - 空串 = 删除该条目（保存端 `filter(!is_empty)` 不会写出 `C[]`）。
+    ///
+    /// `root_comment` 的「只读语义」指**程序**不得把自动生成内容写进
+    /// 该字段抹掉用户文字（`finish_game` 曾犯过）；用户在界面里主动
+    /// 编辑自己的注释正是本字段的用途，不属该禁令。
+    pub fn set_comment(&mut self, board: &Board, text: &str) {
+        self.set_comment_parts(board.cursor(), board.records(), text);
+    }
+
+    /// [`Self::set_comment`] 的无棋盘形态（App 的注释编辑窗在持有
+    /// `&mut GameMeta` 的同时拿不出 `&Board`——先克隆着法序列再调本
+    /// 方法即可，见 `app::comment_edit`）。
+    pub fn set_comment_parts(&mut self, cursor: usize, records: &[MoveRecord], text: &str) {
+        if cursor == 0 {
+            self.info.root_comment = (!text.is_empty()).then(|| text.to_owned());
+            return;
+        }
+        let sig = position_sig(records);
+        if text.is_empty() {
+            self.comments.remove(&sig);
+        } else {
+            self.comments.insert(sig, text.to_owned());
+        }
     }
 
     /// 按局面签名取注释（「另存为」还原逐手注释用）。
@@ -251,10 +291,11 @@ fn build_loaded(source: &Path, tree: &GameTree) -> Result<LoadedGame, LoadError>
 
     // 根注释的路径为空序列；根节点的摆子属性已在预设局面处理，
     // walk 从本层第二个节点起（skip_first）。
+    // 根注释**只存 info.root_comment**（保存端 build_root 的唯一来源，
+    // 显示端 comment_at 游标 0 也从它读）：不进注释表——Q2 之前这里
+    // 曾同步插一份进表，注释表条目成了没人读的死数据，还让
+    // 「编辑根注释后显示仍是旧值」（表未更新）成为陷阱。
     let mut comments = HashMap::new();
-    if let Some(text) = &info.root_comment {
-        comments.insert(position_sig(&[]), text.clone());
-    }
     // 未识别属性保全：根节点先收（签名 = 空路径），其余随 walk 逐节点收。
     // 挂不上任何节点的条数（被丢弃节点上的属性）单独累计，随结果带出。
     let mut extras = HashMap::new();

@@ -126,6 +126,8 @@ pub struct StateSnapshot {
     pub guess: bool,
     /// 待选择的集合局数（竞品移植第四批 Q1；`None` = 无待选集合）。
     pub collection: Option<usize>,
+    /// 当前局面注释（竞品移植第四批 Q2 的取证口径；`None` = 无注释）。
+    pub comment: Option<String>,
     /// 解题模式「已查看答案」留痕。
     pub answer_shown: bool,
     /// 最近一条「参照对照：」判定文本（解题模式落子判定的取证口径；
@@ -786,6 +788,11 @@ impl GuanqiApp {
             solving: self.solving_mode,
             guess: self.guess_mode,
             collection: self.collection.as_ref().map(|(_, games)| games.len()),
+            comment: self
+                .loaded
+                .as_ref()
+                .and_then(|meta| meta.comment_at(&self.board))
+                .map(str::to_owned),
             answer_shown: self.answer_shown,
             judge_notice: self.last_judge_notice(),
             ref_scan: {
@@ -1111,6 +1118,7 @@ impl StateSnapshot {
             "solving": self.solving,
             "guess": self.guess,
             "collection": self.collection,
+            "comment": self.comment,
             "answer_shown": self.answer_shown,
             "judge_notice": self.judge_notice,
             "board_rect": self.board_rect,

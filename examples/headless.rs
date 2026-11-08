@@ -520,6 +520,15 @@ impl Driver {
                         .ok_or_else(|| format!("key 名称无法识别：{rest}{}", label()))?;
                     self.press_keys(&[], key);
                 }
+                // 向聚焦的文本框注入一段文本（egui::Event::Text，与
+                // winit 收到输入法 / 键盘的字符输入同通路）：注释编辑窗
+                // 等带 TextEdit 的场景验证用（竞品移植第四批 Q2）。
+                "text" => {
+                    let text = unquote(rest);
+                    self.tick_with(|input| {
+                        input.events.push(egui::Event::Text(text.clone()));
+                    });
+                }
                 "keys" => {
                     let combo = parse_combo(rest)
                         .ok_or_else(|| format!("keys 组合无法识别：{rest}{}", label()))?;
