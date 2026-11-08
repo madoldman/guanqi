@@ -144,6 +144,9 @@ pub struct GuanqiApp {
     /// 另存时是否写逐手注释块（「分析」菜单开关，随 ui_prefs 持久化；
     /// 默认开）。只影响「另存为」的写回内容，不改任何分析数据流。
     annotate_moves: bool,
+    /// 逐手注释是否含全部已分析手（竞品移植补充，阶段 21 扩展位的
+    /// UI 接线；默认关=只注疑问手及以上）。随 ui_prefs 持久化。
+    annotate_all_hands: bool,
     /// 「跳到手数…」对话框是否打开（复盘导航 P1，见 `app::navigate`）。
     goto_open: bool,
     /// 跳转目标手数（对话框内编辑；0 = 开局盘面，N = 第 N 手之后的盘面）。
@@ -537,6 +540,7 @@ impl GuanqiApp {
             goto_target: 0,
             autoplay_remaining: None,
             annotate_moves: prefs.annotate_moves,
+            annotate_all_hands: prefs.annotate_all_hands,
             play_feedback_shown: 0,
             startup_notice,
             persist_notice: None,
@@ -703,6 +707,7 @@ impl GuanqiApp {
             batch_deepen_visits: self.analysis.batch_config().deepen_visits,
             refscan_visits: self.analysis.ref_scan_config().visits,
             annotate_moves: self.annotate_moves,
+            annotate_all_hands: self.annotate_all_hands,
             // 自动播放间隔只经菜单改动（改时手动 mark_prefs_dirty），
             // 这里原样携带——每帧重建快照不能把它抹成默认值。
             autoplay_secs: self.engine_cfg.ui_prefs.autoplay_secs,

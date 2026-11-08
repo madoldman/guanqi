@@ -132,6 +132,8 @@ pub struct StateSnapshot {
     pub info_pb: Option<String>,
     /// 摆子模式当前笔（竞品移植第四批 Q5 的取证口径；`None` = 非摆子）。
     pub setup: Option<String>,
+    /// 逐手注释「全部已分析手」开关（阶段 21 扩展位接线的取证口径）。
+    pub annotate_all_hands: bool,
     /// 解题模式「已查看答案」留痕。
     pub answer_shown: bool,
     /// 最近一条「参照对照：」判定文本（解题模式落子判定的取证口径；
@@ -802,6 +804,7 @@ impl GuanqiApp {
                 .as_ref()
                 .and_then(|meta| meta.info.player_black.clone()),
             setup: self.setup_mode.map(|pen| pen.name().to_owned()),
+            annotate_all_hands: self.annotate_all_hands,
             answer_shown: self.answer_shown,
             judge_notice: self.last_judge_notice(),
             ref_scan: {
@@ -930,6 +933,7 @@ impl StateSnapshot {
             "comment": self.comment,
             "info_pb": self.info_pb,
             "setup": self.setup,
+            "annotate_all_hands": self.annotate_all_hands,
         });
         let probe = serde_json::json!({
             "engine_warnings": self.engine_warnings,

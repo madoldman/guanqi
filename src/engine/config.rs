@@ -117,6 +117,10 @@ pub struct UiPrefs {
     /// 各手节点的 `C[]`（【观棋 N】界标块，幂等）。默认开——产物本身
     /// 就是复盘笔记；关闭时另存与旧版完全一致（不写逐手块）。
     pub annotate_moves: bool,
+    /// 逐手注释扩展位（阶段 21 留好的 `all_hands` 口径的 UI 接线）：
+    /// `true` = 全部已分析手都注（不只疑问手及以上）。默认关：
+    /// 全量注释对长谱很吵，定位是「教师模式」的显式选择。
+    pub annotate_all_hands: bool,
     /// ---- 窗口几何 ----
     /// 上次退出的窗口尺寸与位置（`None` = 从未记录，用程序默认）。
     pub window_geometry: Option<WindowGeometry>,
@@ -160,6 +164,7 @@ impl Default for UiPrefs {
             batch_deepen_visits: 300,
             refscan_visits: 40,
             annotate_moves: true,
+            annotate_all_hands: false,
             window_geometry: None,
             last_open_dir: None,
             last_save_dir: None,

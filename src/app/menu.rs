@@ -552,6 +552,19 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
         {
             self.mark_prefs_dirty();
         }
+        // 逐手注释扩展位（阶段 21 留好的 all_hands 口径）：全部已分析手
+        // 都注。只在主开关打开时出现（关了主开关它无意义）。
+        if self.annotate_moves
+            && ui
+                .checkbox(&mut self.annotate_all_hands, "含全部已分析手")
+                .on_hover_text(
+                    "打开后不只疑问手及以上——凡算得出损失的已分析手都注。\
+                     长谱会明显变长，适合教学 / 精读场景。",
+                )
+                .changed()
+        {
+            self.mark_prefs_dirty();
+        }
         ui.separator();
         // ---- 限定选点：区域开关 / 清除区域 / 清除排除列表 ----
         // 「清除排除列表」在原侧栏卡片里有独立按钮，搬家后必须仍

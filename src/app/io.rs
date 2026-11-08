@@ -224,7 +224,7 @@ pub(super) fn copy_sgf_to_clipboard(&mut self, ctx: &egui::Context) {
         None
     };
     let move_notes = if self.loaded.is_some() && self.annotate_moves {
-        let notes = self.analysis.move_annotations(&self.board, false);
+        let notes = self.analysis.move_annotations(&self.board, self.annotate_all_hands);
         (!notes.is_empty()).then_some(notes)
     } else {
         None
@@ -268,7 +268,7 @@ pub(super) fn save_game(&mut self, path: PathBuf) {
     // 签名合成注释块表交给保存管线。空表 = 没有任何可注的手（没分析
     // 过 / 数据不齐），交给保存端等同 `None`，不写任何东西。
     let move_notes = if self.loaded.is_some() && self.annotate_moves {
-        let notes = self.analysis.move_annotations(&self.board, false);
+        let notes = self.analysis.move_annotations(&self.board, self.annotate_all_hands);
         (!notes.is_empty()).then_some(notes)
     } else {
         None
