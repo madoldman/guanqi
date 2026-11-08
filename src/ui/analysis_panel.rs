@@ -1113,7 +1113,7 @@ fn card_reference(
         theme::section_title(ui, "参照");
         let file_label = ui.label(RichText::new(&reference.name).strong());
         file_label.on_hover_text(format!(
-            "参照棋盘 {} 路；索引 {} 个局面 / 全树 {} 手",
+            "参照棋盘 {} 路；索引 {} 个局面 / 全树 {} 手。\n             匹配按局面进行，且覆盖全部对称朝向（镜像 / 转置 / 旋转）——             实战不必与库同角同向；命中后续法坐标已换算到实战方向。",
             reference.size, reference.entries, reference.nodes
         ));
         ui.weak(format!(
