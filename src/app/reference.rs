@@ -39,7 +39,7 @@ impl GuanqiApp {
         let place_blocked = (self.board.cursor() != self.board.line_len())
             .then(|| "当前在回看历史（非棋谱末端）。".to_owned());
         let hit = match reference.lookup(&self.board) {
-            crate::refbook::LookupOutcome::Hit { entry, tail, deviation } => {
+            crate::refbook::LookupOutcome::Hit { entry, tail, deviation, sym } => {
                 Some(analysis_panel::ReferenceHit {
                     move_no: entry.move_no,
                     path: entry
@@ -50,10 +50,27 @@ impl GuanqiApp {
                         .join("-"),
                     tail: entry.tail_text(self.board.size()),
                     comment: entry.comment.clone(),
+                    // 续法坐标经对称映射搬到实战方向（R1）：照库落子
+                    // 与展示都直接给「实战盘面上该下的点」，镜像 / 转置
+                    // 命中不再需要用户脑内翻转。
                     continuations: entry
                         .continuations
                         .iter()
-                        .map(crate::refbook::Continuation::text)
+                        .map(|cont| match cont.at.as_deref() {
+                            Some(at_lib) => {
+                                let live = crate::board::Coord::from_gtp(self.board.size(), at_lib)
+                                    .ok()
+                                    .map(|at| sym.coord(at))
+                                    .map(|at| at.to_gtp(self.board.size()));
+                                match live {
+                                    Some(at_live) => {
+                                        format!("{} {at_live}", cont.player.name())
+                                    }
+                                    None => cont.text(),
+                                }
+                            }
+                            None => cont.text(),
+                        })
                         .collect(),
                     // 结构化落子信息：把 GTP 串按棋盘尺寸换回 Coord（弃着
                     // 或串非法 = None，UI 置灰）。解析口径只在派生侧一处。
@@ -64,6 +81,7 @@ impl GuanqiApp {
                             cont.at
                                 .as_deref()
                                 .and_then(|at| crate::board::Coord::from_gtp(self.board.size(), at).ok())
+                                .map(|at| sym.coord(at))
                                 .map(|at| (cont.player, at))
                         })
                         .collect(),

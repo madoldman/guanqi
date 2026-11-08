@@ -73,6 +73,13 @@ pub enum LookupOutcome<'a> {
         /// 偏离提示：`Some` = 实战刚走的那一手不在父局面的库内续法中
         /// 但当前局面仍命中（转置等达成的同形）；`None` = 在库内行棋。
         deviation: Option<String>,
+        /// 对称命中的「库坐标 → 实战坐标」映射（竞品移植第四批 R1）：
+        /// `Some` = 实战局面是库内同形的某种对称副本（转置 / 镜像 /
+        /// 旋转），库内续法坐标必须经它换到实战方向才是「该下的点」
+        /// （照库落子 / 续法展示 / 偏离对比都走它）；`None` = 同向命中
+        /// （含平移），坐标直用。字段恒 `Some`（同向命中也是恒等映射）
+        /// 以免调用方双分支——展示与落子一律 `sym.coord(at)`。
+        sym: SymMap,
     },
     /// 当前局面不在库中，但父局面命中且实战最后一手偏离了库内续法。
     Deviation(Deviation),
@@ -157,29 +164,219 @@ fn key_of_cluster(
     to_play: Stone,
 ) -> (PositionKey, Rect) {
     let rect = cluster_rect(size, cluster);
-    let mut key = Vec::with_capacity(3 + cluster.len() * 3);
-    key.push(rect.w());
-    key.push(rect.h());
-    key.push(u8::from(matches!(to_play, Stone::Black)));
-    let mut stones: Vec<(u8, u8, Stone)> = cluster
+    let local: Vec<(u8, u8, Stone)> = cluster
         .iter()
         .filter(|&&(x, y, _)| rect.contains(x, y))
         .map(|&(x, y, s)| (x - rect.min_x, y - rect.min_y, s))
         .collect();
-    stones.sort_by_key(|&(x, y, _)| (x, y));
-    for (x, y, s) in stones {
-        key.push(x);
-        key.push(y);
-        key.push(u8::from(matches!(s, Stone::Black)));
+    // 键 = 八种二面体变换下逐字节最小的那个（规范化，见对称一节）；
+    // rect 仍返回**原方向**的盘上区域（展示 / 落点守卫都用实战侧坐标）。
+    // 坐标映射不用「获胜变换」——对称形状常有多个变换取得同一规范键，
+    // 两侧各选其一的组合会把空白点（续法）带到不同位置；映射改为
+    // [`SymMap::build`] 直接求解「库棋子 → 实战棋子」的保色变换对。
+    let (key, _) = canonical_variant(&local, rect.w(), rect.h(), to_play);
+    (key, rect)
+}
+
+// ---- 对称归一化（竞品移植第四批 R1，22.1 既定扩展点）----
+//
+// 动机：定式库通常只记录某一个角的某种朝向；实战里同形出现在任意角、
+// 任意朝向。平移不变（区域键以包围盒左上为原点）已覆盖「任意角」，
+// 本节覆盖「任意朝向」——键取八种二面体变换下逐字节最小者。键两侧
+// 同构（索引侧与查询侧共用 `key_of_cluster`），单点改键即两侧生效。
+// 「转置感知」是八分之一：正方形区域上转置 / 镜像 / 旋转全并进同一键。
+
+/// 变换总数（二面体群 D4）。
+const VARIANTS: usize = 8;
+
+/// 变换 `v` 把区域局部坐标 `(x, y)`（`0..w × 0..h`）映到新区域局部
+/// 坐标，返回 `(新 x, 新 y, 新 w, 新 h)`（`w ≠ h` 时 90° 系变换交换
+/// 宽高）。定义与 [`variant_inverse`] 一一对应。
+fn variant_map(v: usize, x: u8, y: u8, w: u8, h: u8) -> (u8, u8, u8, u8) {
+    match v {
+        0 => (x, y, w, h),                     // 恒等
+        1 => (w - 1 - x, y, w, h),             // 水平镜像
+        2 => (x, h - 1 - y, w, h),             // 垂直镜像
+        3 => (w - 1 - x, h - 1 - y, w, h),     // 旋转 180°
+        4 => (y, x, h, w),                     // 转置
+        5 => (h - 1 - y, w - 1 - x, h, w),     // 反对角转置
+        6 => (h - 1 - y, x, h, w),             // 旋转 90°
+        _ => (y, w - 1 - x, h, w),             // 旋转 270°
     }
-    (PositionKey(key), rect)
+}
+
+/// 变换的逆下标（0–5 对合，6 / 7 互逆；非正方形盒的宽高互换由
+/// [`variant_map`] 的显式 dims 参数处理，见其文档后的推演）。
+fn variant_inverse(v: usize) -> usize {
+    match v {
+        6 => 7,
+        7 => 6,
+        other => other,
+    }
+}
+
+/// 一次命中（同向或对称）的「库坐标 → 实战坐标」映射。
+///
+/// 照库落子 / 续法展示 / 偏离对比**必须**经它：库内续法坐标在库朝向
+/// 上，实战局面可能是库内同形的任意对称副本——同向命中是恒等映射，
+/// 对称命中则把库局部坐标经「库的规范变换 → 实战的规范逆变换」搬到
+/// 实战方向。构造在命中时完成（两侧的规范变换各求一次，区域 ≤ 数点，
+/// 开销可忽略），映射本身 O(1)。
+#[derive(Clone, Debug)]
+pub struct SymMap {
+    lib_region: Rect,
+    live_region: Rect,
+    v_lib: usize,
+    v_live: usize,
+    lib_w: u8,
+    lib_h: u8,
+    size: crate::board::Size,
+}
+
+impl SymMap {
+    /// 由命中两侧构建：库侧（条目留存的区域与棋子）与实战侧（命中的
+    /// 簇）。求解 = 找一对变换 `(i, j)` 使「库棋子经 i」与「实战棋子经
+    /// j」为同一带色点集（键相等的直接推论，必然存在）；取第一对。
+    ///
+    /// **为什么不用两侧各自的「规范获胜变换」**：对称形状常有多个变换
+    /// 取得同一规范键（该形状的自同构），库侧与实战侧各自的首胜组合
+    /// 会把**空白点**（续法所在）带到不同位置——首胜组合只保证棋子对
+    /// 齐。而任何「保全部棋子（带色）」的变换对在语义上都等价：其差
+    /// 异自由度只作用于空白边缘，且差异两侧相对棋盘形状互为该形状的
+    /// 对称副本（续法落点等价）。首对即确定、确定性可复现。
+    pub(super) fn build(
+        entry: &RefEntry,
+        live: &ClusterKey,
+        size: crate::board::Size,
+    ) -> Self {
+        let lib_w = entry.region.w();
+        let lib_h = entry.region.h();
+        let lib_local: Vec<(u8, u8, Stone)> = entry
+            .stones
+            .iter()
+            .map(|&(x, y, s)| (x - entry.region.min_x, y - entry.region.min_y, s))
+            .collect();
+        let live_w = live.rect.w();
+        let live_h = live.rect.h();
+        let live_local: Vec<(u8, u8, Stone)> = live
+            .inside
+            .iter()
+            .map(|&(x, y, s)| (x - live.rect.min_x, y - live.rect.min_y, s))
+            .collect();
+        let variant_stones = |v: usize,
+                              stones: &[(u8, u8, Stone)],
+                              w: u8,
+                              h: u8|
+         -> (u8, u8, Vec<(u8, u8, Stone)>) {
+            let (nw, nh) = if v >= 4 { (h, w) } else { (w, h) };
+            let mut transformed: Vec<(u8, u8, Stone)> = stones
+                .iter()
+                .map(|&(x, y, s)| {
+                    let (nx, ny, _, _) = variant_map(v, x, y, w, h);
+                    (nx, ny, s)
+                })
+                .collect();
+            transformed.sort_by_key(|&(x, y, _)| (x, y));
+            (nw, nh, transformed)
+        };
+        // 首个「库变换 i 的带色点集 == 实战变换 j 的带色点集」对（含
+        // 变换后宽高——键相等的必要部分）。键命中保证存在。
+        let mut found: Option<(usize, usize)> = None;
+        for i in 0..VARIANTS {
+            let (lw, lh, lib_set) = variant_stones(i, &lib_local, lib_w, lib_h);
+            for j in 0..VARIANTS {
+                let (lw2, lh2, live_set) =
+                    variant_stones(j, &live_local, live_w, live_h);
+                if lw == lw2 && lh == lh2 && lib_set == live_set {
+                    found = Some((i, j));
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let (v_lib, v_live) =
+            found.expect("键命中则必存在保色变换对（规范键相等的直接推论）");
+        eprintln!(
+            "[sym] entry.region={:?} stones={:?} live.rect={:?} inside={:?} pair=({v_lib},{v_live})",
+            entry.region, entry.stones, live.rect, live.inside
+        );
+        Self {
+            lib_region: entry.region,
+            live_region: live.rect,
+            v_lib,
+            v_live,
+            lib_w,
+            lib_h,
+            size,
+        }
+    }
+
+    /// 库内坐标 → 实战坐标。区域外的点（续法理论上都在区域内，防御）
+    /// 原样返回。
+    pub fn coord(&self, at: Coord) -> Coord {
+        if !self.lib_region.contains(at.x(), at.y()) {
+            return at;
+        }
+        let (x, y) = (at.x() - self.lib_region.min_x, at.y() - self.lib_region.min_y);
+        // 库局部 → 规范区域（c*）→ 实战局部（实战规范逆变换的源区域
+        // 是规范区域，dims 由 variant_map 显式传入）→ 实战盘上坐标。
+        let (cx, cy, cw, ch) = variant_map(self.v_lib, x, y, self.lib_w, self.lib_h);
+        let (lx, ly, _, _) =
+            variant_map(variant_inverse(self.v_live), cx, cy, cw, ch);
+        Coord::new(
+            self.size,
+            self.live_region.min_x + lx,
+            self.live_region.min_y + ly,
+        )
+        .unwrap_or(at)
+    }
+}
+
+/// 规范键 = 八个变换键中**逐字节最小**者；返回键与获胜变换下标
+/// （坐标映射用它，见 [`SymMap`]）。
+fn canonical_variant(
+    stones: &[(u8, u8, Stone)],
+    w: u8,
+    h: u8,
+    to_play: Stone,
+) -> (PositionKey, usize) {
+    let mut best: Option<(PositionKey, usize)> = None;
+    for v in 0..VARIANTS {
+        let (nw, nh) = if v >= 4 { (h, w) } else { (w, h) };
+        let mut transformed: Vec<(u8, u8, Stone)> = stones
+            .iter()
+            .map(|&(x, y, s)| {
+                let (nx, ny, _, _) = variant_map(v, x, y, w, h);
+                (nx, ny, s)
+            })
+            .collect();
+        transformed.sort_by_key(|&(x, y, _)| (x, y));
+        let mut key = Vec::with_capacity(3 + transformed.len() * 3);
+        key.push(nw);
+        key.push(nh);
+        key.push(u8::from(matches!(to_play, Stone::Black)));
+        for (x, y, s) in transformed {
+            key.push(x);
+            key.push(y);
+            key.push(u8::from(matches!(s, Stone::Black)));
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(current, _)| key < current.0)
+        {
+            best = Some((PositionKey(key), v));
+        }
+    }
+    best.expect("VARIANTS ≥ 1，循环至少产生一个候选")
 }
 
 /// 一个簇的完整信息（键 + 比较区域 + 区域内棋子）。
 pub(crate) struct ClusterKey {
-    /// 局面键。
+    /// 局面键（规范化，见对称一节）。
     pub key: PositionKey,
-    /// 比较区域（盘上绝对坐标）。
+    /// 比较区域（盘上绝对坐标，**实战侧原方向**）。
     pub rect: Rect,
     /// 区域内的棋子（盘上绝对坐标）。
     pub inside: Vec<(u8, u8, Stone)>,
@@ -246,7 +443,8 @@ impl super::Reference {
                 current: board.size(),
             };
         }
-        if let Some((entry, _region)) = self.lookup_grid(board.grid(), board.to_play()) {
+        if let Some((entry, cluster)) = self.lookup_grid(board.grid(), board.to_play()) {
+            let sym = SymMap::build(entry, &cluster, board.size());
             // 当前局面命中：若实战最后一手已偏离父局面续法（经由转置等
             // 回到库内同形的路径），同样给出提示（一般不会发生，转置是
             // 唯一回库路径）。
@@ -263,6 +461,7 @@ impl super::Reference {
                 entry,
                 tail: tail_of(board),
                 deviation,
+                sym,
             };
         }
         // 当前局面不在库中：检查是否刚走偏（父局面命中 + 最后一手偏离）。
@@ -281,10 +480,12 @@ impl super::Reference {
         &self,
         grid: &[Option<Stone>],
         to_play: Stone,
-    ) -> Option<(&RefEntry, Rect)> {
+    ) -> Option<(&RefEntry, ClusterKey)> {
         all_cluster_keys(self.size, grid, to_play)
-            .iter()
-            .find_map(|cluster| self.index.get(&cluster.key).map(|entry| (entry, cluster.rect)))
+            .into_iter()
+            .find_map(|cluster| {
+                self.index.get(&cluster.key).map(|entry| (entry, cluster))
+            })
     }
 
     /// 偏离判定（口径见模块级 [`LookupOutcome`] 文档）：父局面命中参照、
@@ -305,28 +506,45 @@ impl super::Reference {
             Action::Pass => return None,
         };
         // 父局面（重放到最后一手之前）的命中簇。
-        let (parent, region) = self.lookup_grid(
+        let (parent, cluster) = self.lookup_grid(
             &self.parent_grid(board, records)?,
             last.player,
         )?;
         // 落点在父局面命中簇的区域外：这一手与本局部无关，不作库内对比。
-        if !region.contains(at.x(), at.y()) {
+        // region 是实战侧原方向区域，对称命中同样适用（守卫在实战方向）。
+        if !cluster.rect.contains(at.x(), at.y()) {
             return None;
         }
+        // 库内续法坐标经对称映射搬到实战方向再与实战落点比对（R1）：
+        // 镜像 / 转置命中时库里的 D4 在实战盘上是另一个点。
+        let sym = SymMap::build(parent, &cluster, board.size());
         let at_text = at.to_gtp(board.size());
+        let mapped_book = parent.continuations.iter().map(|c| match c.at.as_deref() {
+            Some(at_lib) => {
+                let live = crate::board::Coord::from_gtp(board.size(), at_lib)
+                    .ok()
+                    .map(|at_lib| sym.coord(at_lib))
+                    .map(|at_live| at_live.to_gtp(board.size()));
+                match live {
+                    Some(at_live) => format!("{} {at_live}", c.player.name()),
+                    None => c.text(),
+                }
+            }
+            None => c.text(),
+        });
         let in_book = parent.continuations.iter().any(|c| {
-            c.player == last.player && c.at.as_deref() == Some(at_text.as_str())
+            c.player == last.player
+                && c.at
+                    .as_deref()
+                    .and_then(|at_lib| crate::board::Coord::from_gtp(board.size(), at_lib).ok())
+                    .is_some_and(|at_lib| sym.coord(at_lib) == at)
         });
         if in_book {
             return None;
         }
         Some(Deviation {
             played: format!("{} {at_text}", last.player.name()),
-            book: parent
-                .continuations
-                .iter()
-                .map(Continuation::text)
-                .collect(),
+            book: mapped_book.collect(),
         })
     }
 
@@ -356,5 +574,265 @@ impl super::Reference {
             }
         }
         Some(grid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::board::Size;
+
+    #[test]
+    fn 八种变换全部可逆且宽高互换正确() {
+        for v in 0..VARIANTS {
+            for &(w, h) in &[ (3u8, 2u8), (5, 5), (1, 4) ] {
+                for x in 0..w {
+                    for y in 0..h {
+                        let (tx, ty, tw, th) = variant_map(v, x, y, w, h);
+                        assert!(tx < tw && ty < th, "变换后坐标须在新区域内");
+                        let (bx, by, bw, bh) =
+                            variant_map(variant_inverse(v), tx, ty, tw, th);
+                        assert_eq!((bx, by, bw, bh), (x, y, w, h), "v={v}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn 同形的不同朝向规范化为同一键() {
+        // 基形：3×2 盒内 (0,0) 黑、(2,1) 白。八个朝向分别构造，
+        // 规范键必须逐字节相同（且与基形本身相同）。
+        let base: Vec<(u8, u8, Stone)> =
+            vec![(0, 0, Stone::Black), (2, 1, Stone::White)];
+        let (expected, _) = canonical_variant(&base, 3, 2, Stone::Black);
+        for v in 0..VARIANTS {
+            let (nw, nh) = if v >= 4 { (2, 3) } else { (3, 2) };
+            let transformed: Vec<(u8, u8, Stone)> = base
+                .iter()
+                .map(|&(x, y, s)| {
+                    let (nx, ny, _, _) = variant_map(v, x, y, 3, 2);
+                    (nx, ny, s)
+                })
+                .collect();
+            let (key, _) = canonical_variant(&transformed, nw, nh, Stone::Black);
+            assert_eq!(key.0, expected.0, "v={v}");
+        }
+        // 不同形状不得撞键。
+        let other: Vec<(u8, u8, Stone)> =
+            vec![(0, 0, Stone::Black), (1, 1, Stone::White)];
+        let (other_key, _) = canonical_variant(&other, 3, 2, Stone::Black);
+        assert_ne!(other_key.0, expected.0);
+    }
+
+    fn entry_for_test() -> RefEntry {
+        RefEntry {
+            path: vec![0, 1],
+            move_no: 2,
+            comment: None,
+            continuations: Vec::new(),
+            tail: Vec::new(),
+            region: Rect { min_x: 2, min_y: 2, max_x: 4, max_y: 3 },
+            // 3×2 盒内同款基形（盘上绝对坐标，库朝向）。
+            stones: vec![(2, 2, Stone::Black), (4, 3, Stone::White)],
+        }
+    }
+
+    #[test]
+    fn 对称命中映射把库坐标搬到实战方向() {
+        // 实战侧 = 库形状的转置（3×2 → 2×3 盒，放在别处）。
+        let live_stones: Vec<(u8, u8, Stone)> = vec![(10, 10, Stone::Black), (11, 12, Stone::White)];
+        let live = ClusterKey {
+            key: canonical_variant(
+                &[(0, 0, Stone::Black), (1, 2, Stone::White)],
+                2,
+                3,
+                Stone::Black,
+            )
+            .0,
+            rect: Rect { min_x: 10, min_y: 10, max_x: 11, max_y: 12 },
+            inside: live_stones
+                .iter()
+                .map(|&(x, y, s)| (x, y, s))
+                .collect(),
+        };
+        let entry = entry_for_test();
+        // 先确认两侧键确实同字节（转置是规范赢家之一）。
+        let (lib_key, _) = canonical_variant(
+            &[(0, 0, Stone::Black), (2, 1, Stone::White)],
+            3,
+            2,
+            Stone::Black,
+        );
+        assert_eq!(live.key.0, lib_key.0, "测试数据须构成转置命中");
+        let sym = SymMap::build(&entry, &live, Size::new(19).unwrap());
+        // 库内空点 (3,3)（区域中点）→ 经两侧变换映射到实战方向。
+        let mapped = sym
+            .coord(crate::board::Coord::new(Size::new(19).unwrap(), 3, 3).unwrap());
+        // 转置侧：库局部 (1,1) → 规范 → 实战逆变换；手工推演基形转置：
+        // 库 (1,1) 处于 3×2 盒，规范赢家计算后与实战 2×3 盒互逆，结果
+        // 必落在实战区域内。
+        assert!(
+            mapped.x() >= 10
+                && mapped.x() <= 11
+                && mapped.y() >= 10
+                && mapped.y() <= 12,
+            "映射结果必须落在实战区域：{mapped:?}"
+        );
+        // 库区域外的点原样返回（防御口径）。
+        let outside = sym
+            .coord(crate::board::Coord::new(Size::new(19).unwrap(), 0, 0).unwrap());
+        assert_eq!(outside.x(), 0);
+        // 棋子对应严格：库内两颗子必须逐一映射到实战两颗子上。
+        let b = sym
+            .coord(crate::board::Coord::new(Size::new(19).unwrap(), 2, 2).unwrap());
+        assert_eq!((b.x(), b.y()), (10, 10), "库黑子 → 实战黑子");
+        let w = sym
+            .coord(crate::board::Coord::new(Size::new(19).unwrap(), 4, 3).unwrap());
+        assert_eq!((w.x(), w.y()), (11, 12), "库白子 → 实战白子");
+        // 空点：库局部 (1,1) 经转置对应 → 实战局部 (1,1)。
+        let mid = sym
+            .coord(crate::board::Coord::new(Size::new(19).unwrap(), 3, 3).unwrap());
+        assert_eq!((mid.x(), mid.y()), (11, 11), "转置对应空点");
+    }
+
+    #[test]
+    fn 转置库的转置实战局面命中且续法映射唯一() {
+        // 库（9 路）：C3 / C7 / E3 / G7 四手（转置基形的原始朝向，
+        // 三子非共线 ⇒ 保色二面体映射唯一）。实战按转置落 C3 / C7 /
+        // E3 后命中节点 3，其续法 ge=(6,4) 的转置 = (4,6) = E7，
+        // 映射必须严格等于它。
+        let lib = crate::sgf::parse_str("(;GM[1]FF[4]SZ[9];B[cc];W[gc];B[ce];W[ge])")
+            .expect("测试库 SGF 合法");
+        let reference = super::super::build_index(
+            std::path::PathBuf::from("test.sgf"),
+            lib,
+            Size::new(9).unwrap(),
+        );
+        let mut board = crate::board::Board::new(Size::new(9).unwrap());
+        for gtp in ["C3", "C7", "E3"] {
+            board
+                .play(crate::board::Coord::from_gtp(Size::new(9).unwrap(), gtp).unwrap())
+                .unwrap();
+        }
+        match reference.lookup(&board) {
+            LookupOutcome::Hit { entry, sym, .. } => {
+                assert_eq!(entry.move_no, 3, "命中第 3 手节点");
+                let mapped = entry.continuations.iter().find_map(|cont| {
+                    cont.at
+                        .as_deref()
+                        .and_then(|at| {
+                            crate::board::Coord::from_gtp(Size::new(9).unwrap(), at).ok()
+                        })
+                        .map(|at| (cont.player, sym.coord(at)))
+                });
+                let (player, at) = mapped.expect("节点 3 有续法");
+                assert_eq!(player, Stone::White);
+                assert_eq!(
+                    at.to_gtp(Size::new(9).unwrap()),
+                    "E7",
+                    "转置映射：ge(6,4)→(4,6)"
+                );
+            }
+            LookupOutcome::Miss => panic!("转置局面应命中，实际 Miss"),
+            LookupOutcome::Deviation(d) => panic!("转置局面应命中，实际偏离 {d:?}"),
+            LookupOutcome::SizeMismatch { .. } => panic!("尺寸一致却报不匹配"),
+        }
+    }
+
+    #[test]
+    fn 对称形状的续法映射落在等价点集合内() {
+        // 两子共线形状关于其轴镜像对称：A3 与 E3 都是与库内 ce 等价的
+        // 续法点（实现取确定性首解）。断言映射落在等价集合内，且棋子
+        // 对应严格正确（映射必须把库内棋子逐一搬到实战棋子上）。
+        let lib = crate::sgf::parse_str("(;GM[1]FF[4]SZ[9];B[cc];W[gc];B[ce])")
+            .expect("测试库 SGF 合法");
+        let reference = super::super::build_index(
+            std::path::PathBuf::from("test.sgf"),
+            lib,
+            Size::new(9).unwrap(),
+        );
+        let mut board = crate::board::Board::new(Size::new(9).unwrap());
+        for gtp in ["C3", "C7"] {
+            board
+                .play(crate::board::Coord::from_gtp(Size::new(9).unwrap(), gtp).unwrap())
+                .unwrap();
+        }
+        match reference.lookup(&board) {
+            LookupOutcome::Hit { entry, sym, .. } => {
+                let mapped = entry.continuations.iter().find_map(|cont| {
+                    cont.at
+                        .as_deref()
+                        .and_then(|at| {
+                            crate::board::Coord::from_gtp(Size::new(9).unwrap(), at).ok()
+                        })
+                        .map(|at| sym.coord(at))
+                });
+                let at = mapped.expect("节点 2 有续法");
+                assert!(
+                    ["A3", "E3"].contains(&at.to_gtp(Size::new(9).unwrap()).as_str()),
+                    "映射落在等价点集合：{}",
+                    at.to_gtp(Size::new(9).unwrap())
+                );
+                // 棋子对应严格（GTP 行号自下而上：库 cc = C7、gc = G7；
+                // 实战黑在 C3、白在 C7）：库黑子 C7 → 实战黑子 C3，
+                // 库白子 G7 → 实战白子 C7。
+                assert_eq!(
+                    sym.coord(crate::board::Coord::from_gtp(Size::new(9).unwrap(), "C7").unwrap())
+                        .to_gtp(Size::new(9).unwrap()),
+                    "C3",
+                    "库黑子 → 实战黑子"
+                );
+                assert_eq!(
+                    sym.coord(crate::board::Coord::from_gtp(Size::new(9).unwrap(), "G7").unwrap())
+                        .to_gtp(Size::new(9).unwrap()),
+                    "C7",
+                    "库白子 → 实战白子"
+                );
+            }
+            _ => panic!("两子转置局面应命中"),
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod e2e_probe {
+    use super::*;
+    use crate::board::{Board, Size};
+
+    #[test]
+    fn e2e_同形转置命中探针() {
+        let lib = crate::sgf::parse_str("(;GM[1]FF[4]SZ[9];B[cc];W[gc];B[ce];W[ge])")
+            .unwrap();
+        let reference = super::super::build_index(
+            std::path::PathBuf::from("t.sgf"),
+            lib,
+            Size::new(9).unwrap(),
+        );
+        // E2E 顺序：C7（黑）、C3（白）、E3（黑）。
+        let mut board = Board::new(Size::new(9).unwrap());
+        for gtp in ["C7", "C3", "E3"] {
+            board
+                .play(crate::board::Coord::from_gtp(Size::new(9).unwrap(), gtp).unwrap())
+                .unwrap();
+        }
+        let outcome = reference.lookup(&board);
+        match &outcome {
+            LookupOutcome::Hit { entry, sym, .. } => {
+                eprintln!("HIT move_no={} sym.v_lib/v_live 见下", entry.move_no);
+                let mapped = entry.continuations.iter().find_map(|cont| {
+                    cont.at.as_deref().and_then(|at| {
+                        crate::board::Coord::from_gtp(Size::new(9).unwrap(), at)
+                            .ok()
+                            .map(|at| (cont.player, sym.coord(at)))
+                    })
+                });
+                eprintln!("continuation mapped = {mapped:?}");
+            }
+            LookupOutcome::Deviation(d) => eprintln!("DEVIATION played={} book={:?}", d.played, d.book),
+            LookupOutcome::Miss => eprintln!("MISS"),
+            _ => eprintln!("other"),
+        }
     }
 }
