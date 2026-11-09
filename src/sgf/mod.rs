@@ -35,7 +35,9 @@ mod save;
 mod tree;
 
 pub use error::{Position, SgfError, SgfErrorKind};
-pub use load::{GameMeta, LoadError, LoadedGame, load_collection, load_from_bytes};
+pub use load::{
+    GameMeta, LoadError, LoadedGame, load_collection, load_from_bytes, position_sig,
+};
 pub use save::{SaveError, board_to_sgf, save_to_file};
 pub use tree::{GameInfo, GameTree, Node, Property};
 use std::borrow::Cow;

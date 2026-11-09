@@ -168,6 +168,12 @@ impl GameMeta {
         }
     }
 
+    /// 按路径记录取注释（注释搜索 S2 用：全树遍历侧现场重算路径签名，
+    /// 与 [`Self::comment_at`] 同一套键）。
+    pub fn comment_by_records(&self, records: &[MoveRecord]) -> Option<&str> {
+        self.comments.get(&position_sig(records)).map(String::as_str)
+    }
+
     /// 按局面签名取注释（「另存为」还原逐手注释用）。
     pub fn comment_by_sig(&self, sig: u64) -> Option<&str> {
         self.comments.get(&sig).map(String::as_str)
@@ -491,7 +497,7 @@ fn play_node(board: &mut Board, node: &Node) -> Result<bool, String> {
 ///
 /// 保存端（`save.rs`）逐节点增量混入各手还原同一签名，哈希实现经
 /// [`sig_with_record`] 共享，两侧按键必然一致。
-fn position_sig(records: &[crate::board::MoveRecord]) -> u64 {
+pub fn position_sig(records: &[crate::board::MoveRecord]) -> u64 {
     let mut h = SIG_INIT;
     for record in records {
         sig_with_record(&mut h, record);

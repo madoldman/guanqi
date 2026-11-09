@@ -537,6 +537,19 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
                 }
             }
         }));
+        // ---- 注释搜索（竞品补充 S2，Sabaki「按注释找棋」的移植）----
+        // 未载谱时置灰（注释随棋谱走）。
+        let mut entry = ui.add_enabled(
+            self.loaded.is_some(),
+            egui::Button::new("搜索注释…"),
+        );
+        if self.loaded.is_none() {
+            entry = entry.on_disabled_hover_text("未载入棋谱，无注释可搜。");
+        }
+        if self.loaded.is_some() && entry.clicked() {
+            self.open_comment_search();
+            ui.close();
+        }
         // ---- 另存写回：逐手注释开关（随 ui_prefs 持久化）----
         // 归「分析」菜单而非另存对话框：portal 另存对话框是系统原生
         // 窗口塞不进自绘控件，且注释是分析产物的写出口径，与分析设置

@@ -44,6 +44,7 @@ mod doc;
 mod export;
 mod collection;
 mod comment_edit;
+mod comment_search;
 mod info_edit;
 mod io;
 mod menu;
@@ -147,6 +148,10 @@ pub struct GuanqiApp {
     /// 逐手注释是否含全部已分析手（竞品移植补充，阶段 21 扩展位的
     /// UI 接线；默认关=只注疑问手及以上）。随 ui_prefs 持久化。
     annotate_all_hands: bool,
+    /// 注释搜索窗开关（竞品补充 S2，见 `app::comment_search`）。
+    comment_search_open: bool,
+    /// 注释搜索查询词（独立字段：窗口闭包字段级可变捕获所需）。
+    comment_search_query: String,
     /// 「跳到手数…」对话框是否打开（复盘导航 P1，见 `app::navigate`）。
     goto_open: bool,
     /// 跳转目标手数（对话框内编辑；0 = 开局盘面，N = 第 N 手之后的盘面）。
@@ -528,6 +533,8 @@ impl GuanqiApp {
             collection: None,
             comment_edit: None,
             comment_edit_focus: false,
+            comment_search_open: false,
+            comment_search_query: String::new(),
             info_edit: None,
             setup_mode: None,
             meta_dirty: false,
@@ -1233,6 +1240,12 @@ impl eframe::App for GuanqiApp {
         if self.setup_mode.is_some() {
             let ctx = ui.ctx();
             self.setup_dialog(ctx);
+        }
+
+        // 注释搜索窗（竞品补充 S2，见 app::comment_search）。
+        if self.comment_search_open {
+            let ctx = ui.ctx();
+            self.comment_search_dialog(ctx);
         }
 
         // 参照库打分对话框（「分析 → 参照库打分…」入口，阶段 22.3）：
