@@ -31,7 +31,7 @@
 
 pkgname=guanqi
 pkgver=0.1.0
-pkgrel=15
+pkgrel=16
 pkgdesc='观棋 —— KataGo 围棋 AI 引擎图形前端'
 arch=('x86_64')
 license=('MIT')
@@ -70,7 +70,7 @@ source=(
   "guanqi-$pkgver.tar.gz"
   'vendor.tar.gz'
 )
-sha256sums=('97ff11f534b3f08f224b1652e394eab408f5975a4a921a64eebed50b0e84c055'
+sha256sums=('ed239211ca7ab3248461c2b37ef9128a8246b249fb0ea8f29a98cd1b9bd3f136'
             '0c16d77f87d2f2d5906e0a9e10e4fac1db8980536ff221ec8081b8879ba51749')
 
 prepare() {
