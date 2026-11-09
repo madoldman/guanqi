@@ -782,6 +782,20 @@ impl eframe::App for GuanqiApp {
             if ui.input(|i| i.key_pressed(egui::Key::Space) && i.modifiers.is_none()) {
                 self.toggle_autoplay();
             }
+            // 分支点跳转（B / Shift+B；S5）：变着多时的快速巡览。
+            if !ui.ctx().egui_wants_keyboard_input() {
+                let (next_bp, prev_bp) = ui.input(|i| {
+                    (
+                        i.key_pressed(egui::Key::B) && !i.modifiers.shift && !i.modifiers.ctrl,
+                        i.key_pressed(egui::Key::B) && i.modifiers.shift && !i.modifiers.ctrl,
+                    )
+                });
+                if next_bp {
+                    self.goto_branch_point(true);
+                } else if prev_bp {
+                    self.goto_branch_point(false);
+                }
+            }
             // 手数标注开关（M；P4）：复盘定位常用，给快捷键。
             if ui.input(|i| i.key_pressed(egui::Key::M) && i.modifiers.is_none()) {
                 self.overlay.show_move_numbers = !self.overlay.show_move_numbers;

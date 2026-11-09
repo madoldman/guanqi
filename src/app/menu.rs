@@ -449,6 +449,27 @@ pub(super) fn analyze_menu(&mut self, ui: &mut egui::Ui) {
             self.goto_mistake(false);
             ui.close();
         }
+        // 分支点间跳转（竞品补充 S5，KaTrain b / Shift+b 的移植）。
+        let mut entry = ui.add_enabled(!no_moves, egui::Button::new("下一分支点（B）"));
+        if no_moves {
+            entry = entry.on_disabled_hover_text(disabled_reason);
+        } else {
+            entry = entry.on_hover_text(
+                "跳到当前线下一个分支点（有 ≥ 2 条续法的局面，KaTrain b 的移植）。",
+            );
+        }
+        if !no_moves && entry.clicked() {
+            self.goto_branch_point(true);
+            ui.close();
+        }
+        let mut entry = ui.add_enabled(!no_moves, egui::Button::new("上一分支点（Shift+B）"));
+        if no_moves {
+            entry = entry.on_disabled_hover_text(disabled_reason);
+        }
+        if !no_moves && entry.clicked() {
+            self.goto_branch_point(false);
+            ui.close();
+        }
         let mut entry = ui.add_enabled(!no_moves, egui::Button::new("跳到手数…"));
         if no_moves {
             entry = entry.on_disabled_hover_text(disabled_reason);

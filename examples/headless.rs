@@ -989,6 +989,7 @@ fn parse_key(name: &str) -> Option<egui::Key> {
         "O" => egui::Key::O,
         "S" => egui::Key::S,
         "N" => egui::Key::N,
+        "B" => egui::Key::B,
         "M" => egui::Key::M,
         "P" => egui::Key::P,
         "SPACE" => egui::Key::Space,

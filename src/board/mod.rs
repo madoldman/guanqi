@@ -547,6 +547,27 @@ impl Board {
         true
     }
 
+    /// 当前线上的全部分支点手数（子分支 ≥ 2 的节点，升序；竞品补充
+    /// S5「分支点间跳转」用）。分支点 = 该手数**之后**的局面有 ≥ 2 条
+    /// 续法（根节点算手数 0）。
+    pub fn branch_point_depths(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut cur = 0usize;
+        let mut depth = 0usize;
+        loop {
+            if self.nodes[cur].children.len() >= 2 {
+                out.push(depth);
+            }
+            let Some(&child) = self.nodes[cur].children.get(self.nodes[cur].selected)
+            else {
+                break;
+            };
+            cur = child;
+            depth += 1;
+        }
+        out
+    }
+
     /// 把包含当前节点的分支**升为主变**（竞品移植第三批 P7，KaTrain
     /// `PageUp` / LizzieYzy「变着升主变」的移植）：从根到当前节点路径上
     /// 的每个祖先，把路径子分支挪到兄弟分支首位并标记选中。

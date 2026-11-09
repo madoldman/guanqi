@@ -106,6 +106,34 @@ impl GuanqiApp {
         }
     }
 
+    // ---- 分支点跳转（竞品补充 S5，KaTrain b / Shift+b 的移植）----
+
+    /// 跳到当前线上下一个（`forward`）/ 上一个分支点（子分支 ≥ 2 的
+    /// 节点）。变着多的复盘里「这个局面是不是分叉过」靠肉眼扫树面板
+    /// 很慢；分支点清单由 [`Board::branch_point_depths`] 一次给出。
+    pub(super) fn goto_branch_point(&mut self, forward: bool) {
+        let targets = self.board.branch_point_depths();
+        let cursor = self.board.cursor();
+        let target = if forward {
+            targets.iter().find(|&&t| t > cursor)
+        } else {
+            targets.iter().rev().find(|&&t| t < cursor)
+        };
+        let Some(&target) = target else {
+            self.notices.push(LoadNotice::Warn(if forward {
+                "当前线后面没有分支点。".to_owned()
+            } else {
+                "当前线前面没有分支点。".to_owned()
+            }));
+            return;
+        };
+        self.board.go_to(target);
+        self.notices.push(LoadNotice::Ok(format!(
+            "已跳到第 {target} 手（分支点，{} 条续法）。",
+            self.board.child_count()
+        )));
+    }
+
     // ---- 自动播放（Sabaki autoplay 的移植）----
 
     /// 空格键 / 菜单开关共用的播放 / 停止切换。停止静默（开关本身的
